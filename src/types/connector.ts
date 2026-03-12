@@ -1,0 +1,101 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// PRED-ARB :: Connector Interface
+// Abstract interface that all platform connectors must implement
+// ═══════════════════════════════════════════════════════════════════════════
+
+import {
+  NormalizedMarket,
+  OrderBook,
+  OrderRequest,
+  OrderResult,
+  Platform,
+  Position,
+} from './market';
+
+/** Event types emitted by connectors */
+export type ConnectorEvent =
+  | 'connected'
+  | 'disconnected'
+  | 'market_update'
+  | 'orderbook_update'
+  | 'order_update'
+  | 'error';
+
+export type ConnectorEventHandler = (event: ConnectorEvent, data: unknown) => void;
+
+/**
+ * MarketConnector — the contract every platform connector must fulfill.
+ *
+ * Connectors are responsible for:
+ *  1. Fetching and normalizing market data
+ *  2. Fetching and normalizing order books
+ *  3. Placing and managing orders
+ *  4. Streaming real-time updates (optional)
+ */
+export interface MarketConnector {
+  /** Which platform this connector serves */
+  readonly platform: Platform;
+
+  /** Human-readable name */
+  readonly name: string;
+
+  /** Whether the connector is currently connected and healthy */
+  readonly isConnected: boolean;
+
+  // ─── Lifecycle ───────────────────────────────────────────────────────
+
+  /** Initialize the connector (auth, websockets, etc.) */
+  connect(): Promise<void>;
+
+  /** Gracefully shut down */
+  disconnect(): Promise<void>;
+
+  // ─── Market Data ─────────────────────────────────────────────────────
+
+  /** Fetch all active markets (paginated internally) */
+  fetchMarkets(options?: FetchMarketsOptions): Promise<NormalizedMarket[]>;
+
+  /** Fetch a single market by ID */
+  fetchMarket(marketId: string): Promise<NormalizedMarket | null>;
+
+  /** Fetch the order book for a specific outcome token */
+  fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook>;
+
+  // ─── Trading ─────────────────────────────────────────────────────────
+
+  /** Place an order */
+  placeOrder(order: OrderRequest): Promise<OrderResult>;
+
+  /** Cancel an order */
+  cancelOrder(orderId: string): Promise<boolean>;
+
+  /** Get current open orders */
+  getOpenOrders(): Promise<OrderResult[]>;
+
+  /** Get current positions */
+  getPositions(): Promise<Position[]>;
+
+  /** Get account balance in USD */
+  getBalance(): Promise<number>;
+
+  // ─── Events ──────────────────────────────────────────────────────────
+
+  /** Register event handler */
+  on(event: ConnectorEvent, handler: ConnectorEventHandler): void;
+
+  /** Remove event handler */
+  off(event: ConnectorEvent, handler: ConnectorEventHandler): void;
+}
+
+export interface FetchMarketsOptions {
+  /** Filter by category */
+  category?: string;
+  /** Only active markets */
+  activeOnly?: boolean;
+  /** Maximum number of markets */
+  limit?: number;
+  /** Pagination offset / cursor */
+  offset?: number | string;
+  /** Minimum liquidity in USD */
+  minLiquidity?: number;
+}
