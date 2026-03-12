@@ -45,8 +45,8 @@ export class ApiServer {
     this.app.use(cors());
     this.app.use(express.json());
 
-    // Serve dashboard static files
-    this.app.use(express.static(path.join(__dirname, '../../dashboard/dist')));
+    // Serve dashboard static files (Next.js static export → out/)
+    this.app.use(express.static(path.join(__dirname, '../../dashboard/out')));
 
     // ─── REST Endpoints ────────────────────────────────────────────────
 
@@ -104,9 +104,9 @@ export class ApiServer {
       res.json({ state: 'STOPPED' });
     });
 
-    // SPA fallback
+    // SPA fallback (Next.js static export)
     this.app.get('*', (_req, res) => {
-      res.sendFile(path.join(__dirname, '../../dashboard/dist/index.html'));
+      res.sendFile(path.join(__dirname, '../../dashboard/out/index.html'));
     });
   }
 

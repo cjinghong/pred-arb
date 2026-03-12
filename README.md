@@ -135,11 +135,11 @@ pred-arb/
 │   └── index.ts               # Entry point + graceful shutdown
 │
 ├── dashboard/
-│   ├── src/
-│   │   ├── App.tsx            # Full terminal dashboard (React + inline CSS)
-│   │   └── main.tsx           # React entry point
-│   ├── index.html
-│   ├── vite.config.ts
+│   ├── app/
+│   │   ├── layout.tsx         # Root layout + fonts
+│   │   ├── page.tsx           # Terminal dashboard (React)
+│   │   └── globals.css        # Bloomberg terminal styles
+│   ├── next.config.ts         # Next.js (static export)
 │   └── package.json
 │
 ├── data/                      # SQLite DB created here at runtime
@@ -202,7 +202,9 @@ DASHBOARD_PORT=3847
 ```bash
 # Development (hot-reload bot + separate dashboard dev server)
 npm run start:dev          # terminal 1 — bot on :3848
-npm run dashboard:dev      # terminal 2 — dashboard on :3847
+npm run dashboard:dev      # terminal 2 — Next.js dashboard on :3847
+# For dev: copy dashboard/.env.local.example to dashboard/.env.local
+# and set NEXT_PUBLIC_WS_URL=ws://localhost:3848 (Next.js doesn't proxy WebSockets)
 
 # Production
 npm run build:all          # compile backend + build dashboard
@@ -355,7 +357,7 @@ this.executionEngine = new ExecutionEngine(this.riskManager, /* dryRun */ false)
 | Database | SQLite via `better-sqlite3` |
 | API server | Express |
 | Logging | Winston (structured JSON) |
-| Dashboard | React 18, Vite 5 |
+| Dashboard | React 18, Next.js 15 (static export) |
 | Wallet / signing | ethers.js v6 |
 | Configuration | dotenv |
 
@@ -366,7 +368,7 @@ this.executionEngine = new ExecutionEngine(this.riskManager, /* dryRun */ false)
 ```bash
 npm run typecheck        # TypeScript type check (no emit)
 npm run build            # Compile to build/
-npm run build:dashboard  # Build dashboard to dashboard/dist/
+npm run build:dashboard  # Build dashboard to dashboard/out/
 npm run build:all        # Both
 ```
 

@@ -32,10 +32,10 @@ Thumbs.db
 *.swp
 *.swo
 
-# Dashboard (if separate build)
+# Dashboard
 dashboard/node_modules/
-dashboard/dist/
-dashboard/build/
+dashboard/out/
+dashboard/.next/
 
 # Misc
 *.tsbuildinfo
