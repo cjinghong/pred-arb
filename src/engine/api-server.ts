@@ -18,7 +18,8 @@ import {
   getBotStateKV,
   setBotStateKV,
 } from '../db/database';
-import { BotState } from '../types';
+import { BotState, Platform } from '../types';
+import { MarketConnector } from '../types/connector';
 
 const log = createChildLogger('api');
 
@@ -32,6 +33,8 @@ export class ApiServer {
   private setBotState: (state: BotState) => void;
   private getMarketsSummary: (() => unknown) | null = null;
   private setPairStatus: ((pairId: string, status: string) => void) | null = null;
+  private addManualPair: ((marketAId: string, marketBId: string) => string | null) | null = null;
+  private connectors = new Map<Platform, MarketConnector>();
 
   constructor(
     getBotState: () => BotState,
@@ -51,6 +54,16 @@ export class ApiServer {
   /** Wire up pair status setter for dashboard controls */
   setPairStatusHandler(fn: (pairId: string, status: string) => void): void {
     this.setPairStatus = fn;
+  }
+
+  /** Wire up manual pair creation handler */
+  setManualPairHandler(fn: (marketAId: string, marketBId: string) => string | null): void {
+    this.addManualPair = fn;
+  }
+
+  /** Wire up connectors for order book fetching */
+  setConnectors(connectors: Map<Platform, MarketConnector>): void {
+    this.connectors = connectors;
   }
 
   private setupRoutes(): void {
@@ -90,6 +103,7 @@ export class ApiServer {
         maxPositionUsd: config.bot.maxPositionUsd,
         maxTotalExposureUsd: config.bot.maxTotalExposureUsd,
         scanIntervalMs: config.bot.scanIntervalMs,
+        minDepthUsd: config.bot.minDepthUsd,
       });
     });
 
@@ -99,6 +113,26 @@ export class ApiServer {
         return;
       }
       res.json(this.getMarketsSummary());
+    });
+
+    // ─── Order Book Endpoint ──────────────────────────────────────────
+
+    this.app.get('/api/orderbook/:platform/:marketId', async (req, res) => {
+      const { platform, marketId } = req.params;
+      const outcomeIndex = parseInt(req.query.outcome as string) || 0;
+
+      const connector = this.connectors.get(platform as Platform);
+      if (!connector) {
+        res.status(404).json({ error: `Unknown platform: ${platform}` });
+        return;
+      }
+
+      try {
+        const book = await connector.fetchOrderBook(marketId, outcomeIndex);
+        res.json(book);
+      } catch (err) {
+        res.status(500).json({ error: (err as Error).message });
+      }
     });
 
     // ─── Pair Management ─────────────────────────────────────────────────
@@ -136,6 +170,27 @@ export class ApiServer {
       if (!this.setPairStatus) { res.status(503).json({ error: 'Not initialized' }); return; }
       this.setPairStatus(req.params.pairId, 'rejected');
       res.json({ pairId: req.params.pairId, status: 'rejected' });
+    });
+
+    // ─── Manual Pair Creation ─────────────────────────────────────────────
+
+    this.app.post('/api/pairs/manual', (req, res) => {
+      const { marketAId, marketBId } = req.body;
+      if (!marketAId || !marketBId) {
+        res.status(400).json({ error: 'marketAId and marketBId are required' });
+        return;
+      }
+      if (!this.addManualPair) {
+        res.status(503).json({ error: 'Manual pair creation not initialized' });
+        return;
+      }
+      const pairId = this.addManualPair(marketAId, marketBId);
+      if (!pairId) {
+        res.status(404).json({ error: 'One or both markets not found in loaded data' });
+        return;
+      }
+      log.info('Manual pair created via API', { pairId, marketAId, marketBId });
+      res.json({ pairId, marketAId, marketBId, status: 'approved' });
     });
 
     // ─── Bot Control ───────────────────────────────────────────────────
@@ -180,6 +235,9 @@ export class ApiServer {
     eventBus.on('bot:scan_complete', forward('scan_complete'));
     eventBus.on('bot:state_change', forward('state_change'));
     eventBus.on('risk:limit_breach', forward('risk_alert'));
+
+    // Forward book updates so the dashboard can live-update orderbook views
+    eventBus.on('book:update', forward('book_update'));
   }
 
   async start(): Promise<void> {
@@ -213,7 +271,7 @@ export class ApiServer {
         ws.on('message', (data) => {
           try {
             const msg = JSON.parse(data.toString());
-            this.handleClientMessage(msg);
+            this.handleClientMessage(msg, ws);
           } catch {
             log.warn('Invalid WS message received');
           }
@@ -228,7 +286,7 @@ export class ApiServer {
     });
   }
 
-  private handleClientMessage(msg: { type: string; data?: unknown }): void {
+  private handleClientMessage(msg: { type: string; data?: unknown }, ws: WebSocket): void {
     switch (msg.type) {
       case 'pause':
         this.setBotState('PAUSED');
@@ -246,6 +304,14 @@ export class ApiServer {
           timestamp: new Date().toISOString(),
         });
         break;
+      case 'subscribe_book': {
+        // Dashboard client wants live book updates for a specific market.
+        // The book:update events are already being forwarded.
+        // Client sends: { type: 'subscribe_book', data: { platform, marketId } }
+        // We could track per-client subscriptions for efficiency,
+        // but for now all book:update events go to all clients.
+        break;
+      }
     }
   }
 

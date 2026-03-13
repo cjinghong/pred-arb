@@ -64,6 +64,11 @@ interface PredictFunMarketsResponse {
   data: PredictFunRawMarket[];
 }
 
+interface PredictFunOrderBookResponse {
+  success: boolean;
+  data: PredictFunRawOrderBook;
+}
+
 interface PredictFunRawOrderBook {
   bids: Array<[number, number]>;  // [price, quantity]
   asks: Array<[number, number]>;  // [price, quantity]
@@ -167,8 +172,8 @@ export class PredictFunConnector extends BaseConnector {
 
   async connect(): Promise<void> {
     try {
-      // Test REST connectivity with status filter
-      await this.httpGet(`${this.apiUrl}/v1/markets?first=1&status=OPEN`);
+      // Test REST connectivity — pass auth headers so mainnet doesn't 401
+      await this.httpGet(`${this.apiUrl}/v1/markets?first=1&tradingStatus=OPEN`, this.getAuthHeaders());
       this._isConnected = true;
       this.emit('connected');
       this.log.info('Connected to predict.fun REST API', { url: this.apiUrl });
@@ -238,8 +243,11 @@ export class PredictFunConnector extends BaseConnector {
     if (options?.offset) params.set('after', String(options.offset));
 
     // ─── Server-side filters (per https://dev.predict.fun docs) ─────────
+    // NB: the query parameter is `tradingStatus`, not `status`.
+    // `status` is the market lifecycle field (REGISTERED/RESOLVED/etc.);
+    // `tradingStatus` controls whether the order book is open (OPEN/CANCEL_ONLY/CLOSED).
     if (options?.activeOnly !== false) {
-      params.set('status', 'OPEN');
+      params.set('tradingStatus', 'OPEN');
     }
 
     // predict.fun supports sort: VOLUME_TOTAL_DESC, VOLUME_24H_DESC, etc.
@@ -294,11 +302,18 @@ export class PredictFunConnector extends BaseConnector {
       return wsBook;
     }
 
-    // Fallback to REST
-    const raw = await this.httpGet<PredictFunRawOrderBook>(
+    // Fallback to REST — response is wrapped: { success, data: { bids, asks } }
+    const response = await this.httpGet<PredictFunOrderBookResponse>(
       `${this.apiUrl}/v1/markets/${marketId}/orderbook`,
       this.getAuthHeaders(),
     );
+    const raw = response.data ?? response as unknown as PredictFunRawOrderBook;
+
+    this.log.debug('Fetched orderbook via REST', {
+      marketId,
+      bids: (raw.bids || []).length,
+      asks: (raw.asks || []).length,
+    });
 
     return this.normalizeOrderBook(raw, marketId, outcomeIndex);
   }

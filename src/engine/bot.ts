@@ -1,6 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: Bot Orchestrator
-// Main loop that coordinates connectors, strategies, execution, and the API
+// Main loop that coordinates connectors, strategies, execution, and the API.
+//
+// Scanning is event-driven: WebSocket order book updates trigger immediate
+// arb checks on affected pairs. A background timer still refreshes the
+// market pair list periodically.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { BotState, Platform } from '../types';
@@ -26,7 +30,7 @@ export class Bot {
   private executionEngine: ExecutionEngine;
   private riskManager: RiskManager;
   private apiServer: ApiServer;
-  private scanTimer: NodeJS.Timeout | null = null;
+  private pairRefreshTimer: NodeJS.Timeout | null = null;
   private startTime = Date.now();
 
   constructor() {
@@ -82,22 +86,58 @@ export class Bot {
     // 5. Load persisted pair statuses and wire up dashboard handlers
     xPlatformArb.loadPersistedPairs();
     this.apiServer.setMarketsSummaryGetter(() => xPlatformArb.getMarketsSummary());
+    this.apiServer.setConnectors(this.connectors);
     this.apiServer.setPairStatusHandler((pairId, status) => {
       xPlatformArb.setPairStatus(pairId, status as import('../matcher/market-matcher').PairStatus);
+    });
+    this.apiServer.setManualPairHandler((marketAId, marketBId) => {
+      return xPlatformArb.addManualPair(marketAId, marketBId);
     });
 
     // 6. Start API server
     await this.apiServer.start();
 
-    // 7. Start scanning
+    // 7. Wire up event-driven execution: opportunity:found → execution engine
+    eventBus.on('opportunity:found', async (opp) => {
+      if (this.state !== 'RUNNING') return;
+      try {
+        await this.executionEngine.submit(opp);
+      } catch (err) {
+        log.error('Failed to submit opportunity', { error: (err as Error).message });
+      }
+    });
+
+    // 8. Start the bot
     this.setState('RUNNING');
-    this.startScanLoop();
     this.startTime = Date.now();
 
-    log.info('Bot is RUNNING', {
+    // Run initial pair refresh + first scan, then enable event-driven scanning
+    await xPlatformArb.refreshPairsIfNeeded().catch(err =>
+      log.error('Initial pair refresh failed', { error: err.message })
+    );
+    // Run one full scan to log diagnostics on startup
+    await xPlatformArb.scan().catch(err =>
+      log.error('Initial scan failed', { error: err.message })
+    );
+
+    // Enable event-driven scanning: book updates trigger arb checks
+    xPlatformArb.startEventDrivenScanning();
+
+    // Periodically refresh market pairs (not scanning — just re-matching)
+    this.pairRefreshTimer = setInterval(() => {
+      if (this.state === 'RUNNING') {
+        xPlatformArb.refreshPairsIfNeeded().catch(err =>
+          log.error('Pair refresh failed', { error: err.message })
+        );
+      }
+    }, config.bot.pairRefreshIntervalMs);
+
+    log.info('Bot is RUNNING (event-driven mode)', {
       platforms: Array.from(this.connectors.keys()),
       strategies: Array.from(this.strategies.keys()),
-      scanInterval: `${config.bot.scanIntervalMs}ms`,
+      pairRefreshInterval: `${config.bot.pairRefreshIntervalMs}ms`,
+      minProfitBps: config.bot.minProfitBps,
+      minDepthUsd: config.bot.minDepthUsd,
     });
   }
 
@@ -105,12 +145,12 @@ export class Bot {
     log.info('Shutting down...');
     this.setState('STOPPED');
 
-    if (this.scanTimer) {
-      clearInterval(this.scanTimer);
-      this.scanTimer = null;
+    if (this.pairRefreshTimer) {
+      clearInterval(this.pairRefreshTimer);
+      this.pairRefreshTimer = null;
     }
 
-    // Shutdown strategies
+    // Shutdown strategies (also stops event-driven scanning)
     for (const strategy of this.strategies.values()) {
       await strategy.shutdown();
     }
@@ -132,51 +172,5 @@ export class Bot {
     setBotStateKV('state', newState);
     eventBus.emit('bot:state_change', { from: oldState, to: newState });
     log.info(`State: ${oldState} → ${newState}`);
-  }
-
-  private startScanLoop(): void {
-    // Run first scan immediately
-    this.runScan().catch(err => log.error('Initial scan failed', { error: err.message }));
-
-    // Then run on interval
-    this.scanTimer = setInterval(() => {
-      if (this.state === 'RUNNING') {
-        this.runScan().catch(err => log.error('Scan failed', { error: err.message }));
-      }
-    }, config.bot.scanIntervalMs);
-  }
-
-  private async runScan(): Promise<void> {
-    if (this.state !== 'RUNNING') return;
-
-    const scanStart = Date.now();
-    eventBus.emit('bot:scan_start', { timestamp: new Date() });
-
-    let totalOpportunities = 0;
-
-    for (const strategy of this.strategies.values()) {
-      if (!strategy.config.enabled) continue;
-
-      try {
-        const opportunities = await strategy.scan();
-        totalOpportunities += opportunities.length;
-
-        // Submit profitable opportunities to execution engine
-        for (const opp of opportunities) {
-          await this.executionEngine.submit(opp);
-        }
-      } catch (err) {
-        log.error(`Strategy "${strategy.id}" scan failed`, {
-          error: (err as Error).message,
-        });
-      }
-    }
-
-    const duration = Date.now() - scanStart;
-    eventBus.emit('bot:scan_complete', {
-      timestamp: new Date(),
-      durationMs: duration,
-      opportunitiesFound: totalOpportunities,
-    });
   }
 }

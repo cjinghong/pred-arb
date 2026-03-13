@@ -327,8 +327,12 @@ export class WsOrderBookManager {
 
     this.books.set(update.assetId, book);
 
-    // Emit event so strategies can react
-    eventBus.emit('connector:connected', { platform: this.config.platform });
+    // Emit book:update so strategies can react to price changes immediately
+    eventBus.emit('book:update', {
+      platform: this.config.platform,
+      marketId: update.marketId,
+      outcomeIndex: update.outcomeIndex,
+    });
   }
 
   // ─── Reconnection ─────────────────────────────────────────────────────

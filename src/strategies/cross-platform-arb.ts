@@ -1,7 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: Cross-Platform Arbitrage Strategy
 // Core strategy: find matched markets across platforms, identify price
-// discrepancies in order books, and generate arb opportunities
+// discrepancies in order books, and generate arb opportunities.
+//
+// Scanning is event-driven: triggered by WebSocket order book updates.
+// When a book updates on one platform, we immediately check the cross-
+// platform pair for arbitrage instead of polling on a timer.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { v4 as uuid } from 'uuid';
@@ -39,10 +43,20 @@ export class CrossPlatformArbStrategy implements Strategy {
   private matcher = new MarketMatcher(this.llmVerifier);
   private cachedPairs: MarketPair[] = [];
   private lastPairRefresh = 0;
-  private pairRefreshIntervalMs = 5 * 60 * 1000; // Refresh pairs every 5 minutes
+  private pairRefreshIntervalMs = config.bot.pairRefreshIntervalMs;
 
   /** Last fetched markets per platform (for dashboard display) */
   private lastFetchedMarkets = new Map<Platform, NormalizedMarket[]>();
+
+  /** Reverse index: marketId → MarketPair[] for O(1) lookup on book updates */
+  private marketToPairs = new Map<string, MarketPair[]>();
+
+  /** Throttle: don't re-analyze the same pair more than once per N ms */
+  private lastPairAnalysis = new Map<string, number>();
+  private readonly pairAnalysisCooldownMs = 200; // 200ms debounce per pair
+
+  /** Bound handler reference so we can remove the listener on shutdown */
+  private bookUpdateHandler: ((data: { platform: string; marketId: string; outcomeIndex: number }) => void) | null = null;
 
   // Metrics
   private _metrics: StrategyMetrics = {
@@ -64,9 +78,7 @@ export class CrossPlatformArbStrategy implements Strategy {
     maxPositionUsd: config.bot.maxPositionUsd,
     minMatchConfidence: 0.6,
     params: {
-      /** Minimum order book depth (USD) to consider an opportunity executable */
-      minDepthUsd: 50,
-      /** Maximum staleness of order book data in ms */
+      minDepthUsd: config.bot.minDepthUsd,
       maxBookAgeMs: 5000,
     },
   };
@@ -80,16 +92,97 @@ export class CrossPlatformArbStrategy implements Strategy {
     this._state = 'IDLE';
     log.info('Cross-platform arbitrage strategy initialized', {
       platforms: Array.from(connectors.keys()),
+      minProfitBps: this.config.minProfitBps,
+      minDepthUsd: this.config.params.minDepthUsd,
     });
   }
 
+  // ─── WebSocket-Driven Scanning ────────────────────────────────────────
+
+  /**
+   * Start listening for order book update events.
+   * When any book changes, we immediately check the cross-platform pair
+   * for arbitrage instead of waiting for the next poll interval.
+   */
+  startEventDrivenScanning(): void {
+    if (this.bookUpdateHandler) return; // already listening
+
+    this.bookUpdateHandler = (data) => {
+      this.onBookUpdate(data.platform as Platform, data.marketId).catch(err => {
+        log.warn('Error in event-driven scan', { error: (err as Error).message });
+      });
+    };
+
+    eventBus.on('book:update', this.bookUpdateHandler);
+    log.info('Event-driven scanning enabled — arb checks triggered by WS book updates');
+  }
+
+  /**
+   * Stop listening for order book update events.
+   */
+  stopEventDrivenScanning(): void {
+    if (this.bookUpdateHandler) {
+      eventBus.off('book:update', this.bookUpdateHandler);
+      this.bookUpdateHandler = null;
+      log.info('Event-driven scanning disabled');
+    }
+  }
+
+  /**
+   * Called when a WebSocket book update arrives for a specific market.
+   * Finds the cross-platform pair(s) containing that market and immediately
+   * checks for arbitrage.
+   */
+  private async onBookUpdate(platform: Platform, marketId: string): Promise<void> {
+    if (this._state !== 'IDLE' && this._state !== 'SCANNING') return;
+
+    const pairs = this.marketToPairs.get(marketId);
+    if (!pairs || pairs.length === 0) return;
+
+    for (const pair of pairs) {
+      if (pair.status !== 'approved') continue;
+      if (pair.confidence < this.config.minMatchConfidence) continue;
+
+      // Throttle: don't re-check the same pair too frequently
+      const lastCheck = this.lastPairAnalysis.get(pair.pairId) ?? 0;
+      if (Date.now() - lastCheck < this.pairAnalysisCooldownMs) continue;
+      this.lastPairAnalysis.set(pair.pairId, Date.now());
+
+      try {
+        const opps = await this.analyzePair(pair);
+        if (opps.length > 0) {
+          this._metrics.opportunitiesFound += opps.length;
+          this._metrics.lastScanAt = new Date();
+          for (const opp of opps) {
+            eventBus.emit('opportunity:found', opp);
+          }
+          log.info('Arb opportunity detected via WS trigger', {
+            pairId: pair.pairId,
+            platform,
+            marketId,
+            opps: opps.length,
+            profitBps: opps[0].expectedProfitBps.toFixed(0),
+          });
+        }
+      } catch (err) {
+        log.warn('Error analyzing pair on book update', {
+          pairId: pair.pairId,
+          error: (err as Error).message,
+        });
+      }
+    }
+  }
+
   async shutdown(): Promise<void> {
+    this.stopEventDrivenScanning();
     this._state = 'IDLE';
     this.cachedPairs = [];
+    this.marketToPairs.clear();
+    this.lastPairAnalysis.clear();
     log.info('Strategy shut down');
   }
 
-  // ─── Core Scan Logic ───────────────────────────────────────────────────
+  // ─── Core Scan Logic (also usable as a fallback / manual trigger) ─────
 
   async scan(): Promise<ArbitrageOpportunity[]> {
     this._state = 'SCANNING';
@@ -105,13 +198,36 @@ export class CrossPlatformArbStrategy implements Strategy {
         return [];
       }
 
+      // Log pair status breakdown for debugging
+      const statusCounts = { approved: 0, pending: 0, paused: 0, rejected: 0, unknown: 0 };
+      for (const pair of this.cachedPairs) {
+        const s = pair.status as keyof typeof statusCounts;
+        if (s in statusCounts) statusCounts[s]++;
+        else statusCounts.unknown++;
+      }
+      log.info('Pair status breakdown', statusCounts);
+
+      if (statusCounts.approved === 0) {
+        log.warn('No approved pairs — approve pairs via dashboard or set ANTHROPIC_API_KEY for auto-approval');
+      }
+
       // Step 2: For each APPROVED pair, fetch order books and look for arb
+      let pairsChecked = 0;
+      let nullBookCount = 0;
+      let belowDepthCount = 0;
+      let belowProfitCount = 0;
+
       for (const pair of this.cachedPairs) {
         if (pair.status !== 'approved') continue;
         if (pair.confidence < this.config.minMatchConfidence) continue;
+        pairsChecked++;
 
         try {
-          const opps = await this.analyzePair(pair);
+          const opps = await this.analyzePairWithDiagnostics(pair, (reason) => {
+            if (reason === 'null_book') nullBookCount++;
+            else if (reason === 'below_depth') belowDepthCount++;
+            else if (reason === 'below_profit') belowProfitCount++;
+          });
           opportunities.push(...opps);
         } catch (err) {
           log.warn('Error analyzing pair', {
@@ -120,6 +236,18 @@ export class CrossPlatformArbStrategy implements Strategy {
             error: (err as Error).message,
           });
         }
+      }
+
+      // Diagnostic summary
+      if (pairsChecked > 0 && opportunities.length === 0) {
+        log.info('Scan diagnostics — 0 opportunities because:', {
+          pairsChecked,
+          nullBooks: nullBookCount,
+          belowDepth: belowDepthCount,
+          belowProfit: belowProfitCount,
+          minProfitBps: this.config.minProfitBps,
+          minDepthUsd: this.config.params.minDepthUsd,
+        });
       }
 
       // Emit found opportunities
@@ -160,12 +288,8 @@ export class CrossPlatformArbStrategy implements Strategy {
       ]);
 
       // Check if the combined cost is still < $1 (profitable arb)
-      const costA = opportunity.legA.outcome === 'YES'
-        ? (bookA.bestAsk ?? 1)
-        : (bookA.bestAsk ?? 1);
-      const costB = opportunity.legB.outcome === 'YES'
-        ? (bookB.bestAsk ?? 1)
-        : (bookB.bestAsk ?? 1);
+      const costA = bookA.bestAsk ?? 1;
+      const costB = bookB.bestAsk ?? 1;
 
       const totalCost = costA + costB;
       const profitBps = ((1 - totalCost) / totalCost) * 10000;
@@ -189,6 +313,64 @@ export class CrossPlatformArbStrategy implements Strategy {
     const pair = this.cachedPairs.find(p => p.pairId === pairId);
     if (pair) pair.status = status;
     log.info(`Pair status updated`, { pairId, status });
+  }
+
+  /** Manually match two markets (from dashboard) */
+  addManualPair(marketAId: string, marketBId: string): string | null {
+    // Find the markets in our cached data
+    const allMarkets = new Map<string, NormalizedMarket>();
+    for (const [, markets] of this.lastFetchedMarkets) {
+      for (const m of markets) allMarkets.set(m.id, m);
+    }
+
+    const mA = allMarkets.get(marketAId);
+    const mB = allMarkets.get(marketBId);
+    if (!mA || !mB) {
+      log.warn('Manual pair failed — market not found', { marketAId, marketBId });
+      return null;
+    }
+
+    const pairId = this.matcher.addManualPair(marketAId, marketBId);
+
+    // Add to cached pairs immediately
+    const pair: MarketPair = {
+      pairId,
+      marketA: mA,
+      marketB: mB,
+      confidence: 1.0,
+      matchMethod: 'manual',
+      status: 'approved',
+    };
+    this.cachedPairs.push(pair);
+
+    // Update reverse index
+    const listA = this.marketToPairs.get(mA.id) ?? [];
+    listA.push(pair);
+    this.marketToPairs.set(mA.id, listA);
+    const listB = this.marketToPairs.get(mB.id) ?? [];
+    listB.push(pair);
+    this.marketToPairs.set(mB.id, listB);
+
+    // Persist to DB
+    try {
+      upsertMarketPair({
+        pairId,
+        marketAId: mA.id,
+        marketAPlatform: mA.platform,
+        marketAQuestion: mA.question,
+        marketBId: mB.id,
+        marketBPlatform: mB.platform,
+        marketBQuestion: mB.question,
+        status: 'approved',
+        confidence: 1.0,
+        matchMethod: 'manual',
+      });
+    } catch (err) {
+      log.warn('Failed to persist manual pair', { pairId, error: (err as Error).message });
+    }
+
+    log.info('Manual pair created', { pairId, marketA: mA.question.slice(0, 50), marketB: mB.question.slice(0, 50) });
+    return pairId;
   }
 
   /** Load persisted pair statuses from DB at startup */
@@ -256,7 +438,8 @@ export class CrossPlatformArbStrategy implements Strategy {
 
   // ─── Internal Logic ────────────────────────────────────────────────────
 
-  private async refreshPairsIfNeeded(): Promise<void> {
+  /** Refresh pairs (call periodically or manually, NOT on every book update) */
+  async refreshPairsIfNeeded(): Promise<void> {
     if (Date.now() - this.lastPairRefresh < this.pairRefreshIntervalMs) return;
 
     log.info('Refreshing market pairs...');
@@ -268,15 +451,11 @@ export class CrossPlatformArbStrategy implements Strategy {
       return;
     }
 
-    // Push filtering to the API wherever possible:
-    // - Polymarket: activeOnly, minLiquidity, sortBy all handled server-side via Gamma API
-    // - predict.fun: status=OPEN + sort=VOLUME_TOTAL_DESC handled server-side;
-    //                no liquidity field exposed so we skip that filter for pfun
     const baseOpts = { activeOnly: true, limit: 200, sortBy: 'volume' as const, sortDirection: 'desc' as const };
 
     const [marketsA, marketsB] = await Promise.all([
-      connA.fetchMarkets({ ...baseOpts, minLiquidity: 100 }),  // Polymarket supports server-side liquidity filter
-      connB.fetchMarkets(baseOpts),                             // predict.fun: no liquidity field
+      connA.fetchMarkets({ ...baseOpts, minLiquidity: 100 }),
+      connB.fetchMarkets(baseOpts),
     ]);
 
     // Cache for dashboard visibility
@@ -291,6 +470,9 @@ export class CrossPlatformArbStrategy implements Strategy {
     const oldPairIds = new Set(this.cachedPairs.map(p => `${p.marketA.id}:${p.marketB.id}`));
     this.cachedPairs = await this.matcher.findPairs(marketsA, marketsB);
     this.lastPairRefresh = Date.now();
+
+    // Rebuild the reverse index: marketId → pairs
+    this.rebuildMarketIndex();
 
     // Persist pairs to DB
     for (const pair of this.cachedPairs) {
@@ -320,9 +502,31 @@ export class CrossPlatformArbStrategy implements Strategy {
   }
 
   /**
+   * Build a reverse lookup from marketId → MarketPair[] so that when a
+   * book update arrives for a specific market, we can O(1) find which
+   * pairs need re-analysis.
+   */
+  private rebuildMarketIndex(): void {
+    this.marketToPairs.clear();
+    for (const pair of this.cachedPairs) {
+      // Index by market A's ID
+      const listA = this.marketToPairs.get(pair.marketA.id) ?? [];
+      listA.push(pair);
+      this.marketToPairs.set(pair.marketA.id, listA);
+
+      // Index by market B's ID
+      const listB = this.marketToPairs.get(pair.marketB.id) ?? [];
+      listB.push(pair);
+      this.marketToPairs.set(pair.marketB.id, listB);
+    }
+    log.info('Market index rebuilt', {
+      uniqueMarkets: this.marketToPairs.size,
+      pairs: this.cachedPairs.length,
+    });
+  }
+
+  /**
    * Subscribe connectors to WebSocket order book feeds for all matched pairs.
-   * This ensures we get real-time book updates for markets we're actively
-   * monitoring, rather than polling REST on every scan.
    */
   private subscribeToMatchedPairs(
     connA: MarketConnector,
@@ -360,7 +564,7 @@ export class CrossPlatformArbStrategy implements Strategy {
   }
 
   /**
-   * Analyze a matched pair for arbitrage.
+   * Analyze a matched pair for arbitrage — with diagnostics callback.
    *
    * The core arb logic for binary prediction markets:
    *
@@ -372,22 +576,39 @@ export class CrossPlatformArbStrategy implements Strategy {
    *  1. Buy YES on A + Buy NO on B
    *  2. Buy NO on A + Buy YES on B
    */
-  private async analyzePair(pair: MarketPair): Promise<ArbitrageOpportunity[]> {
+  private async analyzePairWithDiagnostics(
+    pair: MarketPair,
+    onSkip: (reason: 'null_book' | 'below_depth' | 'below_profit') => void,
+  ): Promise<ArbitrageOpportunity[]> {
     const connA = this.connectors.get(pair.marketA.platform);
     const connB = this.connectors.get(pair.marketB.platform);
     if (!connA || !connB) return [];
 
-    // Fetch YES order books for both markets
     const [bookAYes, bookBYes] = await Promise.all([
-      connA.fetchOrderBook(pair.marketA.id, 0), // index 0 = YES
-      connB.fetchOrderBook(pair.marketB.id, 0), // index 0 = YES
+      connA.fetchOrderBook(pair.marketA.id, 0),
+      connB.fetchOrderBook(pair.marketB.id, 0),
     ]);
 
+    // Log book state for debugging empty-book issues
+    if (bookAYes.bestAsk === null || bookAYes.bestBid === null ||
+        bookBYes.bestAsk === null || bookBYes.bestBid === null) {
+      log.debug('Order book prices for pair', {
+        pairId: pair.pairId,
+        [`${pair.marketA.platform}_bestBid`]: bookAYes.bestBid,
+        [`${pair.marketA.platform}_bestAsk`]: bookAYes.bestAsk,
+        [`${pair.marketA.platform}_bids`]: bookAYes.bids.length,
+        [`${pair.marketA.platform}_asks`]: bookAYes.asks.length,
+        [`${pair.marketB.platform}_bestBid`]: bookBYes.bestBid,
+        [`${pair.marketB.platform}_bestAsk`]: bookBYes.bestAsk,
+        [`${pair.marketB.platform}_bids`]: bookBYes.bids.length,
+        [`${pair.marketB.platform}_asks`]: bookBYes.asks.length,
+      });
+    }
+
     const opportunities: ArbitrageOpportunity[] = [];
+    const minDepthUsd = this.config.params.minDepthUsd as number;
 
     // Direction 1: Buy YES on A, Buy NO on B
-    // Cost = bestAsk(A, YES) + (1 - bestBid(B, YES))
-    // Because buying NO is equivalent to selling YES at the complement
     if (bookAYes.bestAsk !== null && bookBYes.bestBid !== null) {
       const costYesA = bookAYes.bestAsk;
       const costNoB = 1 - bookBYes.bestBid;
@@ -400,15 +621,20 @@ export class CrossPlatformArbStrategy implements Strategy {
         const maxSizeB = bookBYes.bids[0]?.size ?? 0;
         const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
 
-        if (maxSize * totalCost >= (this.config.params.minDepthUsd as number)) {
-          const opp = this.createOpportunity(
+        if (minDepthUsd <= 0 || maxSize * totalCost >= minDepthUsd) {
+          opportunities.push(this.createOpportunity(
             pair, 'YES', costYesA, bookAYes, maxSizeA,
             'NO', costNoB, bookBYes, maxSizeB,
             profitPerShare * maxSize, profitBps, maxSize,
-          );
-          opportunities.push(opp);
+          ));
+        } else {
+          onSkip('below_depth');
         }
+      } else {
+        onSkip('below_profit');
       }
+    } else {
+      onSkip('null_book');
     }
 
     // Direction 2: Buy NO on A, Buy YES on B
@@ -424,18 +650,30 @@ export class CrossPlatformArbStrategy implements Strategy {
         const maxSizeB = bookBYes.asks[0]?.size ?? 0;
         const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
 
-        if (maxSize * totalCost >= (this.config.params.minDepthUsd as number)) {
-          const opp = this.createOpportunity(
+        if (minDepthUsd <= 0 || maxSize * totalCost >= minDepthUsd) {
+          opportunities.push(this.createOpportunity(
             pair, 'NO', costNoA, bookAYes, maxSizeA,
             'YES', costYesB, bookBYes, maxSizeB,
             profitPerShare * maxSize, profitBps, maxSize,
-          );
-          opportunities.push(opp);
+          ));
+        } else {
+          onSkip('below_depth');
         }
+      } else {
+        onSkip('below_profit');
       }
+    } else {
+      onSkip('null_book');
     }
 
     return opportunities;
+  }
+
+  /**
+   * Lightweight version for WS-triggered analysis (no diagnostics callback).
+   */
+  private async analyzePair(pair: MarketPair): Promise<ArbitrageOpportunity[]> {
+    return this.analyzePairWithDiagnostics(pair, () => {});
   }
 
   private createOpportunity(

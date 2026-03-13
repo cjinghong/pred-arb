@@ -199,7 +199,7 @@ export function updateTradeStatus(
   const params: unknown[] = [status];
 
   if (status === 'EXECUTED') {
-    sets.push('executed_at = datetime("now")');
+    sets.push("executed_at = datetime('now')");
   }
   if (updates?.realizedProfitUsd !== undefined) {
     sets.push('realized_profit_usd = ?');
@@ -325,7 +325,7 @@ export function upsertMarketPair(pair: {
 
 export function updatePairStatus(pairId: string, status: string): void {
   getDb().prepare(
-    'UPDATE market_pairs SET status = ?, updated_at = datetime("now") WHERE pair_id = ?'
+    "UPDATE market_pairs SET status = ?, updated_at = datetime('now') WHERE pair_id = ?"
   ).run(status, pairId);
 }
 

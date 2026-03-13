@@ -202,6 +202,13 @@ export class PolymarketConnector extends BaseConnector {
       `${this.clobUrl}/book?token_id=${tokenId}`
     );
 
+    this.log.debug('Fetched orderbook via REST', {
+      marketId,
+      tokenId,
+      bids: (raw.bids || []).length,
+      asks: (raw.asks || []).length,
+    });
+
     return this.normalizeOrderBook(raw, marketId, outcomeIndex);
   }
 

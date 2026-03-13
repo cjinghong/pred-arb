@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import OrderBookViewer, { BookSelection } from './orderbook-viewer';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -40,10 +41,11 @@ interface Opportunity {
   id: string;
   strategyId: string;
   discoveredAt: string;
-  legA: { platform: string; marketQuestion: string; outcome: string; price: number };
-  legB: { platform: string; marketQuestion: string; outcome: string; price: number };
+  legA: { platform: string; marketId: string; marketQuestion: string; outcome: string; price: number };
+  legB: { platform: string; marketId: string; marketQuestion: string; outcome: string; price: number };
   expectedProfitUsd: number;
   expectedProfitBps: number;
+  maxSize: number;
   matchConfidence: number;
   executed: boolean;
 }
@@ -169,6 +171,9 @@ export default function DashboardPage() {
   const [marketFilter, setMarketFilter] = useState<'all' | 'matched' | 'unmatched'>('all');
   const [platformFilter, setPlatformFilter] = useState<string>('all');
   const [pairStatusFilter, setPairStatusFilter] = useState<'all' | 'approved' | 'pending' | 'paused' | 'rejected'>('all');
+  const [bookSelection, setBookSelection] = useState<BookSelection | null>(null);
+  const [manualMatchMode, setManualMatchMode] = useState(false);
+  const [manualMatchA, setManualMatchA] = useState<{ id: string; platform: string; question: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -254,6 +259,54 @@ export default function DashboardPage() {
     const t = setInterval(poll, 5000);
     return () => clearInterval(t);
   }, []);
+
+  const navigateToPair = (pair: MatchedPair) => {
+    window.location.href = `/pair?a=${encodeURIComponent(pair.marketA.id)}&b=${encodeURIComponent(pair.marketB.id)}`;
+  };
+
+  const navigateToPairFromOpp = (opp: Opportunity) => {
+    window.location.href = `/pair?a=${encodeURIComponent(opp.legA.marketId)}&b=${encodeURIComponent(opp.legB.marketId)}`;
+  };
+
+  const handleManualMatchClick = async (market: { id: string; platform: string; question: string }) => {
+    if (!manualMatchMode) return;
+
+    if (!manualMatchA) {
+      // First selection
+      setManualMatchA(market);
+      return;
+    }
+
+    // Second selection — must be from a different platform
+    if (market.platform === manualMatchA.platform) {
+      // Same platform — replace the first selection
+      setManualMatchA(market);
+      return;
+    }
+
+    // Create the manual pair
+    try {
+      const apiBase = getApiBase();
+      const resp = await fetch(`${apiBase}/api/pairs/manual`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          marketAId: manualMatchA.id,
+          marketBId: market.id,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json();
+        alert(`Failed to create pair: ${err.error}`);
+      }
+    } catch (err) {
+      alert(`Error: ${(err as Error).message}`);
+    }
+
+    // Reset
+    setManualMatchA(null);
+    setManualMatchMode(false);
+  };
 
   const sendCommand = async (cmd: string) => {
     const apiBase = getApiBase();
@@ -394,26 +447,38 @@ export default function DashboardPage() {
                 {opportunities.length === 0 ? (
                   <div className="empty-state">Scanning for opportunities...</div>
                 ) : opportunities.map(opp => (
-                  <div className="row" key={opp.id}>
-                    <span className="row-time">{formatTime(opp.discoveredAt)}</span>
-                    <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
-                    <span className={`row-outcome ${opp.legA.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
-                      {opp.legA.outcome}
-                    </span>
-                    <span className="row-price">{opp.legA.price.toFixed(3)}</span>
-                    <span style={{ color: 'var(--text-dim)' }}>↔</span>
-                    <span className={`row-platform platform-${opp.legB.platform}`}>{opp.legB.platform.slice(0, 5)}</span>
-                    <span className={`row-outcome ${opp.legB.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
-                      {opp.legB.outcome}
-                    </span>
-                    <span className="row-price">{opp.legB.price.toFixed(3)}</span>
-                    <span className={`row-profit ${pnlClass(opp.expectedProfitUsd)}`}>
-                      {formatUsd(opp.expectedProfitUsd)}
-                    </span>
-                    <span className="row-confidence" title="Match confidence">{formatPct(opp.matchConfidence * 100)}</span>
-                    <span className={`row-status ${opp.executed ? 'status-executed' : 'status-pending-trade'}`}>
-                      {opp.executed ? 'EXEC' : 'OPEN'}
-                    </span>
+                  <div className="opp-card clickable" key={opp.id} onClick={() => navigateToPairFromOpp(opp)}>
+                    <div className="opp-card-header">
+                      <span className="row-time">{formatTime(opp.discoveredAt)}</span>
+                      <span className={`row-profit ${pnlClass(opp.expectedProfitUsd)}`}>
+                        {formatUsd(opp.expectedProfitUsd)}
+                      </span>
+                      <span className="opp-bps">{opp.expectedProfitBps?.toFixed(0) || '—'} bps</span>
+                      {opp.maxSize != null && <span className="opp-size">sz {opp.maxSize.toFixed(0)}</span>}
+                      <span className="row-confidence" title="Match confidence">{formatPct(opp.matchConfidence * 100)}</span>
+                      <span className={`row-status ${opp.executed ? 'status-executed' : 'status-pending-trade'}`}>
+                        {opp.executed ? 'EXEC' : 'OPEN'}
+                      </span>
+                    </div>
+                    <div className="opp-card-legs">
+                      <div className="opp-leg">
+                        <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
+                        <span className={`row-outcome ${opp.legA.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                          {opp.legA.outcome}
+                        </span>
+                        <span className="row-price">{opp.legA.price.toFixed(3)}</span>
+                        <span className="opp-market-q">{opp.legA.marketQuestion?.slice(0, 50) || '—'}</span>
+                      </div>
+                      <span className="opp-arrow">↔</span>
+                      <div className="opp-leg">
+                        <span className={`row-platform platform-${opp.legB.platform}`}>{opp.legB.platform.slice(0, 5)}</span>
+                        <span className={`row-outcome ${opp.legB.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                          {opp.legB.outcome}
+                        </span>
+                        <span className="row-price">{opp.legB.price.toFixed(3)}</span>
+                        <span className="opp-market-q">{opp.legB.marketQuestion?.slice(0, 50) || '—'}</span>
+                      </div>
+                    </div>
                   </div>
                 ))}
               </>
@@ -447,7 +512,29 @@ export default function DashboardPage() {
                     <button className={`filter-btn ${pairStatusFilter === 'paused' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('paused')}>PAUSED</button>
                     <button className={`filter-btn ${pairStatusFilter === 'rejected' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('rejected')}>REJECTED</button>
                   </div>
+                  <div className="filter-group" style={{ marginLeft: 'auto' }}>
+                    <button
+                      className={`filter-btn ${manualMatchMode ? 'manual-match-active' : ''}`}
+                      onClick={() => { setManualMatchMode(!manualMatchMode); setManualMatchA(null); }}
+                    >
+                      {manualMatchMode ? '✕ CANCEL MATCH' : '+ MANUAL MATCH'}
+                    </button>
+                  </div>
                 </div>
+
+                {/* Manual match banner */}
+                {manualMatchMode && (
+                  <div className="manual-match-banner">
+                    {!manualMatchA
+                      ? 'Select the FIRST market from the list below'
+                      : <>
+                          Selected: <span className={`row-platform platform-${manualMatchA.platform}`}>{manualMatchA.platform.slice(0, 5).toUpperCase()}</span>{' '}
+                          <span style={{ color: 'var(--text-primary)' }}>{manualMatchA.question.slice(0, 50)}</span>
+                          {' — now select a market from the OTHER platform'}
+                        </>
+                    }
+                  </div>
+                )}
 
                 {/* Matched pairs section */}
                 {marketFilter !== 'unmatched' && marketsSummary.matchedPairs.length > 0 && (
@@ -459,7 +546,8 @@ export default function DashboardPage() {
                     {marketsSummary.matchedPairs
                       .filter(p => pairStatusFilter === 'all' || p.status === pairStatusFilter)
                       .map((pair, i) => (
-                      <div className={`pair-row pair-status-${pair.status}`} key={pair.pairId || i}>
+                      <div className={`pair-row pair-status-${pair.status} clickable`} key={pair.pairId || i}
+                        onClick={() => navigateToPair(pair)}>
                         <div className="pair-info">
                           <div className="pair-markets">
                             <span className={`row-platform platform-${pair.marketA.platform}`}>
@@ -483,7 +571,7 @@ export default function DashboardPage() {
                         {pair.llmReasoning && (
                           <div className="pair-reasoning">{pair.llmReasoning}</div>
                         )}
-                        <div className="pair-actions">
+                        <div className="pair-actions" onClick={e => e.stopPropagation()}>
                           {pair.status !== 'approved' && (
                             <button className="pair-btn pair-btn-approve" onClick={() => updatePairStatus(pair.pairId, 'approved')}>APPROVE</button>
                           )}
@@ -506,8 +594,19 @@ export default function DashboardPage() {
                 </div>
                 {getFilteredMarkets().length === 0 ? (
                   <div className="empty-state">No markets loaded yet</div>
-                ) : getFilteredMarkets().map((m, i) => (
-                  <div className="market-row" key={`${m.platform}-${m.id}-${i}`}>
+                ) : getFilteredMarkets().map((m, i) => {
+                  const isSelectedA = manualMatchA?.id === m.id && manualMatchA?.platform === m.platform;
+                  return (
+                  <div
+                    className={`market-row clickable ${isSelectedA ? 'manual-match-selected' : ''} ${manualMatchMode ? 'manual-match-candidate' : ''}`}
+                    key={`${m.platform}-${m.id}-${i}`}
+                    onClick={() => {
+                      if (manualMatchMode) {
+                        handleManualMatchClick({ id: m.id, platform: m.platform, question: m.question });
+                      } else {
+                        setBookSelection({ mode: 'single', platformA: m.platform, marketIdA: m.id, questionA: m.question });
+                      }
+                    }}>
                     <span className={`row-platform platform-${m.platform}`}>{m.platform.slice(0, 5).toUpperCase()}</span>
                     <span className={`match-badge ${m.matched ? 'match-yes' : 'match-no'}`}>
                       {m.matched ? 'PAIRED' : '—'}
@@ -515,7 +614,8 @@ export default function DashboardPage() {
                     <span className="market-question">{m.question}</span>
                     {m.category && <span className="market-category">{m.category}</span>}
                   </div>
-                ))}
+                  );
+                })}
               </>
             )}
 
@@ -628,6 +728,14 @@ export default function DashboardPage() {
         <span>PRED-ARB v1.0.0 // DRY RUN MODE</span>
         <span>{new Date().toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' })}</span>
       </div>
+
+      {/* ─── ORDER BOOK VIEWER MODAL (single market only) ──── */}
+      {bookSelection && (
+        <OrderBookViewer
+          selection={bookSelection}
+          onClose={() => setBookSelection(null)}
+        />
+      )}
     </div>
   );
 }

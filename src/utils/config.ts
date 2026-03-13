@@ -33,8 +33,10 @@ export const config = {
     privateKey: process.env.PREDICTFUN_PRIVATE_KEY || '',
     apiUrl: 'https://api.predict.fun',
     testnetUrl: 'https://api-testnet.predict.fun',
-    wsUrl: 'wss://api.predict.fun/ws',
-    wsTestnetUrl: 'wss://api-testnet.predict.fun/ws',
+    // WebSocket lives on a separate subdomain from the REST API.
+    // REST → api.predict.fun   WebSocket → ws.predict.fun
+    wsUrl: 'wss://ws.predict.fun/ws',
+    wsTestnetUrl: 'wss://ws-testnet.predict.fun/ws',
     useTestnet: process.env.PREDICTFUN_USE_TESTNET === 'true',
   },
 
@@ -43,6 +45,10 @@ export const config = {
     maxPositionUsd: envInt('MAX_POSITION_USD', 500),
     scanIntervalMs: envInt('SCAN_INTERVAL_MS', 10000),
     maxTotalExposureUsd: envInt('MAX_TOTAL_EXPOSURE_USD', 5000),
+    /** Minimum order book depth in USD to consider an opportunity executable. Set to 0 for testing. */
+    minDepthUsd: envInt('MIN_DEPTH_USD', 50),
+    /** Interval for refreshing market pairs (ms). Pair matching is separate from opportunity scanning. */
+    pairRefreshIntervalMs: envInt('PAIR_REFRESH_INTERVAL_MS', 300000),
   },
 
   dashboard: {

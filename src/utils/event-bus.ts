@@ -19,6 +19,7 @@ export interface BotEvents {
   'order:placed': OrderResult;
   'order:filled': OrderResult;
   'order:cancelled': OrderResult;
+  'book:update': { platform: string; marketId: string; outcomeIndex: number };
   'connector:connected': { platform: string };
   'connector:disconnected': { platform: string };
   'connector:error': { platform: string; error: string };

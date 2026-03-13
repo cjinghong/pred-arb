@@ -19,18 +19,22 @@ Payout: $1.00
 Profit: $0.03 per share (≈ 309 basis points)
 ```
 
-The strategy runs in both directions — YES on A + NO on B, and NO on A + YES on B — and checks both platforms' live order books every scan cycle.
+The strategy runs in both directions — YES on A + NO on B, and NO on A + YES on B — and uses WebSocket-driven scanning to detect opportunities the instant order books change.
+
+> See [docs/cross-platform-arb.md](docs/cross-platform-arb.md) for a detailed strategy deep-dive covering mechanics, sizing, edge cases, and risk considerations.
 
 ---
 
 ## Features
 
+- **Event-driven scanning** — WebSocket order book updates trigger instant arb detection instead of polling. A reverse market-to-pair index provides O(1) lookup with 200ms per-pair debounce.
 - **Multi-platform architecture** — add new prediction markets by implementing a single `MarketConnector` interface
 - **Extensible strategy engine** — swap in new strategies (e.g. multi-leg, hedged, statistical arb) by implementing the `Strategy` interface
-- **Fuzzy market matching** — Fuse.js text similarity + slug/date/category heuristics to identify equivalent markets across platforms
+- **Fuzzy market matching** — Fuse.js text similarity + slug/date/category heuristics to identify equivalent markets across platforms, with optional LLM verification
 - **Pre-trade risk checks** — position size limits, total exposure cap, per-platform balance checks, match-confidence threshold
 - **Dry-run mode on by default** — logs all opportunities and simulated executions without placing real orders
-- **Bloomberg terminal dashboard** — retro-futuristic React UI with live P&L metrics, opportunity feed, trade history, and bot controls
+- **Bloomberg terminal dashboard** — retro-futuristic React UI with live P&L metrics, opportunity feed, trade history, live orderbook viewer, and bot controls
+- **Live order book viewer** — click any market or matched pair to view live order books with YES/NO toggle, flash animations on updates, and inline arb analysis
 - **Persistent SQLite database** — all opportunities and trades recorded for post-analysis
 - **Typed event bus** — fully typed internal pub/sub for clean component communication
 - **Graceful shutdown** — handles `SIGINT`/`SIGTERM`, cleans up connectors and open orders
@@ -40,59 +44,68 @@ The strategy runs in both directions — YES on A + NO on B, and NO on A + YES o
 ## Architecture
 
 ```
-┌─────────────────────┐        ┌─────────────────────┐
-│  PolymarketConnector │        │  PredictFunConnector │
-│  (Gamma + CLOB APIs) │        │  (REST API)          │
-└──────────┬──────────┘        └──────────┬────────────┘
-           │         implements            │
-           │       MarketConnector         │
-           └───────────────┬──────────────┘
-                           │
-                  ┌────────▼─────────┐
-                  │   MarketMatcher   │
-                  │                   │
-                  │  Pass 1: slug      │  exact slug → 0.95 confidence
-                  │  Pass 2: Fuse.js   │  fuzzy text + date/category boost
-                  └────────┬──────────┘
-                           │  MarketPair[]
-                  ┌────────▼──────────────────────┐
-                  │         Strategy Engine         │
-                  │  ┌────────────────────────────┐ │
-                  │  │  CrossPlatformArbStrategy   │ │  ← extensible
-                  │  │                             │ │
-                  │  │  for each pair:             │ │
-                  │  │    fetch both order books   │ │
-                  │  │    check YES+NO cost < $1   │ │
-                  │  │    check NO+YES cost < $1   │ │
-                  │  │    emit ArbitrageOpportunity │ │
-                  │  └────────────────────────────┘ │
-                  └────────┬──────────────────────────┘
-                           │  ArbitrageOpportunity[]
-                  ┌────────▼──────────────────┐
-                  │      ExecutionEngine        │
-                  │  ┌─────────────────────┐   │
-                  │  │    Risk Manager      │   │  position limits
-                  │  │  - max positions     │   │  exposure cap
-                  │  │  - exposure cap      │   │  balance checks
-                  │  │  - balance check     │   │  confidence floor
-                  │  │  - confidence floor  │   │
-                  │  └─────────────────────┘   │
-                  │  → place both legs          │
-                  └────────┬──────────────────────┘
-                           │
-                  ┌────────▼──────────────────┐
-                  │       Bot Orchestrator      │
-                  │  ┌───────────────────────┐ │
-                  │  │     Event Bus (typed)  │ │
-                  │  └───────────────────────┘ │
-                  │  ┌───────────────────────┐ │
-                  │  │    SQLite Database     │ │  opportunities
-                  │  └───────────────────────┘ │  trades, metrics
-                  │  ┌───────────────────────┐ │
-                  │  │  API Server            │ │  REST + WebSocket
-                  │  │  (Express + ws)        │ │  → dashboard
-                  │  └───────────────────────┘ │
-                  └───────────────────────────────┘
+┌─────────────────────────┐        ┌──────────────────────────┐
+│  PolymarketConnector     │        │  PredictFunConnector      │
+│  (Gamma + CLOB APIs)     │        │  (REST + WS via          │
+│  WS: wss://ws.polymarket │        │   wss://ws.predict.fun)   │
+└──────────┬──────────────┘        └──────────┬───────────────┘
+           │         implements               │
+           │       MarketConnector            │
+           └──────────────┬──────────────────┘
+                          │
+                 ┌────────▼─────────┐
+                 │   MarketMatcher   │
+                 │                   │
+                 │  Pass 1: slug     │  exact slug → 0.95 confidence
+                 │  Pass 2: Fuse.js  │  fuzzy text + date/category boost
+                 │  Pass 3: LLM      │  optional verification via Anthropic
+                 └────────┬──────────┘
+                          │  MarketPair[]
+                 ┌────────▼──────────────────────┐
+                 │  WS OrderBook Manager          │
+                 │  ┌──────────────────────────┐  │
+                 │  │ book:update events ──────────┼──→ Event Bus
+                 │  └──────────────────────────┘  │
+                 └────────┬───────────────────────┘
+                          │  triggers
+                 ┌────────▼──────────────────────┐
+                 │      Strategy Engine           │
+                 │  ┌────────────────────────────┐│
+                 │  │ CrossPlatformArbStrategy    ││
+                 │  │                             ││
+                 │  │ marketToPairs index (O(1))  ││  ← reverse lookup
+                 │  │ for each update:            ││
+                 │  │   find pair → fetch books   ││
+                 │  │   check YES+NO cost < $1    ││
+                 │  │   emit ArbitrageOpportunity ││
+                 │  └────────────────────────────┘│
+                 └────────┬───────────────────────┘
+                          │  ArbitrageOpportunity[]
+                 ┌────────▼──────────────────┐
+                 │    ExecutionEngine          │
+                 │  ┌─────────────────────┐   │
+                 │  │    Risk Manager      │   │  position limits
+                 │  │  - max positions     │   │  exposure cap
+                 │  │  - exposure cap      │   │  balance checks
+                 │  │  - balance check     │   │  confidence floor
+                 │  │  - confidence floor  │   │
+                 │  └─────────────────────┘   │
+                 │  → place both legs          │
+                 └────────┬──────────────────────┘
+                          │
+                 ┌────────▼──────────────────┐
+                 │     Bot Orchestrator        │
+                 │  ┌───────────────────────┐ │
+                 │  │   Event Bus (typed)    │ │
+                 │  └───────────────────────┘ │
+                 │  ┌───────────────────────┐ │
+                 │  │  SQLite Database       │ │  opportunities
+                 │  └───────────────────────┘ │  trades, metrics
+                 │  ┌───────────────────────┐ │
+                 │  │  API Server            │ │  REST + WebSocket
+                 │  │  (Express + ws)        │ │  → dashboard
+                 │  └───────────────────────┘ │
+                 └───────────────────────────────┘
 ```
 
 ---
@@ -103,46 +116,53 @@ The strategy runs in both directions — YES on A + NO on B, and NO on A + YES o
 pred-arb/
 ├── src/
 │   ├── types/
-│   │   ├── market.ts          # NormalizedMarket, OrderBook, ArbitrageOpportunity, TradeRecord, …
-│   │   ├── connector.ts       # MarketConnector interface
-│   │   └── strategy.ts        # Strategy interface
+│   │   ├── market.ts              # NormalizedMarket, OrderBook, ArbitrageOpportunity, TradeRecord, …
+│   │   ├── connector.ts           # MarketConnector interface
+│   │   └── strategy.ts            # Strategy interface
 │   │
 │   ├── connectors/
-│   │   ├── base-connector.ts  # Abstract base with HTTP helpers and retry logic
-│   │   ├── polymarket.ts      # Polymarket Gamma + CLOB connector
-│   │   └── predictfun.ts      # predict.fun REST connector
+│   │   ├── base-connector.ts      # Abstract base with HTTP helpers and retry logic
+│   │   ├── polymarket.ts          # Polymarket Gamma + CLOB connector
+│   │   ├── predictfun.ts          # predict.fun REST + WS connector (x-api-key auth)
+│   │   └── ws-orderbook-manager.ts # WebSocket order book manager — emits book:update events
 │   │
 │   ├── matcher/
-│   │   └── market-matcher.ts  # Fuse.js fuzzy matching + slug/date/category heuristics
+│   │   ├── market-matcher.ts      # Fuse.js fuzzy matching + slug/date/category heuristics
+│   │   └── llm-verifier.ts        # Optional LLM-based pair verification (Anthropic)
 │   │
 │   ├── strategies/
-│   │   └── cross-platform-arb.ts  # YES+NO complement arbitrage strategy
+│   │   └── cross-platform-arb.ts  # YES+NO complement arbitrage (event-driven via WS)
 │   │
 │   ├── engine/
-│   │   ├── bot.ts             # Main orchestrator — scan loop, startup, shutdown
-│   │   ├── execution-engine.ts # Validate → risk check → place orders
-│   │   ├── risk-manager.ts    # Pre-trade risk checks and position tracking
-│   │   └── api-server.ts      # Express REST + WebSocket server
+│   │   ├── bot.ts                 # Main orchestrator — event-driven scanning, startup, shutdown
+│   │   ├── execution-engine.ts    # Validate → risk check → place orders
+│   │   ├── risk-manager.ts        # Pre-trade risk checks and position tracking
+│   │   └── api-server.ts          # Express REST + WebSocket server + orderbook endpoint
 │   │
 │   ├── db/
-│   │   └── database.ts        # SQLite schema, CRUD helpers, dashboard metrics query
+│   │   └── database.ts            # SQLite schema, CRUD helpers, dashboard metrics query
 │   │
 │   ├── utils/
-│   │   ├── config.ts          # Centralized env-var config
-│   │   ├── logger.ts          # Winston structured logger
-│   │   └── event-bus.ts       # Typed pub/sub event bus
+│   │   ├── config.ts              # Centralized env-var config
+│   │   ├── logger.ts              # Winston structured logger
+│   │   └── event-bus.ts           # Typed pub/sub event bus
 │   │
-│   └── index.ts               # Entry point + graceful shutdown
+│   └── index.ts                   # Entry point + graceful shutdown
 │
 ├── dashboard/
 │   ├── app/
-│   │   ├── layout.tsx         # Root layout + fonts
-│   │   ├── page.tsx           # Terminal dashboard (React)
-│   │   └── globals.css        # Bloomberg terminal styles
-│   ├── next.config.ts         # Next.js (static export)
+│   │   ├── layout.tsx             # Root layout + fonts
+│   │   ├── page.tsx               # Terminal dashboard (React)
+│   │   ├── pair/page.tsx          # Matched pair detail page with live orderbooks
+│   │   ├── orderbook-viewer.tsx   # Orderbook component (YES/NO toggle, flash, arb summary)
+│   │   └── globals.css            # Bloomberg terminal styles
+│   ├── next.config.ts             # Next.js (static export)
 │   └── package.json
 │
-├── data/                      # SQLite DB created here at runtime
+├── docs/
+│   └── cross-platform-arb.md     # Detailed strategy documentation
+│
+├── data/                          # SQLite DB created here at runtime
 ├── .env.example
 ├── package.json
 └── tsconfig.json
@@ -179,14 +199,20 @@ POLYMARKET_PRIVATE_KEY=       # EOA private key for EIP-712 order signing
 POLYMARKET_CHAIN_ID=137
 
 # predict.fun — needed only for live order placement
-PREDICTFUN_API_KEY=
+PREDICTFUN_API_KEY=           # required for mainnet; testnet is open
 PREDICTFUN_PRIVATE_KEY=
+PREDICTFUN_USE_TESTNET=false
 
 # Bot parameters
 MIN_PROFIT_BPS=150            # 1.5% minimum profit after fees
 MAX_POSITION_USD=500          # max spend per trade leg
 MAX_TOTAL_EXPOSURE_USD=5000   # total outstanding exposure cap
-SCAN_INTERVAL_MS=10000        # scan every 10 seconds
+SCAN_INTERVAL_MS=10000        # fallback scan interval (primary is WS-driven)
+MIN_DEPTH_USD=50              # min orderbook depth; set to 0 for testing
+PAIR_REFRESH_INTERVAL_MS=300000 # how often to re-fetch and match markets (5 min)
+
+# Optional: LLM pair verification (auto-approves pairs when set)
+ANTHROPIC_API_KEY=
 
 # Ports
 API_PORT=3848
@@ -203,8 +229,6 @@ DASHBOARD_PORT=3847
 # Development (hot-reload bot + separate dashboard dev server)
 npm run start:dev          # terminal 1 — bot on :3848
 npm run dashboard:dev      # terminal 2 — Next.js dashboard on :3847
-# For dev: copy dashboard/.env.local.example to dashboard/.env.local
-# and set NEXT_PUBLIC_WS_URL=ws://localhost:3848 (Next.js doesn't proxy WebSockets)
 
 # Production
 npm run build:all          # compile backend + build dashboard
@@ -223,15 +247,19 @@ The admin dashboard uses a retro-futuristic Bloomberg terminal aesthetic — amb
 
 | Panel | Description |
 |---|---|
-| Metrics strip | Rolling 24h / 7d / all-time P&L, win rate, trade count, avg profit, equity sparkline |
-| Arbitrage Opportunities | Live feed of discovered opportunities with platforms, outcomes, prices, expected profit, match confidence |
+| Metrics strip | Rolling 24h / 7d / all-time P&L, win rate, trade count, exposure, equity sparkline |
+| Opportunities | Live feed with market questions, platforms, outcomes, prices, expected profit, bps, size, and match confidence. Click to navigate to the pair detail page. |
+| Markets | All markets across platforms with match status. Filter by platform, match status, pair approval state. Click matched pairs to view their dedicated pair page. |
+| Trades | Executed trades with leg details, realized P&L, fees, and status |
 | Activity Feed | Real-time event stream (scan completions, trade executions, risk alerts) |
-| Trade History | All executed trades with leg details, realized P&L, fees, and status |
-| Strategy Config | Active strategies, parameters, and system architecture diagram |
+
+**Pair detail page:**
+
+Click any matched pair from the dashboard to open a full-page view with side-by-side live orderbooks, YES/NO toggle per book, flash-on-update animations, and inline arb analysis showing both directions with cost, size, and profit in basis points.
 
 **Bot controls:**
 
-- **PAUSE** — suspends the scan loop, leaves open orders as-is
+- **PAUSE** — suspends scanning, leaves open orders as-is
 - **RESUME** — resumes scanning
 - **STOP** — graceful shutdown of all connectors and strategies
 
@@ -241,7 +269,7 @@ The dashboard connects over WebSocket for push updates and falls back to REST po
 
 ## Adding a new platform
 
-Implement the `MarketConnector` interface (10 methods):
+Implement the `MarketConnector` interface:
 
 ```typescript
 // src/connectors/my-platform.ts
@@ -264,14 +292,7 @@ export class MyPlatformConnector extends BaseConnector {
 }
 ```
 
-Then register it in `src/engine/bot.ts`:
-
-```typescript
-const myPlatform = new MyPlatformConnector();
-this.connectors.set('myplatform', myPlatform);
-```
-
-Add `'myplatform'` to the `Platform` union type in `src/types/market.ts`.
+Then register it in `src/engine/bot.ts` and add `'myplatform'` to the `Platform` union type in `src/types/market.ts`.
 
 ---
 
@@ -280,36 +301,15 @@ Add `'myplatform'` to the `Platform` union type in `src/types/market.ts`.
 Implement the `Strategy` interface:
 
 ```typescript
-// src/strategies/my-strategy.ts
 export class MyStrategy implements Strategy {
   readonly id = 'my-strategy';
-  readonly name = 'My Strategy';
-  readonly description = '...';
-  readonly platforms: Platform[] = ['polymarket', 'predictfun'];
-  readonly config: StrategyConfig = { /* ... */ };
-
-  async initialize(connectors: Map<Platform, MarketConnector>): Promise<void> { /* ... */ }
-  async shutdown(): Promise<void> { /* ... */ }
-
-  async scan(): Promise<ArbitrageOpportunity[]> {
-    // Your logic here — return opportunities, never execute directly
-  }
-
-  async validate(opportunity: ArbitrageOpportunity): Promise<boolean> {
-    // Re-check prices just before execution
-  }
-
-  getMetrics(): StrategyMetrics { /* ... */ }
+  async scan(): Promise<ArbitrageOpportunity[]> { /* your logic */ }
+  async validate(opportunity: ArbitrageOpportunity): Promise<boolean> { /* re-check */ }
+  // ...
 }
 ```
 
-Register it in `bot.ts`:
-
-```typescript
-const myStrategy = new MyStrategy();
-await myStrategy.initialize(this.connectors);
-this.strategies.set(myStrategy.id, myStrategy);
-```
+Register it in `bot.ts`. Strategies never execute trades directly — they emit opportunities that flow through the execution engine and risk manager.
 
 ---
 
@@ -327,22 +327,11 @@ All trades pass through the `RiskManager` before execution. Checks in order:
 
 ## Live trading notes
 
-> ⚠️ The bot starts in **dry-run mode** (`dryRun = true` in `bot.ts`). All opportunities are logged and simulated, but no real orders are placed. Review simulated P&L before going live.
+> The bot starts in **dry-run mode** (`dryRun = true` in `bot.ts`). All opportunities are logged and simulated, but no real orders are placed. Review simulated P&L before going live.
 
-To enable live trading, change `bot.ts`:
+**Polymarket** requires a funded USDC wallet on Polygon (chain ID 137), API credentials generated via the CLOB API, and EIP-712 order signing with your private key.
 
-```typescript
-this.executionEngine = new ExecutionEngine(this.riskManager, /* dryRun */ false);
-```
-
-**Polymarket** requires:
-- A funded USDC wallet on Polygon (chain ID 137)
-- API credentials generated via the CLOB API (`create_or_derive_api_creds`)
-- EIP-712 order signing with your private key
-
-**predict.fun** requires:
-- An API key from predict.fun
-- Wallet signing for order authentication
+**predict.fun** requires an API key (`x-api-key` header) for mainnet. Testnet is open and requires no key. Set `PREDICTFUN_USE_TESTNET=true` in `.env` for testnet.
 
 ---
 
@@ -352,8 +341,8 @@ this.executionEngine = new ExecutionEngine(this.riskManager, /* dryRun */ false)
 |---|---|
 | Language | TypeScript 5, Node.js 18+ |
 | HTTP | Native `fetch` (Node 18+) with exponential backoff |
-| WebSocket | `ws` library |
-| Market matching | Fuse.js (fuzzy search) |
+| WebSocket | `ws` library (order book streaming + dashboard push) |
+| Market matching | Fuse.js (fuzzy search) + optional LLM verification |
 | Database | SQLite via `better-sqlite3` |
 | API server | Express |
 | Logging | Winston (structured JSON) |
@@ -372,4 +361,4 @@ npm run build:dashboard  # Build dashboard to dashboard/out/
 npm run build:all        # Both
 ```
 
-Logs are written to stdout in JSON format (Winston). Set `LOG_LEVEL=debug` for verbose connector output.
+Logs are written to stdout in JSON format (Winston). Set `LOG_LEVEL=debug` for verbose connector and order book output.

@@ -173,12 +173,19 @@ export class BacktestDataFetcher {
   private async fetchPredictFunMarkets(limit: number): Promise<NormalizedMarket[]> {
     const params = new URLSearchParams({
       first: String(limit),
-      status: 'OPEN',
+      tradingStatus: 'OPEN',
       sort: 'VOLUME_TOTAL_DESC',
     });
 
-    const resp = await fetch(`${this.predictfunUrl}/v1/markets?${params}`);
-    if (!resp.ok) throw new Error(`predict.fun API error: ${resp.status}`);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (config.predictfun.apiKey) {
+      headers['x-api-key'] = config.predictfun.apiKey;
+    }
+
+    const resp = await fetch(`${this.predictfunUrl}/v1/markets?${params}`, { headers });
+    if (!resp.ok) throw new Error(`predict.fun API error: ${resp.status} ${await resp.text()}`);
     const body = await resp.json() as { data: Array<Record<string, unknown>> };
     const markets = body.data || [];
 
