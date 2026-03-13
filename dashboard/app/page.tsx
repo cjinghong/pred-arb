@@ -54,6 +54,28 @@ interface BotStatus {
   timestamp: string;
 }
 
+interface MarketItem {
+  id: string;
+  question: string;
+  category: string;
+  matched: boolean;
+}
+
+interface MatchedPair {
+  pairId: string;
+  marketA: { id: string; platform: string; question: string };
+  marketB: { id: string; platform: string; question: string };
+  confidence: number;
+  matchMethod: string;
+  status: 'pending' | 'approved' | 'paused' | 'rejected';
+  llmReasoning?: string;
+}
+
+interface MarketsSummary {
+  platforms: Record<string, { total: number; markets: MarketItem[] }>;
+  matchedPairs: MatchedPair[];
+}
+
 interface WsMessage {
   type: string;
   data: {
@@ -66,6 +88,9 @@ interface WsMessage {
   };
   timestamp: string;
 }
+
+// ─── Tab selector type ─────────────────────────────────────────────────────
+type ActiveTab = 'opportunities' | 'markets' | 'trades';
 
 // ─── Utils ─────────────────────────────────────────────────────────────────
 
@@ -108,7 +133,7 @@ function sparkline(data: number[], width = 40): string {
     .join('');
 }
 
-// ─── API base URL (dev: proxy or explicit; prod: same origin) ──────────────
+// ─── API base URL ───────────────────────────────────────────────────────────
 
 function getApiBase(): string {
   if (typeof window === 'undefined') return '';
@@ -136,12 +161,16 @@ export default function DashboardPage() {
   });
   const [trades, setTrades] = useState<Trade[]>([]);
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
+  const [marketsSummary, setMarketsSummary] = useState<MarketsSummary>({ platforms: {}, matchedPairs: [] });
   const [feed, setFeed] = useState<Array<{ time: string; type: string; msg: string; cls: string }>>([]);
   const [clock, setClock] = useState('1970-01-01T00:00:00.000Z');
   const [pnlHistory, setPnlHistory] = useState<number[]>([]);
+  const [activeTab, setActiveTab] = useState<ActiveTab>('opportunities');
+  const [marketFilter, setMarketFilter] = useState<'all' | 'matched' | 'unmatched'>('all');
+  const [platformFilter, setPlatformFilter] = useState<string>('all');
+  const [pairStatusFilter, setPairStatusFilter] = useState<'all' | 'approved' | 'pending' | 'paused' | 'rejected'>('all');
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Defer random sparkline data to client to avoid hydration mismatch
   useEffect(() => {
     setPnlHistory(Array.from({ length: 40 }, () => Math.random() * 10 - 3));
   }, []);
@@ -191,19 +220,14 @@ export default function DashboardPage() {
       const url = getWsUrl();
       const ws = new WebSocket(url);
       wsRef.current = ws;
-
       ws.onmessage = (ev) => {
         try {
           const msg: WsMessage = JSON.parse(ev.data);
           handleWsMessage(msg);
         } catch { /* ignore */ }
       };
-
-      ws.onclose = () => {
-        setTimeout(connect, 3000);
-      };
+      ws.onclose = () => { setTimeout(connect, 3000); };
     };
-
     connect();
     return () => wsRef.current?.close();
   }, [handleWsMessage]);
@@ -212,19 +236,20 @@ export default function DashboardPage() {
     const apiBase = getApiBase();
     const poll = async () => {
       try {
-        const [s, m, t, o] = await Promise.all([
+        const [s, m, t, o, mk] = await Promise.all([
           fetch(`${apiBase}/api/status`).then(r => r.json()),
           fetch(`${apiBase}/api/metrics`).then(r => r.json()),
           fetch(`${apiBase}/api/trades?limit=30`).then(r => r.json()),
           fetch(`${apiBase}/api/opportunities?limit=30`).then(r => r.json()),
+          fetch(`${apiBase}/api/markets`).then(r => r.json()).catch(() => ({ platforms: {}, matchedPairs: [] })),
         ]);
         setStatus(s);
         setMetrics(m);
         setTrades(t);
         setOpportunities(o);
+        setMarketsSummary(mk);
       } catch { /* server not up yet */ }
     };
-
     poll();
     const t = setInterval(poll, 5000);
     return () => clearInterval(t);
@@ -233,6 +258,22 @@ export default function DashboardPage() {
   const sendCommand = async (cmd: string) => {
     const apiBase = getApiBase();
     await fetch(`${apiBase}/api/bot/${cmd}`, { method: 'POST' });
+  };
+
+  const updatePairStatus = async (pairId: string, status: string) => {
+    const apiBase = getApiBase();
+    await fetch(`${apiBase}/api/pairs/${encodeURIComponent(pairId)}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    // Optimistically update local state
+    setMarketsSummary(prev => ({
+      ...prev,
+      matchedPairs: prev.matchedPairs.map(p =>
+        p.pairId === pairId ? { ...p, status: status as MatchedPair['status'] } : p
+      ),
+    }));
   };
 
   const stateClass = status.state === 'RUNNING' ? 'status-running'
@@ -244,10 +285,30 @@ export default function DashboardPage() {
     : status.state === 'PAUSED' ? 'pulse-amber'
     : 'pulse-red';
 
+  // Compute market counts
+  const platformNames = Object.keys(marketsSummary.platforms);
+  const totalMarkets = platformNames.reduce((s, p) => s + (marketsSummary.platforms[p]?.total || 0), 0);
+  const totalMatched = marketsSummary.matchedPairs.length;
+
+  // Build filtered market list for Markets tab
+  const getFilteredMarkets = () => {
+    const allMarkets: (MarketItem & { platform: string })[] = [];
+    for (const [platform, data] of Object.entries(marketsSummary.platforms)) {
+      for (const m of data.markets) {
+        if (platformFilter !== 'all' && platform !== platformFilter) continue;
+        if (marketFilter === 'matched' && !m.matched) continue;
+        if (marketFilter === 'unmatched' && m.matched) continue;
+        allMarkets.push({ ...m, platform });
+      }
+    }
+    return allMarkets;
+  };
+
   return (
-    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
+    <div className="root-layout">
       <div className="scanlines" />
 
+      {/* ─── HEADER ──────────────────────────────────────────── */}
       <div className="header">
         <div className="header-left">
           <span className="logo">PRED-ARB</span>
@@ -271,6 +332,7 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {/* ─── METRICS STRIP ──────────────────────────────────── */}
       <div className="metrics-strip">
         <div className="metric-cell">
           <span className="metric-label">P&L 24H</span>
@@ -293,10 +355,9 @@ export default function DashboardPage() {
           <span className="metric-value neutral">{metrics.totalTrades}</span>
         </div>
         <div className="metric-cell">
-          <span className="metric-label">AVG PROFIT</span>
-          <span className={`metric-value ${pnlClass(metrics.avgProfitPerTrade)}`}>
-            {formatUsd(metrics.avgProfitPerTrade)}
-          </span>
+          <span className="metric-label">MARKETS</span>
+          <span className="metric-value cyan">{totalMarkets}</span>
+          <span className="metric-sub">{totalMatched} matched</span>
         </div>
         <div className="metric-cell">
           <span className="metric-label">EXPOSURE</span>
@@ -308,172 +369,261 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <div className="grid">
-        <div className="panel wide-panel">
-          <div className="panel-header">
-            <span className="panel-title">Arbitrage Opportunities</span>
-            <span className="panel-tag">LIVE</span>
+      {/* ─── MAIN CONTENT ───────────────────────────────────── */}
+      <div className="main-content">
+        {/* LEFT: Tabbed main panel */}
+        <div className="main-left">
+          {/* Tab bar */}
+          <div className="tab-bar">
+            <button className={`tab-btn ${activeTab === 'opportunities' ? 'tab-active' : ''}`} onClick={() => setActiveTab('opportunities')}>
+              OPPORTUNITIES
+            </button>
+            <button className={`tab-btn ${activeTab === 'markets' ? 'tab-active' : ''}`} onClick={() => setActiveTab('markets')}>
+              MARKETS ({totalMarkets})
+            </button>
+            <button className={`tab-btn ${activeTab === 'trades' ? 'tab-active' : ''}`} onClick={() => setActiveTab('trades')}>
+              TRADES ({metrics.totalTrades})
+            </button>
           </div>
-          <div className="panel-body">
-            {opportunities.length === 0 ? (
-              <div style={{ color: 'var(--text-dim)', padding: '20px', textAlign: 'center' }}>
-                Scanning for opportunities...
-              </div>
-            ) : opportunities.map(opp => (
-              <div className="row" key={opp.id}>
-                <span className="row-time">{formatTime(opp.discoveredAt)}</span>
-                <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
-                <span className={`row-outcome ${opp.legA.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
-                  {opp.legA.outcome}
-                </span>
-                <span className="row-price">{opp.legA.price.toFixed(3)}</span>
-                <span style={{ color: 'var(--text-dim)' }}>↔</span>
-                <span className={`row-platform platform-${opp.legB.platform}`}>{opp.legB.platform.slice(0, 5)}</span>
-                <span className={`row-outcome ${opp.legB.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
-                  {opp.legB.outcome}
-                </span>
-                <span className="row-price">{opp.legB.price.toFixed(3)}</span>
-                <span className={`row-profit ${pnlClass(opp.expectedProfitUsd)}`}>
-                  {formatUsd(opp.expectedProfitUsd)}
-                </span>
-                <span className="row-confidence" title="Match confidence">{formatPct(opp.matchConfidence * 100)}</span>
-                <span className={`row-status ${opp.executed ? 'status-executed' : 'status-pending-trade'}`}>
-                  {opp.executed ? 'EXEC' : 'OPEN'}
-                </span>
-              </div>
-            ))}
+
+          {/* Tab content */}
+          <div className="tab-content">
+            {/* ─── OPPORTUNITIES TAB ─── */}
+            {activeTab === 'opportunities' && (
+              <>
+                {opportunities.length === 0 ? (
+                  <div className="empty-state">Scanning for opportunities...</div>
+                ) : opportunities.map(opp => (
+                  <div className="row" key={opp.id}>
+                    <span className="row-time">{formatTime(opp.discoveredAt)}</span>
+                    <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
+                    <span className={`row-outcome ${opp.legA.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                      {opp.legA.outcome}
+                    </span>
+                    <span className="row-price">{opp.legA.price.toFixed(3)}</span>
+                    <span style={{ color: 'var(--text-dim)' }}>↔</span>
+                    <span className={`row-platform platform-${opp.legB.platform}`}>{opp.legB.platform.slice(0, 5)}</span>
+                    <span className={`row-outcome ${opp.legB.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                      {opp.legB.outcome}
+                    </span>
+                    <span className="row-price">{opp.legB.price.toFixed(3)}</span>
+                    <span className={`row-profit ${pnlClass(opp.expectedProfitUsd)}`}>
+                      {formatUsd(opp.expectedProfitUsd)}
+                    </span>
+                    <span className="row-confidence" title="Match confidence">{formatPct(opp.matchConfidence * 100)}</span>
+                    <span className={`row-status ${opp.executed ? 'status-executed' : 'status-pending-trade'}`}>
+                      {opp.executed ? 'EXEC' : 'OPEN'}
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+
+            {/* ─── MARKETS TAB ─── */}
+            {activeTab === 'markets' && (
+              <>
+                {/* Filter bar */}
+                <div className="filter-bar">
+                  <div className="filter-group">
+                    <span className="filter-label">MARKETS</span>
+                    <button className={`filter-btn ${marketFilter === 'all' ? 'filter-active' : ''}`} onClick={() => setMarketFilter('all')}>ALL</button>
+                    <button className={`filter-btn ${marketFilter === 'matched' ? 'filter-active' : ''}`} onClick={() => setMarketFilter('matched')}>MATCHED</button>
+                    <button className={`filter-btn ${marketFilter === 'unmatched' ? 'filter-active' : ''}`} onClick={() => setMarketFilter('unmatched')}>UNMATCHED</button>
+                  </div>
+                  <div className="filter-group">
+                    <span className="filter-label">PLATFORM</span>
+                    <button className={`filter-btn ${platformFilter === 'all' ? 'filter-active' : ''}`} onClick={() => setPlatformFilter('all')}>ALL</button>
+                    {platformNames.map(p => (
+                      <button key={p} className={`filter-btn ${platformFilter === p ? 'filter-active' : ''}`} onClick={() => setPlatformFilter(p)}>
+                        {p.toUpperCase().slice(0, 7)}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="filter-group">
+                    <span className="filter-label">PAIR STATUS</span>
+                    <button className={`filter-btn ${pairStatusFilter === 'all' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('all')}>ALL</button>
+                    <button className={`filter-btn ${pairStatusFilter === 'approved' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('approved')}>APPROVED</button>
+                    <button className={`filter-btn ${pairStatusFilter === 'pending' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('pending')}>PENDING</button>
+                    <button className={`filter-btn ${pairStatusFilter === 'paused' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('paused')}>PAUSED</button>
+                    <button className={`filter-btn ${pairStatusFilter === 'rejected' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('rejected')}>REJECTED</button>
+                  </div>
+                </div>
+
+                {/* Matched pairs section */}
+                {marketFilter !== 'unmatched' && marketsSummary.matchedPairs.length > 0 && (
+                  <div className="matched-pairs-section">
+                    <div className="section-header">
+                      <span className="section-title">MATCHED PAIRS</span>
+                      <span className="panel-tag">{marketsSummary.matchedPairs.filter(p => pairStatusFilter === 'all' || p.status === pairStatusFilter).length}</span>
+                    </div>
+                    {marketsSummary.matchedPairs
+                      .filter(p => pairStatusFilter === 'all' || p.status === pairStatusFilter)
+                      .map((pair, i) => (
+                      <div className={`pair-row pair-status-${pair.status}`} key={pair.pairId || i}>
+                        <div className="pair-info">
+                          <div className="pair-markets">
+                            <span className={`row-platform platform-${pair.marketA.platform}`}>
+                              {pair.marketA.platform.slice(0, 5).toUpperCase()}
+                            </span>
+                            <span className="pair-question">{pair.marketA.question.slice(0, 55)}</span>
+                          </div>
+                          <div className="pair-separator">⟷</div>
+                          <div className="pair-markets">
+                            <span className={`row-platform platform-${pair.marketB.platform}`}>
+                              {pair.marketB.platform.slice(0, 5).toUpperCase()}
+                            </span>
+                            <span className="pair-question">{pair.marketB.question.slice(0, 55)}</span>
+                          </div>
+                        </div>
+                        <div className="pair-meta">
+                          <span className="pair-confidence">{formatPct(pair.confidence * 100)}</span>
+                          <span className={`pair-method method-${pair.matchMethod}`}>{pair.matchMethod.replace('_', ' ')}</span>
+                          <span className={`pair-status-badge status-${pair.status ?? 'pending'}`}>{(pair.status ?? 'pending').toUpperCase()}</span>
+                        </div>
+                        {pair.llmReasoning && (
+                          <div className="pair-reasoning">{pair.llmReasoning}</div>
+                        )}
+                        <div className="pair-actions">
+                          {pair.status !== 'approved' && (
+                            <button className="pair-btn pair-btn-approve" onClick={() => updatePairStatus(pair.pairId, 'approved')}>APPROVE</button>
+                          )}
+                          {pair.status !== 'paused' && pair.status !== 'rejected' && (
+                            <button className="pair-btn pair-btn-pause" onClick={() => updatePairStatus(pair.pairId, 'paused')}>PAUSE</button>
+                          )}
+                          {pair.status !== 'rejected' && (
+                            <button className="pair-btn pair-btn-reject" onClick={() => updatePairStatus(pair.pairId, 'rejected')}>REJECT</button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* All markets list */}
+                <div className="section-header" style={{ marginTop: 8 }}>
+                  <span className="section-title">ALL MARKETS</span>
+                  <span className="panel-tag">{getFilteredMarkets().length}</span>
+                </div>
+                {getFilteredMarkets().length === 0 ? (
+                  <div className="empty-state">No markets loaded yet</div>
+                ) : getFilteredMarkets().map((m, i) => (
+                  <div className="market-row" key={`${m.platform}-${m.id}-${i}`}>
+                    <span className={`row-platform platform-${m.platform}`}>{m.platform.slice(0, 5).toUpperCase()}</span>
+                    <span className={`match-badge ${m.matched ? 'match-yes' : 'match-no'}`}>
+                      {m.matched ? 'PAIRED' : '—'}
+                    </span>
+                    <span className="market-question">{m.question}</span>
+                    {m.category && <span className="market-category">{m.category}</span>}
+                  </div>
+                ))}
+              </>
+            )}
+
+            {/* ─── TRADES TAB ─── */}
+            {activeTab === 'trades' && (
+              <>
+                {trades.length === 0 ? (
+                  <div className="empty-state">No trades executed yet</div>
+                ) : trades.map(t => (
+                  <div className="row" key={t.id}>
+                    <span className="row-time">{formatTime(t.created_at)}</span>
+                    <span className={`row-platform platform-${t.leg_a_platform || 'polymarket'}`}>
+                      {(t.leg_a_platform || 'POLY').slice(0, 5)}
+                    </span>
+                    <span className="row-price">{t.leg_a_price?.toFixed(3) || '—'}</span>
+                    <span style={{ color: 'var(--text-dim)' }}>↔</span>
+                    <span className={`row-platform platform-${t.leg_b_platform || 'predictfun'}`}>
+                      {(t.leg_b_platform || 'PFUN').slice(0, 5)}
+                    </span>
+                    <span className="row-price">{t.leg_b_price?.toFixed(3) || '—'}</span>
+                    <span className={`row-profit ${pnlClass(t.realized_profit_usd)}`}>
+                      {formatUsd(t.realized_profit_usd ?? t.expected_profit_usd)}
+                    </span>
+                    <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>
+                      FEE {t.fees?.toFixed(2) || '0.00'}
+                    </span>
+                    <span className={`row-status ${
+                      t.status === 'EXECUTED' ? 'status-executed' :
+                      t.status === 'FAILED' ? 'status-failed-trade' : 'status-pending-trade'
+                    }`}>
+                      {t.status}
+                    </span>
+                    {t.notes && <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>{t.notes}</span>}
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         </div>
 
-        <div className="panel">
-          <div className="panel-header">
-            <span className="panel-title">Activity Feed</span>
-            <span className="panel-tag">STREAM</span>
-          </div>
-          <div className="panel-body">
-            {feed.length === 0 ? (
-              <div style={{ color: 'var(--text-dim)', padding: '20px', textAlign: 'center' }}>
-                Waiting for events...
-              </div>
-            ) : feed.map((item, i) => (
-              <div className="feed-item" key={i}>
-                <span className="feed-time">{item.time}</span>
-                <span className={`feed-type ${item.cls}`}>{item.type}</span>
-                <span className="feed-msg">{item.msg}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="panel wide-panel">
-          <div className="panel-header">
-            <span className="panel-title">Trade History</span>
-            <span className="panel-tag">{metrics.totalTrades} TOTAL</span>
-          </div>
-          <div className="panel-body">
-            {trades.length === 0 ? (
-              <div style={{ color: 'var(--text-dim)', padding: '20px', textAlign: 'center' }}>
-                No trades executed yet
-              </div>
-            ) : trades.map(t => (
-              <div className="row" key={t.id}>
-                <span className="row-time">{formatTime(t.created_at)}</span>
-                <span className={`row-platform platform-${t.leg_a_platform || 'polymarket'}`}>
-                  {(t.leg_a_platform || 'POLY').slice(0, 5)}
-                </span>
-                <span className="row-price">{t.leg_a_price?.toFixed(3) || '—'}</span>
-                <span style={{ color: 'var(--text-dim)' }}>↔</span>
-                <span className={`row-platform platform-${t.leg_b_platform || 'predictfun'}`}>
-                  {(t.leg_b_platform || 'PFUN').slice(0, 5)}
-                </span>
-                <span className="row-price">{t.leg_b_price?.toFixed(3) || '—'}</span>
-                <span className={`row-profit ${pnlClass(t.realized_profit_usd)}`}>
-                  {formatUsd(t.realized_profit_usd ?? t.expected_profit_usd)}
-                </span>
-                <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>
-                  FEE {t.fees?.toFixed(2) || '0.00'}
-                </span>
-                <span className={`row-status ${
-                  t.status === 'EXECUTED' ? 'status-executed' :
-                  t.status === 'FAILED' ? 'status-failed-trade' : 'status-pending-trade'
-                }`}>
-                  {t.status}
-                </span>
-                {t.notes && <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>{t.notes}</span>}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <span className="panel-title">Strategies</span>
-            <span className="panel-tag">CONFIG</span>
-          </div>
-          <div className="panel-body">
-            <div style={{ padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                <span style={{ color: 'var(--accent-amber)', fontWeight: 600 }}>CROSS-PLATFORM ARB</span>
-                <span className="status-badge status-running" style={{ fontSize: 8 }}>ACTIVE</span>
-              </div>
-              <div style={{ color: 'var(--text-dim)', fontSize: 10, marginBottom: 8 }}>
-                Buy opposite outcomes on matched markets across Polymarket and predict.fun
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px', fontSize: 10 }}>
-                <span className="metric-label">MIN PROFIT</span>
-                <span style={{ color: 'var(--text-primary)' }}>150 BPS</span>
-                <span className="metric-label">MAX POSITION</span>
-                <span style={{ color: 'var(--text-primary)' }}>$500</span>
-                <span className="metric-label">MAX EXPOSURE</span>
-                <span style={{ color: 'var(--text-primary)' }}>$5,000</span>
-                <span className="metric-label">SCAN INTERVAL</span>
-                <span style={{ color: 'var(--text-primary)' }}>10s</span>
-              </div>
+        {/* RIGHT: Activity Feed + Strategy */}
+        <div className="main-right">
+          <div className="panel" style={{ flex: 1 }}>
+            <div className="panel-header">
+              <span className="panel-title">Activity Feed</span>
+              <span className="panel-tag">STREAM</span>
             </div>
-            <div style={{ padding: '12px 0', color: 'var(--text-dim)', fontSize: 10 }}>
-              <div style={{ marginBottom: 8, color: 'var(--text-secondary)', fontWeight: 500, letterSpacing: 1 }}>
-                ARCHITECTURE
+            <div className="panel-body">
+              {feed.length === 0 ? (
+                <div className="empty-state">Waiting for events...</div>
+              ) : feed.map((item, i) => (
+                <div className="feed-item" key={i}>
+                  <span className="feed-time">{item.time}</span>
+                  <span className={`feed-type ${item.cls}`}>{item.type}</span>
+                  <span className="feed-msg">{item.msg}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="panel" style={{ flex: 0, minHeight: 'auto' }}>
+            <div className="panel-header">
+              <span className="panel-title">Strategy</span>
+              <span className="panel-tag">CONFIG</span>
+            </div>
+            <div className="panel-body">
+              <div style={{ padding: '6px 0' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <span style={{ color: 'var(--accent-amber)', fontWeight: 600, fontSize: 10 }}>CROSS-PLATFORM ARB</span>
+                  <span className="status-badge status-running" style={{ fontSize: 8 }}>ACTIVE</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 12px', fontSize: 10 }}>
+                  <span className="metric-label">MIN PROFIT</span>
+                  <span style={{ color: 'var(--text-primary)' }}>150 BPS</span>
+                  <span className="metric-label">MAX POSITION</span>
+                  <span style={{ color: 'var(--text-primary)' }}>$500</span>
+                  <span className="metric-label">SCAN INTERVAL</span>
+                  <span style={{ color: 'var(--text-primary)' }}>10s</span>
+                </div>
               </div>
-              <pre style={{ fontSize: 9, lineHeight: 1.3, color: 'var(--accent-green)', whiteSpace: 'pre-wrap' }}>{`
-┌─────────────┐    ┌──────────────┐
-│ POLYMARKET  │    │ PREDICT.FUN  │
-│  Connector  │    │  Connector   │
-└──────┬──────┘    └──────┬───────┘
-       │                  │
-       └────────┬─────────┘
-                │
-        ┌───────▼────────┐
-        │ Market Matcher │
-        │  (Fuse.js)     │
-        └───────┬────────┘
-                │
-        ┌───────▼────────┐
-        │   Strategy     │
-        │    Engine      │
-        └───────┬────────┘
-                │
-    ┌───────────▼──────────┐
-    │  Execution Engine    │
-    │  ┌─────────────────┐ │
-    │  │  Risk Manager   │ │
-    │  └─────────────────┘ │
-    └──────────────────────┘
-              `.trim()}</pre>
             </div>
           </div>
         </div>
       </div>
 
+      {/* ─── FOOTER ─────────────────────────────────────────── */}
       <div className="footer">
         <div className="footer-connections">
-          <span className="conn-indicator">
-            <span className={`conn-dot ${status.state !== 'STOPPED' ? 'conn-active' : 'conn-inactive'}`} />
-            POLYMARKET
-          </span>
-          <span className="conn-indicator">
-            <span className={`conn-dot ${status.state !== 'STOPPED' ? 'conn-active' : 'conn-inactive'}`} />
-            PREDICT.FUN
-          </span>
+          {platformNames.length > 0 ? platformNames.map(p => (
+            <span className="conn-indicator" key={p}>
+              <span className={`conn-dot ${status.state !== 'STOPPED' ? 'conn-active' : 'conn-inactive'}`} />
+              {p.toUpperCase()}
+              <span style={{ color: 'var(--text-dim)', marginLeft: 4 }}>
+                ({marketsSummary.platforms[p]?.total || 0})
+              </span>
+            </span>
+          )) : (
+            <>
+              <span className="conn-indicator">
+                <span className={`conn-dot ${status.state !== 'STOPPED' ? 'conn-active' : 'conn-inactive'}`} />
+                POLYMARKET
+              </span>
+              <span className="conn-indicator">
+                <span className={`conn-dot ${status.state !== 'STOPPED' ? 'conn-active' : 'conn-inactive'}`} />
+                PREDICT.FUN
+              </span>
+            </>
+          )}
         </div>
         <span>PRED-ARB v1.0.0 // DRY RUN MODE</span>
         <span>{new Date().toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' })}</span>

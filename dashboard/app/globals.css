@@ -31,8 +31,16 @@ html, body {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.4;
-  overflow: hidden;
   height: 100vh;
+  overflow: hidden;
+}
+
+/* ─── Root Layout: flex column, fill viewport ──────────────────────────── */
+.root-layout {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 /* Scanline Effect */
@@ -40,21 +48,19 @@ html, body {
   position: fixed; top: 0; left: 0; width: 100%; height: 100%;
   pointer-events: none; z-index: 1000;
   background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0, 0, 0, 0.03) 2px,
-    rgba(0, 0, 0, 0.03) 4px
+    0deg, transparent, transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px, rgba(0, 0, 0, 0.03) 4px
   );
 }
 
-/* Header */
+/* ─── Header ───────────────────────────────────────────────────────────── */
 .header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 16px;
   background: linear-gradient(180deg, #161b2e 0%, #111520 100%);
   border-bottom: 1px solid var(--border-bright);
   min-height: 44px;
+  flex-shrink: 0;
 }
 
 .header-left { display: flex; align-items: center; gap: 16px; }
@@ -105,23 +111,276 @@ html, body {
 .btn-danger:hover { border-color: var(--accent-red); color: var(--accent-red); }
 .btn-success:hover { border-color: var(--accent-green); color: var(--accent-green); }
 
-/* Grid Layout */
-.grid {
-  flex: 1; display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  grid-template-rows: auto 1fr 1fr;
+/* ─── Metrics Strip ────────────────────────────────────────────────────── */
+.metrics-strip {
+  display: flex; gap: 1px; background: var(--border);
+  flex-shrink: 0;
+}
+
+.metric-cell {
+  flex: 1; padding: 8px 12px;
+  background: var(--bg-panel);
+  display: flex; flex-direction: column; gap: 2px;
+}
+
+.metric-label {
+  font-size: 9px; color: var(--text-dim); letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+.metric-value { font-size: 18px; font-weight: 600; letter-spacing: 1px; }
+.metric-sub { font-size: 9px; color: var(--text-dim); }
+
+.positive { color: var(--accent-green); }
+.negative { color: var(--accent-red); }
+.neutral { color: var(--text-primary); }
+.amber { color: var(--accent-amber); }
+.cyan { color: var(--accent-cyan); }
+
+/* ─── Main Content: 2-column layout ───────────────────────────────────── */
+.main-content {
+  flex: 1;
+  display: flex;
   gap: 1px;
   background: var(--border);
   overflow: hidden;
+  min-height: 0;  /* crucial: prevents flex child from overflowing */
 }
 
-.metrics-row { grid-column: 1 / -1; }
+.main-left {
+  flex: 2;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  overflow: hidden;
+  min-height: 0;
+}
 
-/* Panel */
+.main-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--border);
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* ─── Tab Bar ──────────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  background: var(--bg-panel-header);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.tab-btn {
+  padding: 8px 16px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.tab-btn:hover { color: var(--text-secondary); }
+
+.tab-btn.tab-active {
+  color: var(--accent-amber);
+  border-bottom-color: var(--accent-amber);
+}
+
+/* ─── Tab Content ──────────────────────────────────────────────────────── */
+.tab-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  min-height: 0;
+}
+
+.tab-content::-webkit-scrollbar { width: 4px; }
+.tab-content::-webkit-scrollbar-track { background: var(--bg-secondary); }
+.tab-content::-webkit-scrollbar-thumb { background: var(--border-bright); }
+
+.empty-state {
+  color: var(--text-dim); padding: 20px; text-align: center;
+}
+
+/* ─── Filter Bar (Markets tab) ─────────────────────────────────────────── */
+.filter-bar {
+  display: flex; gap: 16px; padding: 6px 0; margin-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.filter-group {
+  display: flex; align-items: center; gap: 4px;
+}
+
+.filter-label {
+  font-size: 9px; color: var(--text-dim); letter-spacing: 1px;
+  margin-right: 4px;
+}
+
+.filter-btn {
+  padding: 2px 8px; border: 1px solid var(--border); background: none;
+  color: var(--text-dim); font-family: var(--font-mono); font-size: 9px;
+  cursor: pointer; letter-spacing: 0.5px; transition: all 0.15s;
+}
+
+.filter-btn:hover { border-color: var(--accent-amber); color: var(--text-secondary); }
+
+.filter-btn.filter-active {
+  background: rgba(255, 184, 0, 0.1);
+  border-color: var(--accent-amber-dim);
+  color: var(--accent-amber);
+}
+
+/* ─── Section Headers ──────────────────────────────────────────────────── */
+.section-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0 4px;
+}
+
+.section-title {
+  font-size: 10px; font-weight: 600; letter-spacing: 2px;
+  color: var(--accent-cyan);
+}
+
+/* ─── Matched Pairs ────────────────────────────────────────────────────── */
+.matched-pairs-section {
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.pair-row {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 6px; font-size: 10px;
+  border-bottom: 1px solid rgba(30, 38, 64, 0.5);
+  border-left: 3px solid transparent;
+  transition: border-color 0.15s;
+}
+
+.pair-row:hover { background: rgba(30, 38, 64, 0.3); }
+
+.pair-status-approved { border-left-color: var(--accent-green); }
+.pair-status-pending { border-left-color: var(--accent-amber); }
+.pair-status-paused { border-left-color: var(--accent-cyan); }
+.pair-status-rejected { border-left-color: var(--accent-red); opacity: 0.6; }
+
+.pair-info {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+}
+
+.pair-markets {
+  display: flex; align-items: center; gap: 4px; flex: 1;
+  overflow: hidden;
+}
+
+.pair-separator { color: var(--accent-green); font-size: 12px; flex-shrink: 0; }
+
+.pair-question {
+  flex: 1; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.pair-meta {
+  display: flex; align-items: center; gap: 6px;
+}
+
+.pair-confidence {
+  color: var(--accent-amber); font-size: 9px; min-width: 40px; text-align: right;
+}
+
+.pair-method {
+  color: var(--text-dim); font-size: 9px; min-width: 48px; text-align: center;
+  padding: 1px 4px; background: rgba(30, 38, 64, 0.5);
+}
+
+.method-llm_verified { color: var(--accent-green); background: rgba(0, 255, 136, 0.08); }
+.method-exact_slug { color: var(--accent-cyan); background: rgba(0, 212, 255, 0.08); }
+.method-combined { color: var(--accent-amber); background: rgba(255, 184, 0, 0.08); }
+
+.pair-status-badge {
+  font-size: 8px; padding: 1px 6px; font-weight: 700; letter-spacing: 0.5px;
+  border-radius: 1px;
+}
+
+.pair-status-badge.status-approved { background: rgba(0, 255, 136, 0.1); color: var(--accent-green); }
+.pair-status-badge.status-pending { background: rgba(255, 184, 0, 0.1); color: var(--accent-amber); }
+.pair-status-badge.status-paused { background: rgba(0, 212, 255, 0.1); color: var(--accent-cyan); }
+.pair-status-badge.status-rejected { background: rgba(255, 51, 102, 0.1); color: var(--accent-red); }
+
+.pair-reasoning {
+  font-size: 9px; color: var(--text-dim); padding: 2px 0;
+  font-style: italic; line-height: 1.3;
+}
+
+.pair-actions {
+  display: flex; gap: 4px;
+}
+
+.pair-btn {
+  padding: 2px 8px; border: 1px solid var(--border); background: none;
+  font-family: var(--font-mono); font-size: 8px; font-weight: 600;
+  letter-spacing: 0.5px; cursor: pointer; transition: all 0.15s;
+}
+
+.pair-btn-approve { color: var(--accent-green); border-color: rgba(0, 255, 136, 0.3); }
+.pair-btn-approve:hover { background: rgba(0, 255, 136, 0.1); border-color: var(--accent-green); }
+
+.pair-btn-pause { color: var(--accent-cyan); border-color: rgba(0, 212, 255, 0.3); }
+.pair-btn-pause:hover { background: rgba(0, 212, 255, 0.1); border-color: var(--accent-cyan); }
+
+.pair-btn-reject { color: var(--accent-red); border-color: rgba(255, 51, 102, 0.3); }
+.pair-btn-reject:hover { background: rgba(255, 51, 102, 0.1); border-color: var(--accent-red); }
+
+/* ─── Market Rows ──────────────────────────────────────────────────────── */
+.market-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 0; font-size: 10px;
+  border-bottom: 1px solid rgba(30, 38, 64, 0.3);
+}
+
+.market-question {
+  flex: 1; color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.market-category {
+  font-size: 9px; padding: 1px 6px;
+  background: rgba(68, 136, 255, 0.1);
+  color: var(--accent-blue);
+  border-radius: 1px;
+}
+
+.match-badge {
+  font-size: 9px; padding: 1px 6px; min-width: 52px; text-align: center;
+  font-weight: 600; letter-spacing: 0.5px;
+}
+
+.match-yes {
+  background: rgba(0, 255, 136, 0.1); color: var(--accent-green);
+  border: 1px solid rgba(0, 255, 136, 0.2);
+}
+
+.match-no {
+  background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+/* ─── Panel ────────────────────────────────────────────────────────────── */
 .panel {
   background: var(--bg-panel);
   display: flex; flex-direction: column;
   overflow: hidden;
+  min-height: 0;
 }
 
 .panel-header {
@@ -130,6 +389,7 @@ html, body {
   background: var(--bg-panel-header);
   border-bottom: 1px solid var(--border);
   min-height: 28px;
+  flex-shrink: 0;
 }
 
 .panel-title {
@@ -145,42 +405,14 @@ html, body {
 
 .panel-body {
   flex: 1; overflow-y: auto; padding: 8px 12px;
+  min-height: 0;
 }
 
 .panel-body::-webkit-scrollbar { width: 4px; }
 .panel-body::-webkit-scrollbar-track { background: var(--bg-secondary); }
 .panel-body::-webkit-scrollbar-thumb { background: var(--border-bright); }
 
-/* Metrics Strip */
-.metrics-strip {
-  display: flex; gap: 1px; background: var(--border);
-  padding: 0;
-}
-
-.metric-cell {
-  flex: 1; padding: 10px 14px;
-  background: var(--bg-panel);
-  display: flex; flex-direction: column; gap: 2px;
-}
-
-.metric-label {
-  font-size: 9px; color: var(--text-dim); letter-spacing: 2px;
-  text-transform: uppercase;
-}
-
-.metric-value {
-  font-size: 18px; font-weight: 600; letter-spacing: 1px;
-}
-
-.metric-sub { font-size: 9px; color: var(--text-dim); }
-
-.positive { color: var(--accent-green); }
-.negative { color: var(--accent-red); }
-.neutral { color: var(--text-primary); }
-.amber { color: var(--accent-amber); }
-.cyan { color: var(--accent-cyan); }
-
-/* Trade/Opportunity Rows */
+/* ─── Trade/Opportunity Rows ───────────────────────────────────────────── */
 .row {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 0; border-bottom: 1px solid rgba(30, 38, 64, 0.5);
@@ -216,7 +448,7 @@ html, body {
 .status-pending-trade { background: rgba(255, 184, 0, 0.1); color: var(--accent-amber); }
 .status-failed-trade { background: rgba(255, 51, 102, 0.1); color: var(--accent-red); }
 
-/* Activity Feed */
+/* ─── Activity Feed ────────────────────────────────────────────────────── */
 .feed-item {
   padding: 5px 0; border-bottom: 1px solid rgba(30, 38, 64, 0.3);
   display: flex; gap: 8px; font-size: 10px;
@@ -227,18 +459,19 @@ html, body {
 }
 .feed-msg { color: var(--text-secondary); flex: 1; }
 
-/* ASCII Art */
+/* ─── ASCII Art ────────────────────────────────────────────────────────── */
 .ascii-chart {
   font-size: 10px; color: var(--accent-green); line-height: 1.2;
   padding: 4px 0; white-space: pre; overflow-x: auto;
 }
 
-/* Footer */
+/* ─── Footer ───────────────────────────────────────────────────────────── */
 .footer {
   display: flex; align-items: center; justify-content: space-between;
   padding: 4px 16px; background: var(--bg-panel-header);
   border-top: 1px solid var(--border);
   font-size: 9px; color: var(--text-dim); letter-spacing: 1px;
+  flex-shrink: 0;
 }
 
 .footer-connections { display: flex; gap: 12px; }
@@ -246,5 +479,3 @@ html, body {
 .conn-dot { width: 5px; height: 5px; border-radius: 50%; }
 .conn-active { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
 .conn-inactive { background: var(--accent-red); }
-
-.wide-panel { grid-column: span 2; }

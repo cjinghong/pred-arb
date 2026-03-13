@@ -370,7 +370,7 @@ describe('Arbitrage Bot Integration', () => {
       const predictfunmarkets = await predictfunConnector.fetchMarkets({ activeOnly: true });
 
       // Manually run the matcher logic that the strategy uses
-      const pairs = (strategy as any).matcher.findPairs(polymarkets, predictfunmarkets);
+      const pairs = (strategy as any).matcher.findPairsSync(polymarkets, predictfunmarkets);
 
       expect(pairs.length).toBeGreaterThan(0);
       expect(pairs[0].marketA.platform).toBe('polymarket');

@@ -108,10 +108,29 @@ export function initializeDatabase(): void {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS market_pairs (
+      pair_id TEXT PRIMARY KEY,
+      market_a_id TEXT NOT NULL,
+      market_a_platform TEXT NOT NULL,
+      market_a_question TEXT NOT NULL,
+      market_b_id TEXT NOT NULL,
+      market_b_platform TEXT NOT NULL,
+      market_b_question TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      confidence REAL DEFAULT 0,
+      match_method TEXT DEFAULT 'fuzzy_question',
+      llm_is_same_market INTEGER,
+      llm_confidence REAL,
+      llm_reasoning TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
     CREATE INDEX IF NOT EXISTS idx_trades_created ON trades(created_at);
     CREATE INDEX IF NOT EXISTS idx_opportunities_discovered ON opportunities(discovered_at);
     CREATE INDEX IF NOT EXISTS idx_market_snapshots_captured ON market_snapshots(captured_at);
+    CREATE INDEX IF NOT EXISTS idx_market_pairs_status ON market_pairs(status);
   `);
 
   log.info('Database schema initialized');
@@ -259,6 +278,73 @@ export function setBotStateKV(key: string, value: string): void {
 export function getBotStateKV(key: string): string | undefined {
   const row = getDb().prepare('SELECT value FROM bot_state WHERE key = ?').get(key) as { value: string } | undefined;
   return row?.value;
+}
+
+// ─── Market Pair CRUD ────────────────────────────────────────────────
+
+export function upsertMarketPair(pair: {
+  pairId: string;
+  marketAId: string;
+  marketAPlatform: string;
+  marketAQuestion: string;
+  marketBId: string;
+  marketBPlatform: string;
+  marketBQuestion: string;
+  status: string;
+  confidence: number;
+  matchMethod: string;
+  llmIsSameMarket?: boolean;
+  llmConfidence?: number;
+  llmReasoning?: string;
+}): void {
+  getDb().prepare(`
+    INSERT INTO market_pairs (
+      pair_id, market_a_id, market_a_platform, market_a_question,
+      market_b_id, market_b_platform, market_b_question,
+      status, confidence, match_method,
+      llm_is_same_market, llm_confidence, llm_reasoning
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(pair_id) DO UPDATE SET
+      status = excluded.status,
+      confidence = excluded.confidence,
+      match_method = excluded.match_method,
+      llm_is_same_market = excluded.llm_is_same_market,
+      llm_confidence = excluded.llm_confidence,
+      llm_reasoning = excluded.llm_reasoning,
+      updated_at = datetime('now')
+  `).run(
+    pair.pairId,
+    pair.marketAId, pair.marketAPlatform, pair.marketAQuestion,
+    pair.marketBId, pair.marketBPlatform, pair.marketBQuestion,
+    pair.status, pair.confidence, pair.matchMethod,
+    pair.llmIsSameMarket !== undefined ? (pair.llmIsSameMarket ? 1 : 0) : null,
+    pair.llmConfidence ?? null,
+    pair.llmReasoning ?? null,
+  );
+}
+
+export function updatePairStatus(pairId: string, status: string): void {
+  getDb().prepare(
+    'UPDATE market_pairs SET status = ?, updated_at = datetime("now") WHERE pair_id = ?'
+  ).run(status, pairId);
+}
+
+export function getAllMarketPairs(): Array<Record<string, unknown>> {
+  return getDb().prepare(
+    'SELECT * FROM market_pairs ORDER BY confidence DESC'
+  ).all() as Array<Record<string, unknown>>;
+}
+
+export function getMarketPairsByStatus(status: string): Array<Record<string, unknown>> {
+  return getDb().prepare(
+    'SELECT * FROM market_pairs WHERE status = ? ORDER BY confidence DESC'
+  ).all(status) as Array<Record<string, unknown>>;
+}
+
+export function getMarketPair(pairId: string): Record<string, unknown> | undefined {
+  return getDb().prepare(
+    'SELECT * FROM market_pairs WHERE pair_id = ?'
+  ).get(pairId) as Record<string, unknown> | undefined;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────

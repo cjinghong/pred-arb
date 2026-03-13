@@ -53,7 +53,7 @@ describe('MarketMatcher', () => {
         platform: 'predictfun',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0]).toMatchObject({
@@ -75,7 +75,7 @@ describe('MarketMatcher', () => {
         slug: 'bitcoin-price-above-50k',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].confidence).toBe(0.95);
@@ -93,7 +93,7 @@ describe('MarketMatcher', () => {
         slug: 'bitcoin-price-above-50k',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].confidence).toBe(0.95);
@@ -112,7 +112,7 @@ describe('MarketMatcher', () => {
         question: 'Will Ethereum be above 3k?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(0);
     });
@@ -134,7 +134,7 @@ describe('MarketMatcher', () => {
         category: 'crypto',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].matchMethod).toBe('combined');
@@ -155,7 +155,7 @@ describe('MarketMatcher', () => {
         question: 'Will the stock market close above 4500?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].confidence).toBeGreaterThanOrEqual(0.5);
@@ -174,7 +174,7 @@ describe('MarketMatcher', () => {
         question: 'Will it rain tomorrow in Tokyo?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(0);
     });
@@ -198,7 +198,7 @@ describe('MarketMatcher', () => {
         endDate: new Date('2026-04-15'),
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       // Should have both date boost (0.1) and category boost (0.05)
@@ -220,7 +220,7 @@ describe('MarketMatcher', () => {
         category: 'politics',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       if (pairs.length > 0) {
         // If there's a match, it should not have the category boost
@@ -248,7 +248,7 @@ describe('MarketMatcher', () => {
         endDate: new Date(baseDate.getTime() + 3 * 24 * 60 * 60 * 1000), // 3 days later
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       // Should have date boost of 0.1
@@ -272,7 +272,7 @@ describe('MarketMatcher', () => {
         endDate: new Date(baseDate.getTime() + 10 * 24 * 60 * 60 * 1000), // 10 days later
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       if (pairs.length > 0) {
         // Date boost should not apply
@@ -295,7 +295,7 @@ describe('MarketMatcher', () => {
         endDate: new Date('2026-04-12'),
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       if (pairs.length > 0) {
         // Without date boost, confidence should be lower
@@ -318,7 +318,7 @@ describe('MarketMatcher', () => {
         question: 'Will Apple stock reach 150 dollars?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       // Should have keyword boost (max 0.15)
@@ -338,7 +338,7 @@ describe('MarketMatcher', () => {
         question: 'Will snowfall be more than 5 centimeters?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       if (pairs.length > 0) {
         // Limited keyword overlap (only "will"), low confidence
@@ -359,7 +359,7 @@ describe('MarketMatcher', () => {
         question: 'Will stock price be above 100 next quarter?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       // Should match with similar keyword set (stock, price, above, quarter)
       expect(pairs.length).toBeGreaterThanOrEqual(0);
@@ -380,7 +380,7 @@ describe('MarketMatcher', () => {
         question: 'Completely unrelated question',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(0);
     });
@@ -399,7 +399,7 @@ describe('MarketMatcher', () => {
         question: 'Will event X happen?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       // This should definitely match with high confidence
       expect(pairs).toHaveLength(1);
@@ -424,7 +424,7 @@ describe('MarketMatcher', () => {
         slug: 'shared-slug',
       });
 
-      const pairs = matcher.findPairs([marketA1, marketA2], [marketB]);
+      const pairs = matcher.findPairsSync([marketA1, marketA2], [marketB]);
 
       // Only one market A can match with the shared market B
       expect(pairs).toHaveLength(1);
@@ -451,7 +451,7 @@ describe('MarketMatcher', () => {
         slug: 'exact-slug',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB1, marketB2]);
+      const pairs = matcher.findPairsSync([marketA], [marketB1, marketB2]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].marketB.id).toBe('market-b1');
@@ -478,7 +478,7 @@ describe('MarketMatcher', () => {
         slug: 'slug-a2',
       });
 
-      const pairs = matcher.findPairs([marketA1, marketA2], [marketB1, marketB2]);
+      const pairs = matcher.findPairsSync([marketA1, marketA2], [marketB1, marketB2]);
 
       expect(pairs).toHaveLength(2);
       expect(pairs.map(p => p.marketB.id)).toEqual(expect.arrayContaining(['market-b1', 'market-b2']));
@@ -492,7 +492,7 @@ describe('MarketMatcher', () => {
         slug: 'test-slug',
       });
 
-      const pairs = matcher.findPairs([], [marketB]);
+      const pairs = matcher.findPairsSync([], [marketB]);
 
       expect(pairs).toHaveLength(0);
     });
@@ -503,13 +503,13 @@ describe('MarketMatcher', () => {
         slug: 'test-slug',
       });
 
-      const pairs = matcher.findPairs([marketA], []);
+      const pairs = matcher.findPairsSync([marketA], []);
 
       expect(pairs).toHaveLength(0);
     });
 
     it('should handle both arrays empty', () => {
-      const pairs = matcher.findPairs([], []);
+      const pairs = matcher.findPairsSync([], []);
 
       expect(pairs).toHaveLength(0);
     });
@@ -525,7 +525,7 @@ describe('MarketMatcher', () => {
         slug: 'single-slug',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].confidence).toBe(0.95);
@@ -545,7 +545,7 @@ describe('MarketMatcher', () => {
         question: 'Totally unrelated content',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(0);
     });
@@ -563,7 +563,7 @@ describe('MarketMatcher', () => {
         question: 'Will Bitcoin reach 100k?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].matchMethod).toBe('combined');
@@ -595,7 +595,7 @@ describe('MarketMatcher', () => {
         question: 'Will the price rise?',
       });
 
-      const pairs = matcher.findPairs([marketA1, marketA2], [marketB1, marketB2]);
+      const pairs = matcher.findPairsSync([marketA1, marketA2], [marketB1, marketB2]);
 
       // Pairs should be sorted by confidence descending
       for (let i = 0; i < pairs.length - 1; i++) {
@@ -614,7 +614,7 @@ describe('MarketMatcher', () => {
         slug: 'exact-slug',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB1]);
+      const pairs = matcher.findPairsSync([marketA], [marketB1]);
 
       expect(pairs[0].matchMethod).toBe('exact_slug');
       expect(pairs[0].confidence).toBe(0.95);
@@ -635,7 +635,7 @@ describe('MarketMatcher', () => {
         platform: 'predictfun',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].marketA.platform).toBe('polymarket');
@@ -655,7 +655,7 @@ describe('MarketMatcher', () => {
         platform: 'polymarket',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
     });
@@ -694,7 +694,7 @@ describe('MarketMatcher', () => {
         }),
       ];
 
-      const pairs = matcher.findPairs(marketsA, marketsB);
+      const pairs = matcher.findPairsSync(marketsA, marketsB);
 
       expect(pairs.length).toBeGreaterThanOrEqual(2);
       // Verify no duplicates
@@ -715,7 +715,7 @@ describe('MarketMatcher', () => {
         question: 'Will Bitcoin exceed 100000?',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       if (pairs.length > 0) {
         expect(pairs[0].confidence).toBeGreaterThan(0);
@@ -737,7 +737,7 @@ describe('MarketMatcher', () => {
         question: longQuestion,
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
     });
@@ -753,7 +753,7 @@ describe('MarketMatcher', () => {
         slug: 'test-slug',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       expect(pairs[0].confidence).toBe(0.95);
@@ -772,7 +772,7 @@ describe('MarketMatcher', () => {
         slug: 'valid-pair-slug',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       expect(pairs).toHaveLength(1);
       const pair = pairs[0];
@@ -802,7 +802,7 @@ describe('MarketMatcher', () => {
         question: 'Test question',
       });
 
-      const pairs = matcher.findPairs([marketA], [marketB]);
+      const pairs = matcher.findPairsSync([marketA], [marketB]);
 
       pairs.forEach(pair => {
         expect(pair.confidence).toBeGreaterThanOrEqual(0);
@@ -821,7 +821,7 @@ describe('MarketMatcher', () => {
         slug: 'exact-test',
       });
 
-      const exactPairs = matcher.findPairs([exactA], [exactB]);
+      const exactPairs = matcher.findPairsSync([exactA], [exactB]);
       expect(exactPairs[0].matchMethod).toBe('exact_slug');
 
       // Fuzzy match
@@ -836,7 +836,7 @@ describe('MarketMatcher', () => {
         question: 'Will price increase?',
       });
 
-      const fuzzyPairs = matcher.findPairs([fuzzyA], [fuzzyB]);
+      const fuzzyPairs = matcher.findPairsSync([fuzzyA], [fuzzyB]);
       if (fuzzyPairs.length > 0) {
         expect(fuzzyPairs[0].matchMethod).toBe('combined');
       }

@@ -54,6 +54,10 @@ export const config = {
     path: env('DB_PATH', './data/pred-arb.db'),
   },
 
+  anthropic: {
+    apiKey: process.env.ANTHROPIC_API_KEY || '',
+  },
+
   logging: {
     level: env('LOG_LEVEL', 'info'),
   },

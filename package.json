@@ -14,6 +14,7 @@
     "lint": "eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
+    "backtest": "tsx src/backtest/run-backtest.ts",
     "typecheck": "tsc --noEmit",
     "setup": "npm install && cd dashboard && npm install"
   },

@@ -17,7 +17,9 @@ import {
   ArbLeg,
 } from '../types';
 import { MarketConnector } from '../types/connector';
-import { MarketMatcher, MarketPair } from '../matcher/market-matcher';
+import { MarketMatcher, MarketPair, PairStatus } from '../matcher/market-matcher';
+import { LLMVerifier } from '../matcher/llm-verifier';
+import { upsertMarketPair, getAllMarketPairs, updatePairStatus as dbUpdatePairStatus } from '../db/database';
 import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
 import { eventBus } from '../utils/event-bus';
@@ -33,10 +35,14 @@ export class CrossPlatformArbStrategy implements Strategy {
 
   private _state: StrategyState = 'IDLE';
   private connectors = new Map<Platform, MarketConnector>();
-  private matcher = new MarketMatcher();
+  private llmVerifier = new LLMVerifier();
+  private matcher = new MarketMatcher(this.llmVerifier);
   private cachedPairs: MarketPair[] = [];
   private lastPairRefresh = 0;
   private pairRefreshIntervalMs = 5 * 60 * 1000; // Refresh pairs every 5 minutes
+
+  /** Last fetched markets per platform (for dashboard display) */
+  private lastFetchedMarkets = new Map<Platform, NormalizedMarket[]>();
 
   // Metrics
   private _metrics: StrategyMetrics = {
@@ -99,8 +105,9 @@ export class CrossPlatformArbStrategy implements Strategy {
         return [];
       }
 
-      // Step 2: For each pair, fetch order books and look for arb
+      // Step 2: For each APPROVED pair, fetch order books and look for arb
       for (const pair of this.cachedPairs) {
+        if (pair.status !== 'approved') continue;
         if (pair.confidence < this.config.minMatchConfidence) continue;
 
         try {
@@ -174,6 +181,79 @@ export class CrossPlatformArbStrategy implements Strategy {
     return { ...this._metrics, marketsTracked: this.cachedPairs.length };
   }
 
+  /** Update a pair's status (from dashboard/API) */
+  setPairStatus(pairId: string, status: PairStatus): void {
+    this.matcher.setPairStatus(pairId, status);
+    dbUpdatePairStatus(pairId, status);
+    // Update cached pair
+    const pair = this.cachedPairs.find(p => p.pairId === pairId);
+    if (pair) pair.status = status;
+    log.info(`Pair status updated`, { pairId, status });
+  }
+
+  /** Load persisted pair statuses from DB at startup */
+  loadPersistedPairs(): void {
+    try {
+      const rows = getAllMarketPairs();
+      const statuses = new Map<string, PairStatus>();
+      for (const row of rows) {
+        statuses.set(row.pair_id as string, row.status as PairStatus);
+      }
+      this.matcher.loadPairStatuses(statuses);
+    } catch (err) {
+      log.warn('Failed to load persisted pairs', { error: (err as Error).message });
+    }
+  }
+
+  /** Expose market/pair data for the dashboard */
+  getMarketsSummary(): {
+    platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; matched: boolean }> }>;
+    matchedPairs: Array<{
+      pairId: string;
+      marketA: { id: string; platform: string; question: string };
+      marketB: { id: string; platform: string; question: string };
+      confidence: number;
+      matchMethod: string;
+      status: string;
+      llmReasoning?: string;
+    }>;
+  } {
+    // Build set of matched market IDs per platform
+    const matchedIds = new Map<string, Set<string>>();
+    for (const pair of this.cachedPairs) {
+      if (!matchedIds.has(pair.marketA.platform)) matchedIds.set(pair.marketA.platform, new Set());
+      if (!matchedIds.has(pair.marketB.platform)) matchedIds.set(pair.marketB.platform, new Set());
+      matchedIds.get(pair.marketA.platform)!.add(pair.marketA.id);
+      matchedIds.get(pair.marketB.platform)!.add(pair.marketB.id);
+    }
+
+    const platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; matched: boolean }> }> = {};
+    for (const [platform, markets] of this.lastFetchedMarkets.entries()) {
+      const pMatched = matchedIds.get(platform) || new Set();
+      platforms[platform] = {
+        total: markets.length,
+        markets: markets.map(m => ({
+          id: m.id,
+          question: m.question,
+          category: m.category,
+          matched: pMatched.has(m.id),
+        })),
+      };
+    }
+
+    const matchedPairs = this.cachedPairs.map(p => ({
+      pairId: p.pairId,
+      marketA: { id: p.marketA.id, platform: p.marketA.platform, question: p.marketA.question },
+      marketB: { id: p.marketB.id, platform: p.marketB.platform, question: p.marketB.question },
+      confidence: p.confidence,
+      matchMethod: p.matchMethod,
+      status: p.status,
+      llmReasoning: p.llmVerification?.reasoning,
+    }));
+
+    return { platforms, matchedPairs };
+  }
+
   // ─── Internal Logic ────────────────────────────────────────────────────
 
   private async refreshPairsIfNeeded(): Promise<void> {
@@ -189,21 +269,19 @@ export class CrossPlatformArbStrategy implements Strategy {
     }
 
     // Push filtering to the API wherever possible:
-    // - Polymarket: activeOnly, minLiquidity, sortBy all handled server-side
-    // - predict.fun: activeOnly (status=active) handled server-side;
-    //                minLiquidity falls back to client-side filtering
-    const fetchOpts = {
-      activeOnly: true,
-      limit: 200,
-      minLiquidity: 100,               // skip illiquid markets that can't fill
-      sortBy: 'liquidity' as const,    // best arb candidates first
-      sortDirection: 'desc' as const,
-    };
+    // - Polymarket: activeOnly, minLiquidity, sortBy all handled server-side via Gamma API
+    // - predict.fun: status=OPEN + sort=VOLUME_TOTAL_DESC handled server-side;
+    //                no liquidity field exposed so we skip that filter for pfun
+    const baseOpts = { activeOnly: true, limit: 200, sortBy: 'volume' as const, sortDirection: 'desc' as const };
 
     const [marketsA, marketsB] = await Promise.all([
-      connA.fetchMarkets(fetchOpts),
-      connB.fetchMarkets(fetchOpts),
+      connA.fetchMarkets({ ...baseOpts, minLiquidity: 100 }),  // Polymarket supports server-side liquidity filter
+      connB.fetchMarkets(baseOpts),                             // predict.fun: no liquidity field
     ]);
+
+    // Cache for dashboard visibility
+    this.lastFetchedMarkets.set('polymarket', marketsA);
+    this.lastFetchedMarkets.set('predictfun', marketsB);
 
     log.info('Markets fetched', {
       polymarket: marketsA.length,
@@ -211,8 +289,31 @@ export class CrossPlatformArbStrategy implements Strategy {
     });
 
     const oldPairIds = new Set(this.cachedPairs.map(p => `${p.marketA.id}:${p.marketB.id}`));
-    this.cachedPairs = this.matcher.findPairs(marketsA, marketsB);
+    this.cachedPairs = await this.matcher.findPairs(marketsA, marketsB);
     this.lastPairRefresh = Date.now();
+
+    // Persist pairs to DB
+    for (const pair of this.cachedPairs) {
+      try {
+        upsertMarketPair({
+          pairId: pair.pairId,
+          marketAId: pair.marketA.id,
+          marketAPlatform: pair.marketA.platform,
+          marketAQuestion: pair.marketA.question,
+          marketBId: pair.marketB.id,
+          marketBPlatform: pair.marketB.platform,
+          marketBQuestion: pair.marketB.question,
+          status: pair.status,
+          confidence: pair.confidence,
+          matchMethod: pair.matchMethod,
+          llmIsSameMarket: pair.llmVerification?.isSameMarket,
+          llmConfidence: pair.llmVerification?.confidence,
+          llmReasoning: pair.llmVerification?.reasoning,
+        });
+      } catch (err) {
+        log.warn('Failed to persist pair', { pairId: pair.pairId, error: (err as Error).message });
+      }
+    }
 
     // Subscribe to WebSocket order book updates for newly matched pairs
     this.subscribeToMatchedPairs(connA, connB, oldPairIds);

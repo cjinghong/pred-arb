@@ -30,6 +30,8 @@ export class ApiServer {
 
   private getBotState: () => BotState;
   private setBotState: (state: BotState) => void;
+  private getMarketsSummary: (() => unknown) | null = null;
+  private setPairStatus: ((pairId: string, status: string) => void) | null = null;
 
   constructor(
     getBotState: () => BotState,
@@ -39,6 +41,16 @@ export class ApiServer {
     this.setBotState = setBotState;
     this.setupRoutes();
     this.setupEventForwarding();
+  }
+
+  /** Wire up market summary getter after strategies are initialized */
+  setMarketsSummaryGetter(fn: () => unknown): void {
+    this.getMarketsSummary = fn;
+  }
+
+  /** Wire up pair status setter for dashboard controls */
+  setPairStatusHandler(fn: (pairId: string, status: string) => void): void {
+    this.setPairStatus = fn;
   }
 
   private setupRoutes(): void {
@@ -79,6 +91,51 @@ export class ApiServer {
         maxTotalExposureUsd: config.bot.maxTotalExposureUsd,
         scanIntervalMs: config.bot.scanIntervalMs,
       });
+    });
+
+    this.app.get('/api/markets', (_req, res) => {
+      if (!this.getMarketsSummary) {
+        res.json({ platforms: {}, matchedPairs: [] });
+        return;
+      }
+      res.json(this.getMarketsSummary());
+    });
+
+    // ─── Pair Management ─────────────────────────────────────────────────
+
+    this.app.post('/api/pairs/:pairId/status', (req, res) => {
+      const { pairId } = req.params;
+      const { status } = req.body;
+      const validStatuses = ['pending', 'approved', 'paused', 'rejected'];
+      if (!validStatuses.includes(status)) {
+        res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+        return;
+      }
+      if (!this.setPairStatus) {
+        res.status(503).json({ error: 'Pair management not initialized' });
+        return;
+      }
+      this.setPairStatus(pairId, status);
+      log.info(`Pair status changed via API`, { pairId, status });
+      res.json({ pairId, status });
+    });
+
+    this.app.post('/api/pairs/:pairId/approve', (req, res) => {
+      if (!this.setPairStatus) { res.status(503).json({ error: 'Not initialized' }); return; }
+      this.setPairStatus(req.params.pairId, 'approved');
+      res.json({ pairId: req.params.pairId, status: 'approved' });
+    });
+
+    this.app.post('/api/pairs/:pairId/pause', (req, res) => {
+      if (!this.setPairStatus) { res.status(503).json({ error: 'Not initialized' }); return; }
+      this.setPairStatus(req.params.pairId, 'paused');
+      res.json({ pairId: req.params.pairId, status: 'paused' });
+    });
+
+    this.app.post('/api/pairs/:pairId/reject', (req, res) => {
+      if (!this.setPairStatus) { res.status(503).json({ error: 'Not initialized' }); return; }
+      this.setPairStatus(req.params.pairId, 'rejected');
+      res.json({ pairId: req.params.pairId, status: 'rejected' });
     });
 
     // ─── Bot Control ───────────────────────────────────────────────────

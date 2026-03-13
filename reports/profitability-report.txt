@@ -1,0 +1,309 @@
+════════════════════════════════════════════════════════════════════════════════
+  PRED-ARB :: BACKTESTING PROFITABILITY REPORT
+  Generated: 2026-03-12T16:24:01.091Z
+════════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────┬────────┬────────┬────────┬────────┬────────┬────────┐
+│ Strategy                            │  P&L   │ Trades │Win Rate│ Sharpe │Max DD% │Ann Ret │
+├─────────────────────────────────────┼────────┼────────┼────────┼────────┼────────┼────────┤
+│ HTR: Conservative (3% spread)         │ +$178 │    18 │ 50.0% │-95.42 │  2.3% │ 9338% │
+│ HTR: Moderate (2% spread)             │ +$195 │    44 │ 31.8% │-163.66 │  2.4% │ 3414% │
+│ HTR: High-Conviction (4% spread)      │ +$172 │     8 │ 50.0% │-64.86 │  0.4% │ 3616% │
+│ HTR: Low-Fee Volume (1.5% spread)     │ +$491 │    41 │ 46.3% │-135.23 │  0.5% │ 5163% │
+│ HTR: Ultra-Conservative (5% spread)   │   $33 │     4 │  0.0% │-64.96 │  0.6% │ -587% │
+│ HTR: Balanced (2.5% spread, $500)     │ +$206 │    21 │ 47.6% │-98.77 │  0.7% │ 4325% │
+└─────────────────────────────────────┴────────┴────────┴────────┴────────┴────────┴────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+  STRATEGY: HTR: CONSERVATIVE (3% SPREAD)
+────────────────────────────────────────────────────────────────────────────────
+
+  Configuration:
+    Min Profit:        300 BPS (3.0%)
+    Max Position:      $200
+    Fee Rate:          100 BPS per leg
+    Slippage:          0.5%
+    Max Concurrent:    10
+    Take Profit:       Hold to resolution
+    Stop Loss:         None
+
+  Performance:
+    Total P&L:         +$177.67
+    Total Trades:      18
+    Winners:           9 (50.0%)
+    Losers:            9
+    Avg Win:           +$24.80
+    Avg Loss:          -$5.06
+    Profit Factor:     4.90
+
+  Risk Metrics:
+    Sharpe Ratio:      -95.418
+    Sortino Ratio:     -9.022
+    Max Drawdown:      $45.52 (2.3%)
+    Total Fees:        $68.63
+
+  Returns:
+    Return on Capital: 8.88%
+    Annualized Return: 9338%
+    Time Span:         8.3 hours
+    Pairs Evaluated:   25
+    Avg Hold Time:     537 snapshots (~269 minutes)
+
+  Equity Curve:
+        ████████████████                                            
+                    ▒▒▒▒▒▒▒                                     
+                           ▒▒▒▒                                 
+                               ▒▒                               
+                                 ▒▒▒▒                           
+                                     ▒▒▒▒▒▒▒▒▒                  
+                                              ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒   
+                                                             ▒▒▒
+
+────────────────────────────────────────────────────────────────────────────────
+  STRATEGY: HTR: MODERATE (2% SPREAD)
+────────────────────────────────────────────────────────────────────────────────
+
+  Configuration:
+    Min Profit:        200 BPS (2.0%)
+    Max Position:      $400
+    Fee Rate:          100 BPS per leg
+    Slippage:          0.3%
+    Max Concurrent:    15
+    Take Profit:       Hold to resolution
+    Stop Loss:         None
+
+  Performance:
+    Total P&L:         +$194.84
+    Total Trades:      44
+    Winners:           14 (31.8%)
+    Losers:            30
+    Avg Win:           +$24.33
+    Avg Loss:          -$4.86
+    Profit Factor:     2.34
+
+  Risk Metrics:
+    Sharpe Ratio:      -163.663
+    Sortino Ratio:     -28.021
+    Max Drawdown:      $145.72 (2.4%)
+    Total Fees:        $180.96
+
+  Returns:
+    Return on Capital: 3.25%
+    Annualized Return: 3414%
+    Time Span:         8.3 hours
+    Pairs Evaluated:   25
+    Avg Hold Time:     333 snapshots (~167 minutes)
+
+  Equity Curve:
+        █                                                           
+     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒                                             
+                   ▒▒▒▒▒                                        
+                        ▒▒▒▒▒▒▒▒▒▒▒▒                            
+                                    ▒▒▒▒                        
+                                        ▒▒▒▒▒▒▒▒▒▒              
+                                                  ▒▒▒▒▒▒▒       
+                                                         ▒▒▒▒▒▒▒
+
+────────────────────────────────────────────────────────────────────────────────
+  STRATEGY: HTR: HIGH-CONVICTION (4% SPREAD)
+────────────────────────────────────────────────────────────────────────────────
+
+  Configuration:
+    Min Profit:        400 BPS (4.0%)
+    Max Position:      $1000
+    Fee Rate:          100 BPS per leg
+    Slippage:          0.5%
+    Max Concurrent:    5
+    Take Profit:       Hold to resolution
+    Stop Loss:         None
+
+  Performance:
+    Total P&L:         +$172.01
+    Total Trades:      8
+    Winners:           4 (50.0%)
+    Losers:            4
+    Avg Win:           +$47.43
+    Avg Loss:          -$4.42
+    Profit Factor:     10.72
+
+  Risk Metrics:
+    Sharpe Ratio:      -64.860
+    Sortino Ratio:     -4.098
+    Max Drawdown:      $17.69 (0.4%)
+    Total Fees:        $35.38
+
+  Returns:
+    Return on Capital: 3.44%
+    Annualized Return: 3616%
+    Time Span:         8.3 hours
+    Pairs Evaluated:   25
+    Avg Hold Time:     565 snapshots (~283 minutes)
+
+  Equity Curve:
+        █                                                           
+                                                                
+     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒                                            
+                    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒                           
+                                                                
+                                     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒ 
+                                                                
+                                                               ▒
+
+────────────────────────────────────────────────────────────────────────────────
+  STRATEGY: HTR: LOW-FEE VOLUME (1.5% SPREAD)
+────────────────────────────────────────────────────────────────────────────────
+
+  Configuration:
+    Min Profit:        150 BPS (1.5%)
+    Max Position:      $500
+    Fee Rate:          50 BPS per leg
+    Slippage:          0.2%
+    Max Concurrent:    20
+    Take Profit:       Hold to resolution
+    Stop Loss:         None
+
+  Performance:
+    Total P&L:         +$491.19
+    Total Trades:      41
+    Winners:           19 (46.3%)
+    Losers:            22
+    Avg Win:           +$28.34
+    Avg Loss:          -$2.15
+    Profit Factor:     11.40
+
+  Risk Metrics:
+    Sharpe Ratio:      -135.231
+    Sortino Ratio:     -18.979
+    Max Drawdown:      $47.24 (0.5%)
+    Total Fees:        $70.71
+
+  Returns:
+    Return on Capital: 4.91%
+    Annualized Return: 5163%
+    Time Span:         8.3 hours
+    Pairs Evaluated:   25
+    Avg Hold Time:     482 snapshots (~241 minutes)
+
+  Equity Curve:
+        █                                                           
+     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒                                           
+                     ▒▒▒▒▒▒▒▒▒▒▒                                
+                                ▒▒▒▒▒▒▒▒▒▒                      
+                                          ▒▒▒▒▒                 
+                                               ▒▒▒▒▒            
+                                                    ▒▒▒▒▒▒▒▒    
+                                                            ▒▒▒▒
+
+────────────────────────────────────────────────────────────────────────────────
+  STRATEGY: HTR: ULTRA-CONSERVATIVE (5% SPREAD)
+────────────────────────────────────────────────────────────────────────────────
+
+  Configuration:
+    Min Profit:        500 BPS (5.0%)
+    Max Position:      $2000
+    Fee Rate:          100 BPS per leg
+    Slippage:          1%
+    Max Concurrent:    3
+    Take Profit:       Hold to resolution
+    Stop Loss:         None
+
+  Performance:
+    Total P&L:         $-33.48
+    Total Trades:      4
+    Winners:           0 (0.0%)
+    Losers:            4
+    Avg Win:           +$0.00
+    Avg Loss:          -$8.37
+    Profit Factor:     0.00
+
+  Risk Metrics:
+    Sharpe Ratio:      -64.959
+    Sortino Ratio:     -4.104
+    Max Drawdown:      $33.48 (0.6%)
+    Total Fees:        $33.83
+
+  Returns:
+    Return on Capital: -0.56%
+    Annualized Return: -587%
+    Time Span:         8.3 hours
+    Pairs Evaluated:   25
+    Avg Hold Time:     243 snapshots (~121 minutes)
+
+  Equity Curve:
+        ██                                                          
+                                                                
+      ▒▒                                                        
+                                                                
+        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒                                 
+                               ▒▒▒▒▒                            
+                                                                
+                                    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+
+────────────────────────────────────────────────────────────────────────────────
+  STRATEGY: HTR: BALANCED (2.5% SPREAD, $500)
+────────────────────────────────────────────────────────────────────────────────
+
+  Configuration:
+    Min Profit:        250 BPS (2.5%)
+    Max Position:      $500
+    Fee Rate:          75 BPS per leg
+    Slippage:          0.3%
+    Max Concurrent:    10
+    Take Profit:       Hold to resolution
+    Stop Loss:         None
+
+  Performance:
+    Total P&L:         +$205.71
+    Total Trades:      21
+    Winners:           10 (47.6%)
+    Losers:            11
+    Avg Win:           +$24.23
+    Avg Loss:          -$3.32
+    Profit Factor:     6.63
+
+  Risk Metrics:
+    Sharpe Ratio:      -98.775
+    Sortino Ratio:     -10.322
+    Max Drawdown:      $36.55 (0.7%)
+    Total Fees:        $55.83
+
+  Returns:
+    Return on Capital: 4.11%
+    Annualized Return: 4325%
+    Time Span:         8.3 hours
+    Pairs Evaluated:   25
+    Avg Hold Time:     471 snapshots (~236 minutes)
+
+  Equity Curve:
+        █                                                           
+     ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒                                          
+                      ▒▒▒▒▒▒▒                                   
+                             ▒▒▒▒▒▒▒▒▒▒                         
+                                       ▒▒▒▒▒▒                   
+                                             ▒▒▒▒▒▒▒▒▒▒         
+                                                       ▒▒       
+                                                         ▒▒▒▒▒▒▒
+
+════════════════════════════════════════════════════════════════════════════════
+  RECOMMENDATIONS
+════════════════════════════════════════════════════════════════════════════════
+
+  Best Strategy: HTR: Ultra-Conservative (5% spread)
+    - P&L: $-33.48
+    - Sharpe: -64.959
+    - Win Rate: 0.0%
+    - 4 trades over 8.3 hours
+
+  Key Findings:
+    - 5/6 strategies were profitable
+    - Average min spread across profitable strategies: 260 BPS
+    - Average fees per strategy: $74.22
+    - Best win rate: 50.0%
+    - Best Sharpe ratio: -64.860
+
+  Note: This backtest uses simulated historical data with
+  stochastic price models. Real performance may differ.
+  Fees assumed at 1% per leg (conservative). Lower fees
+  on maker orders could significantly improve results.
+
+════════════════════════════════════════════════════════════════════════════════

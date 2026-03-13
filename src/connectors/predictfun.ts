@@ -17,28 +17,51 @@ import {
 import { config } from '../utils/config';
 import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
 
-// ─── Raw predict.fun API Types ───────────────────────────────────────────
+// ─── Raw predict.fun API Types (from https://dev.predict.fun) ────────────
+
+interface PredictFunOutcome {
+  name: string;
+  indexSet: number;
+  onChainId: string;
+  status: 'WON' | 'LOST' | string;
+}
 
 interface PredictFunRawMarket {
-  id: string;
+  id: number;                       // numeric ID
+  imageUrl: string;
   title: string;
-  slug: string;
-  category: string;
-  outcomes: Array<{ id: string; title: string; price: number }>;
-  volume: number;
-  liquidity: number;
-  status: string;
-  endDate: string;
+  question: string;
+  description: string;
+  tradingStatus: 'OPEN' | 'MATCHING_NOT_ENABLED' | 'CANCEL_ONLY' | 'CLOSED';
+  status: 'REGISTERED' | 'PRICE_PROPOSED' | 'PRICE_DISPUTED' | 'PAUSED' | 'UNPAUSED' | 'RESOLVED' | 'REMOVED';
+  isVisible: boolean;
+  isNegRisk: boolean;
+  isYieldBearing: boolean;
+  feeRateBps: number;
+  resolution: { name: string; indexSet: number; onChainId: string; status: string } | null;
+  oracleQuestionId: string;
+  conditionId: string;
+  resolverAddress: string;
+  outcomes: PredictFunOutcome[];
+  questionIndex: number | null;
+  spreadThreshold: number;
+  shareThreshold: number;
+  isBoosted: boolean;
+  boostStartsAt: string | null;
+  boostEndsAt: string | null;
+  polymarketConditionIds: string[];
+  kalshiMarketTicker: string | null;
+  categorySlug: string;
   createdAt: string;
-  updatedAt: string;
+  decimalPrecision: 2 | 3;
+  marketVariant: 'DEFAULT' | 'SPORTS_MATCH' | 'CRYPTO_UP_DOWN' | 'TWEET_COUNT' | 'SPORTS_TEAM_MATCH';
+  variantData: unknown;
 }
 
 interface PredictFunMarketsResponse {
+  success: boolean;
+  cursor: string | null;
   data: PredictFunRawMarket[];
-  pageInfo?: {
-    hasNextPage: boolean;
-    endCursor: string;
-  };
 }
 
 interface PredictFunRawOrderBook {
@@ -144,8 +167,8 @@ export class PredictFunConnector extends BaseConnector {
 
   async connect(): Promise<void> {
     try {
-      // Test REST connectivity
-      await this.httpGet(`${this.apiUrl}/v1/markets?first=1`);
+      // Test REST connectivity with status filter
+      await this.httpGet(`${this.apiUrl}/v1/markets?first=1&status=OPEN`);
       this._isConnected = true;
       this.emit('connected');
       this.log.info('Connected to predict.fun REST API', { url: this.apiUrl });
@@ -214,33 +237,50 @@ export class PredictFunConnector extends BaseConnector {
     params.set('first', String(options?.limit ?? 100));
     if (options?.offset) params.set('after', String(options.offset));
 
+    // ─── Server-side filters (per https://dev.predict.fun docs) ─────────
+    if (options?.activeOnly !== false) {
+      params.set('status', 'OPEN');
+    }
+
+    // predict.fun supports sort: VOLUME_TOTAL_DESC, VOLUME_24H_DESC, etc.
+    if (options?.sortBy) {
+      const sortMap: Record<string, string> = {
+        volume: options.sortDirection === 'asc' ? 'VOLUME_TOTAL_ASC' : 'VOLUME_TOTAL_DESC',
+        liquidity: options.sortDirection === 'asc' ? 'VOLUME_TOTAL_ASC' : 'VOLUME_TOTAL_DESC', // no liquidity sort; use volume as proxy
+        updatedAt: options.sortDirection === 'asc' ? 'VOLUME_24H_ASC' : 'VOLUME_24H_DESC',
+      };
+      const sortValue = sortMap[options.sortBy];
+      if (sortValue) params.set('sort', sortValue);
+    }
+
     const response = await this.httpGet<PredictFunMarketsResponse>(
       `${this.apiUrl}/v1/markets?${params.toString()}`,
       this.getAuthHeaders(),
     );
 
-    const markets = response.data || response as unknown as PredictFunRawMarket[];
+    const markets = response.data || [];
 
+    // ─── Client-side filters ────────────────────────────────────────────
+    // predict.fun API doesn't expose liquidity/volume fields for filtering,
+    // so binary-only and tradingStatus checks are done here
     return (Array.isArray(markets) ? markets : [])
       .filter(m => {
-        // Only binary markets
-        const outcomes = m.outcomes || [];
-        return outcomes.length === 2;
-      })
-      .map(m => this.normalizeMarket(m))
-      .filter(m => {
-        if (options?.activeOnly !== false && !m.active) return false;
-        if (options?.minLiquidity && m.liquidity < options.minLiquidity) return false;
+        // Binary markets only
+        if ((m.outcomes || []).length !== 2) return false;
+        // Must be actively tradable
+        if (m.tradingStatus !== 'OPEN') return false;
         return true;
-      });
+      })
+      .map(m => this.normalizeMarket(m));
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {
     try {
-      const raw = await this.httpGet<PredictFunRawMarket>(
+      const response = await this.httpGet<{ success: boolean; data: PredictFunRawMarket }>(
         `${this.apiUrl}/v1/markets/${marketId}`,
         this.getAuthHeaders(),
       );
+      const raw = response.data ?? response as unknown as PredictFunRawMarket;
       return this.normalizeMarket(raw);
     } catch {
       return null;
@@ -407,24 +447,26 @@ export class PredictFunConnector extends BaseConnector {
   // ─── Normalization ─────────────────────────────────────────────────────
 
   private normalizeMarket(raw: PredictFunRawMarket): NormalizedMarket {
-    const outcomes = (raw.outcomes || []).map(o => o.title || 'Unknown');
-    const outcomePrices = (raw.outcomes || []).map(o => o.price || 0);
-    const outcomeTokenIds = (raw.outcomes || []).map(o => o.id || '');
+    const outcomes = (raw.outcomes || []).map(o => o.name || 'Unknown');
+    const outcomeTokenIds = (raw.outcomes || []).map(o => o.onChainId || '');
+    // predict.fun doesn't return current prices in the markets endpoint;
+    // prices come from the order book. Use 0 as placeholder.
+    const outcomePrices = (raw.outcomes || []).map(() => 0);
 
     return {
-      id: raw.id,
+      id: String(raw.id),           // numeric → string for our normalized type
       platform: 'predictfun',
-      question: raw.title,
-      slug: raw.slug || '',
-      category: raw.category || '',
+      question: raw.question || raw.title,
+      slug: raw.conditionId || '',
+      category: raw.categorySlug || '',
       outcomes,
       outcomeTokenIds,
       outcomePrices,
-      volume: raw.volume || 0,
-      liquidity: raw.liquidity || 0,
-      active: raw.status === 'active' || raw.status === 'ACTIVE',
-      endDate: raw.endDate ? new Date(raw.endDate) : null,
-      lastUpdated: new Date(raw.updatedAt || Date.now()),
+      volume: 0,                     // not returned by markets endpoint
+      liquidity: 0,                  // not returned by markets endpoint
+      active: raw.status !== 'RESOLVED' && raw.status !== 'REMOVED' && raw.tradingStatus === 'OPEN',
+      endDate: null,                 // not in the API response
+      lastUpdated: new Date(raw.createdAt || Date.now()),
       raw,
     };
   }

@@ -79,10 +79,17 @@ export class Bot {
     this.riskManager.initialize(this.connectors);
     this.executionEngine.initialize(this.connectors, this.strategies);
 
-    // 5. Start API server
+    // 5. Load persisted pair statuses and wire up dashboard handlers
+    xPlatformArb.loadPersistedPairs();
+    this.apiServer.setMarketsSummaryGetter(() => xPlatformArb.getMarketsSummary());
+    this.apiServer.setPairStatusHandler((pairId, status) => {
+      xPlatformArb.setPairStatus(pairId, status as import('../matcher/market-matcher').PairStatus);
+    });
+
+    // 6. Start API server
     await this.apiServer.start();
 
-    // 6. Start scanning
+    // 7. Start scanning
     this.setState('RUNNING');
     this.startScanLoop();
     this.startTime = Date.now();
