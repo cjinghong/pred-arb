@@ -20,7 +20,7 @@ interface MatchedPair {
 
 function getApiBase(): string {
   if (typeof window === 'undefined') return '';
-  return process.env.NEXT_PUBLIC_API_URL || '';
+  return process.env.NEXT_PUBLIC_API_URL || `http://${window.location.hostname}:3848`;
 }
 
 function formatPct(n: number): string {

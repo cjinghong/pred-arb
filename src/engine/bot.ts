@@ -36,7 +36,7 @@ export class Bot {
   constructor() {
     // Initialize components
     this.riskManager = new RiskManager();
-    this.executionEngine = new ExecutionEngine(this.riskManager, /* dryRun */ true);
+    this.executionEngine = new ExecutionEngine(this.riskManager, config.bot.dryRun);
     this.apiServer = new ApiServer(
       () => this.state,
       (s) => this.setState(s),
@@ -92,6 +92,24 @@ export class Bot {
     });
     this.apiServer.setManualPairHandler((marketAId, marketBId) => {
       return xPlatformArb.addManualPair(marketAId, marketBId);
+    });
+    this.apiServer.setPositionsGetter(() => this.riskManager.getPositions());
+    this.apiServer.setResetHandler(async () => {
+      // Reset in-memory state
+      xPlatformArb.reset();
+      this.riskManager.updatePositions([]);
+
+      // Re-initialize: load pairs, run scan, resume event-driven scanning
+      xPlatformArb.loadPersistedPairs();
+      this.setState('RUNNING');
+      await xPlatformArb.refreshPairsIfNeeded().catch(err =>
+        log.error('Post-reset pair refresh failed', { error: err.message })
+      );
+      await xPlatformArb.scan().catch(err =>
+        log.error('Post-reset scan failed', { error: err.message })
+      );
+      xPlatformArb.startEventDrivenScanning();
+      log.info('Bot restarted after reset');
     });
 
     // 6. Start API server

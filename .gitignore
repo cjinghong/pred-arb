@@ -41,4 +41,7 @@ dashboard/.next/
 *.tsbuildinfo
 .cache/
 
+# Claude scratchpad
+CLAUDE.md
+
 id_do

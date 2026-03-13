@@ -244,6 +244,13 @@ export class MarketMatcher {
     log.info('Manual pair removed', { pairId });
   }
 
+  /** Reset all in-memory pair data */
+  reset(): void {
+    this.pairStatuses.clear();
+    this.manualPairs.clear();
+    log.info('Market matcher state reset');
+  }
+
   /**
    * Find matching market pairs across two sets of markets.
    * Returns pairs sorted by confidence (highest first).

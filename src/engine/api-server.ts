@@ -17,6 +17,7 @@ import {
   getRecentTrades,
   getBotStateKV,
   setBotStateKV,
+  resetAllData,
 } from '../db/database';
 import { BotState, Platform } from '../types';
 import { MarketConnector } from '../types/connector';
@@ -34,6 +35,8 @@ export class ApiServer {
   private getMarketsSummary: (() => unknown) | null = null;
   private setPairStatus: ((pairId: string, status: string) => void) | null = null;
   private addManualPair: ((marketAId: string, marketBId: string) => string | null) | null = null;
+  private getPositions: (() => unknown[]) | null = null;
+  private resetStrategy: (() => void | Promise<void>) | null = null;
   private connectors = new Map<Platform, MarketConnector>();
 
   constructor(
@@ -59,6 +62,16 @@ export class ApiServer {
   /** Wire up manual pair creation handler */
   setManualPairHandler(fn: (marketAId: string, marketBId: string) => string | null): void {
     this.addManualPair = fn;
+  }
+
+  /** Wire up positions getter from risk manager */
+  setPositionsGetter(fn: () => unknown[]): void {
+    this.getPositions = fn;
+  }
+
+  /** Wire up strategy reset handler */
+  setResetHandler(fn: () => void | Promise<void>): void {
+    this.resetStrategy = fn;
   }
 
   /** Wire up connectors for order book fetching */
@@ -113,6 +126,14 @@ export class ApiServer {
         return;
       }
       res.json(this.getMarketsSummary());
+    });
+
+    this.app.get('/api/positions', (_req, res) => {
+      if (!this.getPositions) {
+        res.json([]);
+        return;
+      }
+      res.json(this.getPositions());
     });
 
     // ─── Order Book Endpoint ──────────────────────────────────────────
@@ -214,6 +235,23 @@ export class ApiServer {
       setBotStateKV('state', 'STOPPED');
       log.info('Bot stopped via API');
       res.json({ state: 'STOPPED' });
+    });
+
+    this.app.post('/api/bot/reset', async (_req, res) => {
+      try {
+        // Stop the bot
+        this.setBotState('STOPPED');
+        // Clear database
+        resetAllData();
+        log.info('Full reset triggered via API — clearing data and restarting');
+        // Reset in-memory strategy state + auto-restart
+        if (this.resetStrategy) await this.resetStrategy();
+        this.broadcast({ type: 'state_change', data: { state: this.getBotState() }, timestamp: new Date().toISOString() });
+        res.json({ success: true, state: this.getBotState() });
+      } catch (err) {
+        log.error('Reset failed', { error: (err as Error).message });
+        res.status(500).json({ error: (err as Error).message });
+      }
     });
 
     // SPA fallback (Next.js static export)

@@ -373,6 +373,18 @@ export class CrossPlatformArbStrategy implements Strategy {
     return pairId;
   }
 
+  /** Reset all in-memory state (called from dashboard reset) */
+  reset(): void {
+    this.stopEventDrivenScanning();
+    this.cachedPairs = [];
+    this.lastPairRefresh = 0;
+    this.lastFetchedMarkets.clear();
+    this.marketToPairs.clear();
+    this.lastPairAnalysis.clear();
+    this.matcher.reset();
+    log.info('Strategy state reset');
+  }
+
   /** Load persisted pair statuses from DB at startup */
   loadPersistedPairs(): void {
     try {

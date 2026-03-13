@@ -23,6 +23,7 @@ export const config = {
     apiSecret: process.env.POLYMARKET_API_SECRET || '',
     apiPassphrase: process.env.POLYMARKET_API_PASSPHRASE || '',
     privateKey: process.env.POLYMARKET_PRIVATE_KEY || '',
+    proxyAddress: process.env.POLYMARKET_PROXY_ADDRESS || '',
     gammaUrl: 'https://gamma-api.polymarket.com',
     clobUrl: 'https://clob.polymarket.com',
     wsUrl: 'wss://ws-subscriptions-clob.polymarket.com/ws/market',
@@ -49,6 +50,8 @@ export const config = {
     minDepthUsd: envInt('MIN_DEPTH_USD', 50),
     /** Interval for refreshing market pairs (ms). Pair matching is separate from opportunity scanning. */
     pairRefreshIntervalMs: envInt('PAIR_REFRESH_INTERVAL_MS', 300000),
+    /** Dry-run mode: when true, no real trades are placed. Default: true (safe). */
+    dryRun: process.env.DRY_RUN !== 'false',
   },
 
   dashboard: {

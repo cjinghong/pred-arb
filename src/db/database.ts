@@ -56,6 +56,8 @@ export function initializeDatabase(): void {
       max_size REAL NOT NULL,
       match_confidence REAL NOT NULL,
       executed INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'open',
+      fail_reason TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -133,6 +135,14 @@ export function initializeDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_market_pairs_status ON market_pairs(status);
   `);
 
+  // Migration: add status + fail_reason to existing opportunities tables
+  try {
+    db.exec(`ALTER TABLE opportunities ADD COLUMN status TEXT DEFAULT 'open'`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE opportunities ADD COLUMN fail_reason TEXT`);
+  } catch { /* column already exists */ }
+
   log.info('Database schema initialized');
 }
 
@@ -157,7 +167,15 @@ export function insertOpportunity(opp: ArbitrageOpportunity): void {
 }
 
 export function markOpportunityExecuted(id: string): void {
-  getDb().prepare('UPDATE opportunities SET executed = 1 WHERE id = ?').run(id);
+  getDb().prepare('UPDATE opportunities SET executed = 1, status = ? WHERE id = ?').run('executed', id);
+}
+
+export function updateOpportunityStatus(id: string, status: string, failReason?: string): void {
+  if (failReason) {
+    getDb().prepare('UPDATE opportunities SET status = ?, fail_reason = ? WHERE id = ?').run(status, failReason, id);
+  } else {
+    getDb().prepare('UPDATE opportunities SET status = ? WHERE id = ?').run(status, id);
+  }
 }
 
 export function getRecentOpportunities(limit = 50): ArbitrageOpportunity[] {
@@ -347,6 +365,19 @@ export function getMarketPair(pairId: string): Record<string, unknown> | undefin
   ).get(pairId) as Record<string, unknown> | undefined;
 }
 
+// ─── Reset ───────────────────────────────────────────────────────────────
+
+export function resetAllData(): void {
+  const db = getDb();
+  db.exec(`
+    DELETE FROM opportunities;
+    DELETE FROM trades;
+    DELETE FROM market_pairs;
+    DELETE FROM market_snapshots;
+    DELETE FROM bot_state;
+  `);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 function rowToOpportunity(row: Record<string, unknown>): ArbitrageOpportunity {
@@ -379,5 +410,7 @@ function rowToOpportunity(row: Record<string, unknown>): ArbitrageOpportunity {
     maxSize: row.max_size as number,
     matchConfidence: row.match_confidence as number,
     executed: (row.executed as number) === 1,
-  };
+    status: (row.status as string) || 'open',
+    failReason: (row.fail_reason as string) || undefined,
+  } as ArbitrageOpportunity & { status: string; failReason?: string };
 }

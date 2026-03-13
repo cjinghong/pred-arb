@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: predict.fun Connector
 // Connects to the predict.fun REST API and WebSocket for real-time order books
+// Real trading via @predictdotfun/sdk
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { BaseConnector } from './base-connector';
@@ -16,6 +17,14 @@ import {
 } from '../types';
 import { config } from '../utils/config';
 import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
+import { Wallet } from 'ethers';
+import {
+  OrderBuilder,
+  Side as PredictSide,
+  SignatureType as PredictSigType,
+  ChainId,
+} from '@predictdotfun/sdk';
+import type { SignedOrder as PredictSignedOrder } from '@predictdotfun/sdk';
 
 // ─── Raw predict.fun API Types (from https://dev.predict.fun) ────────────
 
@@ -87,6 +96,13 @@ export class PredictFunConnector extends BaseConnector {
   private apiUrl: string;
   private jwtToken: string | null = null;
   private wsManager: WsOrderBookManager;
+
+  /** predict.fun SDK OrderBuilder for EIP-712 signing */
+  private orderBuilder: OrderBuilder | null = null;
+  /** Wallet for signing */
+  private wallet: Wallet | null = null;
+  /** Wallet address */
+  private walletAddress: string | null = null;
 
   /** Cache: marketId → NormalizedMarket (for token lookups and WS event parsing) */
   private marketCache = new Map<string, NormalizedMarket>();
@@ -178,6 +194,12 @@ export class PredictFunConnector extends BaseConnector {
       this.emit('connected');
       this.log.info('Connected to predict.fun REST API', { url: this.apiUrl });
 
+      // Initialize trading SDK
+      await this.initTradingClient();
+
+      // Authenticate for JWT (needed for order management)
+      await this.authenticate();
+
       // Connect WebSocket for real-time book streaming
       try {
         await this.wsManager.connect();
@@ -194,6 +216,34 @@ export class PredictFunConnector extends BaseConnector {
     }
   }
 
+  /** Initialize the predict.fun OrderBuilder for EIP-712 signing */
+  private async initTradingClient(): Promise<void> {
+    const { privateKey } = config.predictfun;
+
+    if (!privateKey) {
+      this.log.warn('PREDICTFUN_PRIVATE_KEY not set — trading disabled');
+      return;
+    }
+
+    try {
+      this.wallet = new Wallet(privateKey);
+      this.walletAddress = this.wallet.address;
+
+      const chainId = config.predictfun.useTestnet ? ChainId.BnbTestnet : ChainId.BnbMainnet;
+      this.orderBuilder = await OrderBuilder.make(chainId, this.wallet);
+
+      this.log.info('predict.fun OrderBuilder initialized', {
+        address: this.walletAddress,
+        chainId,
+      });
+    } catch (err) {
+      this.log.error('Failed to initialize predict.fun trading SDK', {
+        error: (err as Error).message,
+      });
+      this.orderBuilder = null;
+    }
+  }
+
   async disconnect(): Promise<void> {
     await this.wsManager.disconnect();
     this._isWsConnected = false;
@@ -206,22 +256,51 @@ export class PredictFunConnector extends BaseConnector {
 
   /** Authenticate and get JWT token */
   private async authenticate(): Promise<void> {
-    if (!config.predictfun.apiKey || !config.predictfun.privateKey) {
+    if (!config.predictfun.apiKey || !config.predictfun.privateKey || !this.wallet) {
       this.log.warn('predict.fun credentials not configured — trading disabled');
       return;
     }
 
-    // Step 1: Get auth message
-    const { message } = await this.httpGet<PredictFunAuthMessage>(
-      `${this.apiUrl}/v1/auth/message`
-    );
+    try {
+      // Step 1: Get auth message
+      const { message } = await this.httpGet<PredictFunAuthMessage>(
+        `${this.apiUrl}/v1/auth/message`,
+        this.getAuthHeaders(),
+      );
 
-    // Step 2: Sign message with private key (would use ethers.js)
-    this.log.info('Auth message received, signing required for trading');
+      this.log.info('Auth message received, signing...');
 
-    // Step 3: Exchange for JWT
-    // const jwt = await this.httpPost(`${this.apiUrl}/v1/auth`, { ... });
-    // this.jwtToken = jwt.token;
+      // Step 2: Sign message with private key
+      const signature = await this.wallet.signMessage(message);
+
+      // Step 3: Exchange for JWT
+      const authResponse = await this.httpPost<{ token: string }>(
+        `${this.apiUrl}/v1/auth`,
+        {
+          signer: this.walletAddress,
+          signature,
+          message,
+        },
+        this.getAuthHeaders(),
+      );
+
+      this.jwtToken = authResponse.token;
+      this.log.info('predict.fun JWT authentication successful', {
+        address: this.walletAddress,
+      });
+    } catch (err) {
+      this.log.error('predict.fun authentication failed — trading may be limited', {
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /** Re-authenticate if JWT has expired */
+  private async ensureAuthenticated(): Promise<void> {
+    // JWT tokens typically expire — re-authenticate if needed
+    if (!this.jwtToken && this.wallet) {
+      await this.authenticate();
+    }
   }
 
   private getAuthHeaders(): Record<string, string> {
@@ -363,59 +442,274 @@ export class PredictFunConnector extends BaseConnector {
     }
   }
 
-  // ─── Trading (requires auth) ───────────────────────────────────────────
+  // ─── Trading (requires auth + SDK) ─────────────────────────────────────
+
+  private ensureOrderBuilder(): OrderBuilder {
+    if (!this.orderBuilder) {
+      throw new Error('predict.fun: OrderBuilder not initialized — set PREDICTFUN_PRIVATE_KEY');
+    }
+    return this.orderBuilder;
+  }
+
+  /**
+   * Calculate predict.fun taker fee.
+   * Formula: rawFee = baseFee% × min(price, 1 - price) × shares
+   * Base fee: 2% (0.02). Discounted: multiply by 0.9 → 1.8% effective.
+   *
+   * Polymarket has no fees, so we only need this for predict.fun.
+   */
+  static calculateTakerFee(price: number, shares: number, discounted = false): number {
+    const baseFee = 0.02;
+    const rawFee = baseFee * Math.min(price, 1 - price) * shares;
+    return discounted ? rawFee * 0.9 : rawFee;
+  }
 
   async placeOrder(order: OrderRequest): Promise<OrderResult> {
-    if (!this.jwtToken && !config.predictfun.apiKey) {
-      throw new Error('predict.fun: not authenticated for trading');
-    }
+    const ob = this.ensureOrderBuilder();
+    await this.ensureAuthenticated();
 
-    this.log.info('Placing order on predict.fun', { order });
+    const market = this.marketCache.get(order.marketId);
+    if (!market) throw new Error(`Market ${order.marketId} not in cache`);
 
-    const orderPayload = {
+    const rawMarket = market.raw as PredictFunRawMarket;
+    const tokenId = market.outcomeTokenIds[order.outcomeIndex];
+    if (!tokenId) throw new Error(`No token for outcome index ${order.outcomeIndex}`);
+
+    const side = order.side === 'BUY' ? PredictSide.BUY : PredictSide.SELL;
+    const precision = BigInt(10) ** BigInt(18);  // predict.fun uses 18 decimals
+    const priceWei = BigInt(Math.round(order.price * 1e18));
+    const quantityWei = BigInt(Math.round(order.size * 1e18));
+
+    this.log.info('Placing order on predict.fun', {
       marketId: order.marketId,
-      outcomeIndex: order.outcomeIndex,
+      tokenId,
       side: order.side,
-      type: order.type,
-      price: order.price,
-      amount: order.size,
-    };
-
-    this.log.info('Order payload prepared (dry-run mode)', { orderPayload });
-
-    return {
-      id: `pfun_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      platform: 'predictfun',
-      marketId: order.marketId,
-      outcomeIndex: order.outcomeIndex,
-      side: order.side,
-      type: order.type,
       price: order.price,
       size: order.size,
-      filledSize: 0,
-      avgFillPrice: 0,
-      status: 'PENDING',
-      timestamp: new Date(),
-      fees: 0,
-      raw: orderPayload,
-    };
+      isNegRisk: rawMarket.isNegRisk,
+    });
+
+    try {
+      // Calculate order amounts using SDK
+      const amounts = ob.getLimitOrderAmounts({
+        side,
+        pricePerShareWei: priceWei,
+        quantityWei,
+      });
+
+      // Build the order struct
+      const orderStruct = ob.buildOrder('LIMIT', {
+        side,
+        tokenId,
+        makerAmount: amounts.makerAmount.toString(),
+        takerAmount: amounts.takerAmount.toString(),
+        feeRateBps: rawMarket.feeRateBps || 200, // 2% default
+      });
+
+      // Build typed data and sign
+      const typedData = ob.buildTypedData(orderStruct, {
+        isNegRisk: rawMarket.isNegRisk || false,
+        isYieldBearing: rawMarket.isYieldBearing || false,
+      });
+      const signedOrder: PredictSignedOrder = await ob.signTypedDataOrder(typedData);
+      const orderHash = ob.buildTypedDataHash(typedData);
+
+      // Submit to predict.fun API
+      const strategy = order.type === 'MARKET' ? 'MARKET' : 'LIMIT';
+      const response = await this.httpPost<any>(
+        `${this.apiUrl}/v1/orders`,
+        {
+          data: {
+            pricePerShare: order.price.toString(),
+            strategy,
+            isFillOrKill: order.type === 'MARKET',
+            order: {
+              ...signedOrder,
+              hash: orderHash,
+            },
+          },
+        },
+        this.getAuthHeaders(),
+      );
+
+      const orderId = response?.hash || orderHash || `pfun_${Date.now()}`;
+      const fees = PredictFunConnector.calculateTakerFee(order.price, order.size);
+
+      this.log.info('Order placed on predict.fun', {
+        orderId,
+        status: response?.status,
+        raw: response,
+      });
+
+      return {
+        id: orderId,
+        platform: 'predictfun',
+        marketId: order.marketId,
+        outcomeIndex: order.outcomeIndex,
+        side: order.side,
+        type: order.type,
+        price: order.price,
+        size: order.size,
+        filledSize: 0,
+        avgFillPrice: 0,
+        status: 'PENDING',
+        timestamp: new Date(),
+        fees,
+        raw: response,
+      };
+    } catch (err) {
+      this.log.error('Failed to place order on predict.fun', {
+        error: (err as Error).message,
+        order,
+      });
+      return {
+        id: `pfun_failed_${Date.now()}`,
+        platform: 'predictfun',
+        marketId: order.marketId,
+        outcomeIndex: order.outcomeIndex,
+        side: order.side,
+        type: order.type,
+        price: order.price,
+        size: order.size,
+        filledSize: 0,
+        avgFillPrice: 0,
+        status: 'FAILED',
+        timestamp: new Date(),
+        fees: 0,
+        raw: { error: (err as Error).message },
+      };
+    }
   }
 
   async cancelOrder(orderId: string): Promise<boolean> {
+    await this.ensureAuthenticated();
     this.log.info('Cancelling order on predict.fun', { orderId });
-    return true;
+
+    try {
+      await this.httpPost(
+        `${this.apiUrl}/v1/orders/remove`,
+        { data: { ids: [orderId] } },
+        this.getAuthHeaders(),
+      );
+      this.log.info('Order cancelled on predict.fun', { orderId });
+      return true;
+    } catch (err) {
+      this.log.error('Failed to cancel order on predict.fun', {
+        orderId,
+        error: (err as Error).message,
+      });
+      return false;
+    }
   }
 
   async getOpenOrders(): Promise<OrderResult[]> {
-    return [];
+    await this.ensureAuthenticated();
+
+    try {
+      const response = await this.httpGet<any>(
+        `${this.apiUrl}/v1/orders`,
+        this.getAuthHeaders(),
+      );
+
+      const orders = response?.data || response?.edges?.map((e: any) => e.node) || [];
+      return orders.map((o: any) => ({
+        id: o.hash || o.id || '',
+        platform: 'predictfun' as Platform,
+        marketId: o.marketId || '',
+        outcomeIndex: 0,
+        side: o.side === 0 || o.side === 'BUY' ? 'BUY' as const : 'SELL' as const,
+        type: 'LIMIT' as const,
+        price: parseFloat(o.pricePerShare || o.price || '0'),
+        size: parseFloat(o.originalSize || o.size || '0') / 1e18,
+        filledSize: parseFloat(o.matchedSize || '0') / 1e18,
+        avgFillPrice: 0,
+        status: this.mapPredictFunStatus(o.status),
+        timestamp: new Date(o.createdAt || Date.now()),
+        fees: 0,
+        raw: o,
+      }));
+    } catch (err) {
+      this.log.error('Failed to get open orders', { error: (err as Error).message });
+      return [];
+    }
   }
 
   async getPositions(): Promise<Position[]> {
-    return [];
+    await this.ensureAuthenticated();
+
+    try {
+      const response = await this.httpGet<any>(
+        `${this.apiUrl}/v1/positions?first=50`,
+        this.getAuthHeaders(),
+      );
+
+      const positions = response?.edges?.map((e: any) => e.node) || response?.data || [];
+      return positions.map((p: any) => ({
+        platform: 'predictfun' as Platform,
+        marketId: p.marketId || '',
+        marketQuestion: p.title || '',
+        outcomeIndex: p.outcome === 'YES' || p.outcomeIndex === 0 ? 0 : 1,
+        side: (p.outcome === 'YES' ? 'YES' : 'NO') as 'YES' | 'NO',
+        size: parseFloat(p.balance || '0') / 1e18,
+        avgEntryPrice: parseFloat(p.avgPrice || '0'),
+        currentPrice: parseFloat(p.currentPrice || '0'),
+        unrealizedPnl: parseFloat(p.unrealizedPnL || '0') / 1e18,
+      }));
+    } catch (err) {
+      this.log.error('Failed to get positions', { error: (err as Error).message });
+      return [];
+    }
   }
 
   async getBalance(): Promise<number> {
-    return 0;
+    // Option 1: Use SDK if available
+    if (this.orderBuilder) {
+      try {
+        const balanceWei = await this.orderBuilder.balanceOf('USDT');
+        const balance = Number(balanceWei) / 1e18;
+        this.log.debug('predict.fun balance fetched via SDK', { balance });
+        return balance;
+      } catch (err) {
+        this.log.warn('SDK balance fetch failed, trying API', { error: (err as Error).message });
+      }
+    }
+
+    // Option 2: Try API endpoint
+    await this.ensureAuthenticated();
+    try {
+      const response = await this.httpGet<any>(
+        `${this.apiUrl}/v1/account/balance`,
+        this.getAuthHeaders(),
+      );
+      const balance = parseFloat(response?.balance || response?.data?.balance || '0');
+      this.log.debug('predict.fun balance fetched via API', { balance });
+      return balance;
+    } catch (err) {
+      this.log.error('Failed to get predict.fun balance', { error: (err as Error).message });
+      return 0;
+    }
+  }
+
+  // ─── Trading Helpers ────────────────────────────────────────────────────
+
+  private mapPredictFunStatus(status: string): OrderResult['status'] {
+    switch ((status || '').toUpperCase()) {
+      case 'LIVE':
+      case 'OPEN':
+        return 'OPEN';
+      case 'MATCHED':
+      case 'FILLED':
+        return 'FILLED';
+      case 'CANCELLED':
+      case 'CANCELED':
+        return 'CANCELLED';
+      case 'PENDING':
+        return 'PENDING';
+      case 'PARTIALLY_MATCHED':
+        return 'PARTIALLY_FILLED';
+      default:
+        return 'PENDING';
+    }
   }
 
   // ─── WebSocket Event Parsing ─────────────────────────────────────────

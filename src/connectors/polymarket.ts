@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: Polymarket Connector
 // Connects to Polymarket's Gamma API (markets) and CLOB API (order books)
+// Real trading via @polymarket/clob-client SDK
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { BaseConnector } from './base-connector';
@@ -16,6 +17,29 @@ import {
 } from '../types';
 import { config } from '../utils/config';
 import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
+import { Wallet } from 'ethers';
+import {
+  ClobClient,
+  Side as PolySide,
+  OrderType as PolyOrderType,
+  AssetType,
+  SignatureType,
+  type ApiKeyCreds,
+  type OpenOrder,
+  type ClobSigner,
+} from '@polymarket/clob-client';
+
+/**
+ * Adapter: wraps ethers v6 Wallet to match the EthersSigner interface
+ * expected by @polymarket/clob-client (which expects _signTypedData with underscore).
+ */
+function walletToClobSigner(wallet: Wallet): ClobSigner {
+  return {
+    _signTypedData: (domain: any, types: any, value: any) =>
+      wallet.signTypedData(domain, types, value),
+    getAddress: () => Promise.resolve(wallet.address),
+  } as ClobSigner;
+}
 
 // ─── Raw Polymarket API Types ────────────────────────────────────────────
 
@@ -24,16 +48,85 @@ interface PolymarketRawMarket {
   question: string;
   conditionId: string;
   slug: string;
-  category: string;
+  category?: string;
   outcomes: string;           // JSON string: '["Yes","No"]'
-  outcomePrices: string;      // JSON string: '[0.65, 0.35]'
-  clobTokenIds: string;       // JSON string: '["token1","token2"]'
-  volume: number;
-  liquidity: number;
+  outcomePrices: string;      // JSON string: '["0.324","0.676"]'
+  clobTokenIds: string;       // JSON string: '["tokenId1","tokenId2"]'
+  volume: number | string;
+  liquidity: number | string;
   active: boolean;
   closed: boolean;
   endDate: string;
   updatedAt: string;
+  // Extended fields from Gamma API
+  startDate?: string;
+  image?: string;
+  icon?: string;
+  description?: string;
+  resolutionSource?: string;
+  marketMakerAddress?: string;
+  createdAt?: string;
+  new?: boolean;
+  featured?: boolean;
+  submitted_by?: string;
+  archived?: boolean;
+  resolvedBy?: string;
+  restricted?: boolean;
+  groupItemTitle?: string;
+  groupItemThreshold?: string;
+  questionID?: string;
+  enableOrderBook?: boolean;
+  orderPriceMinTickSize?: number;
+  orderMinSize?: number;
+  volumeNum?: number;
+  liquidityNum?: number;
+  endDateIso?: string;
+  startDateIso?: string;
+  hasReviewedDates?: boolean;
+  volume24hr?: number;
+  volume1wk?: number;
+  volume1mo?: number;
+  volume1yr?: number;
+  umaBond?: string;
+  umaReward?: string;
+  volume24hrClob?: number;
+  volume1wkClob?: number;
+  volume1moClob?: number;
+  volume1yrClob?: number;
+  volumeClob?: number;
+  liquidityClob?: number;
+  acceptingOrders?: boolean;
+  negRisk?: boolean;
+  events?: any[];
+  ready?: boolean;
+  funded?: boolean;
+  acceptingOrdersTimestamp?: string;
+  cyom?: boolean;
+  competitive?: number;
+  pagerDutyNotificationEnabled?: boolean;
+  approved?: boolean;
+  rewardsMinSize?: number;
+  rewardsMaxSpread?: number;
+  spread?: number;
+  oneDayPriceChange?: number;
+  oneHourPriceChange?: number;
+  oneWeekPriceChange?: number;
+  oneMonthPriceChange?: number;
+  lastTradePrice?: number;
+  bestBid?: number;
+  bestAsk?: number;
+  automaticallyActive?: boolean;
+  clearBookOnStart?: boolean;
+  manualActivation?: boolean;
+  negRiskOther?: boolean;
+  umaResolutionStatuses?: string;
+  pendingDeployment?: boolean;
+  deploying?: boolean;
+  rfqEnabled?: boolean;
+  holdingRewardsEnabled?: boolean;
+  feesEnabled?: boolean;
+  requiresTranslation?: boolean;
+  feeType?: string | null;
 }
 
 interface PolymarketRawOrderBook {
@@ -55,6 +148,11 @@ export class PolymarketConnector extends BaseConnector {
   private gammaUrl: string;
   private clobUrl: string;
   private wsManager: WsOrderBookManager;
+
+  /** CLOB client for authenticated trading operations */
+  private clobClient: ClobClient | null = null;
+  /** Wallet address derived from private key */
+  private walletAddress: string | null = null;
 
   /** Cache: marketId → NormalizedMarket (to avoid refetching for token lookups) */
   private marketCache = new Map<string, NormalizedMarket>();
@@ -101,6 +199,9 @@ export class PolymarketConnector extends BaseConnector {
       this.emit('connected');
       this.log.info('Connected to Polymarket REST API');
 
+      // Initialize CLOB client for trading if credentials are available
+      await this.initClobClient();
+
       // Connect WebSocket for real-time book streaming
       try {
         await this.wsManager.connect();
@@ -114,6 +215,90 @@ export class PolymarketConnector extends BaseConnector {
     } catch (err) {
       this.log.error('Failed to connect to Polymarket', { error: (err as Error).message });
       throw err;
+    }
+  }
+
+  /** Initialize the CLOB client for authenticated trading */
+  private async initClobClient(): Promise<void> {
+    const { privateKey, apiKey, apiSecret, apiPassphrase, proxyAddress } = config.polymarket;
+
+    if (!privateKey) {
+      this.log.warn('POLYMARKET_PRIVATE_KEY not set — trading disabled');
+      return;
+    }
+
+    try {
+      const wallet = new Wallet(privateKey);
+      this.walletAddress = wallet.address;
+      const signer = walletToClobSigner(wallet);
+
+      // Determine signature type and funder address
+      // POLY_GNOSIS_SAFE (2) = browser wallet (MetaMask, Rabby) or embedded wallet (Privy, Turnkey)
+      // POLY_PROXY (1) = Magic Link (email/Google login) with exported private key
+      // EOA (0) = standalone wallet, no proxy
+      const sigType = proxyAddress ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+      const funder = proxyAddress || undefined;
+
+      if (proxyAddress) {
+        this.log.info('Using Polymarket proxy wallet (Gnosis Safe)', {
+          eoa: this.walletAddress,
+          proxy: proxyAddress,
+          signatureType: 'POLY_GNOSIS_SAFE',
+        });
+      }
+
+      // If API credentials are provided, use L2 auth (faster, no signature per request)
+      if (apiKey && apiSecret && apiPassphrase) {
+        const creds: ApiKeyCreds = {
+          key: apiKey,
+          secret: apiSecret,
+          passphrase: apiPassphrase,
+        };
+        this.clobClient = new ClobClient(
+          this.clobUrl,
+          137,  // Polygon mainnet
+          signer,
+          creds,
+          sigType,
+          funder,
+        );
+        this.log.info('Polymarket CLOB client initialized with L2 auth (API key)', {
+          address: this.walletAddress,
+          funderAddress: funder || 'EOA (self)',
+        });
+      } else {
+        // L1 auth only — derive API credentials automatically
+        this.clobClient = new ClobClient(
+          this.clobUrl,
+          137,
+          signer,
+          undefined,  // no creds yet
+          sigType,
+          funder,
+        );
+        // Derive or create API keys
+        const creds = await this.clobClient.createOrDeriveApiKey();
+
+        // Reinitialize with L2 creds for faster subsequent requests
+        this.clobClient = new ClobClient(
+          this.clobUrl,
+          137,
+          signer,
+          creds,
+          sigType,
+          funder,
+        );
+        this.log.info('Polymarket CLOB client initialized with derived API key', {
+          address: this.walletAddress,
+          funderAddress: funder || 'EOA (self)',
+          apiKey: creds.key,
+        });
+      }
+    } catch (err) {
+      this.log.error('Failed to initialize CLOB client — trading disabled', {
+        error: (err as Error).message,
+      });
+      this.clobClient = null;
     }
   }
 
@@ -297,71 +482,251 @@ export class PolymarketConnector extends BaseConnector {
     return result;
   }
 
-  // ─── Trading (requires auth) ───────────────────────────────────────────
+  // ─── Trading (requires CLOB client) ────────────────────────────────────
+
+  private ensureClobClient(): ClobClient {
+    if (!this.clobClient) {
+      throw new Error('Polymarket: CLOB client not initialized — set POLYMARKET_PRIVATE_KEY');
+    }
+    return this.clobClient;
+  }
 
   async placeOrder(order: OrderRequest): Promise<OrderResult> {
-    // NOTE: Full order signing requires EIP-712 integration with ethers.js
-    // This is a scaffold — production would use the Polymarket CLOB client SDK
-    this.log.info('Placing order on Polymarket', { order });
+    const client = this.ensureClobClient();
 
-    const market = await this.fetchMarket(order.marketId);
+    const market = await this.getOrFetchMarket(order.marketId);
     if (!market) throw new Error(`Market ${order.marketId} not found`);
 
     const tokenId = market.outcomeTokenIds[order.outcomeIndex];
+    if (!tokenId) throw new Error(`No token for outcome index ${order.outcomeIndex}`);
 
-    // In production, this would:
-    // 1. Build the order struct
-    // 2. Sign with EIP-712
-    // 3. POST to CLOB /order endpoint
-    const orderPayload = {
-      tokenID: tokenId,
-      price: order.price,
-      size: order.size,
-      side: order.side,
-      feeRateBps: 0,
-      nonce: Date.now().toString(),
-    };
+    const side = order.side === 'BUY' ? PolySide.BUY : PolySide.SELL;
 
-    this.log.info('Order payload prepared (dry-run mode)', { orderPayload });
-
-    // Return a simulated result for now
-    return {
-      id: `poly_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      platform: 'polymarket',
+    this.log.info('Placing order on Polymarket', {
       marketId: order.marketId,
-      outcomeIndex: order.outcomeIndex,
+      tokenId,
       side: order.side,
-      type: order.type,
       price: order.price,
       size: order.size,
-      filledSize: 0,
-      avgFillPrice: 0,
-      status: 'PENDING',
-      timestamp: new Date(),
-      fees: 0,
-      raw: orderPayload,
-    };
+    });
+
+    try {
+      // Use the SDK to create, sign, and post the order in one call
+      // Polymarket has NO fees per user confirmation
+      let response: any;
+      if (order.type === 'MARKET') {
+        // Market orders use FOK (Fill or Kill)
+        response = await client.createAndPostMarketOrder(
+          {
+            tokenID: tokenId,
+            price: order.price,
+            amount: order.side === 'BUY' ? order.size * order.price : order.size,
+            side,
+            feeRateBps: 0,
+          },
+          undefined,
+          PolyOrderType.FOK,
+        );
+      } else {
+        // Limit orders use GTC (Good Till Cancelled)
+        response = await client.createAndPostOrder(
+          {
+            tokenID: tokenId,
+            price: order.price,
+            size: order.size,
+            side,
+            feeRateBps: 0,
+          },
+          undefined,
+          PolyOrderType.GTC,
+        );
+      }
+
+      // Check for error response (API returns { error: string, status: number })
+      if (response?.error) {
+        throw new Error(response.error);
+      }
+
+      const orderId = response?.orderID || response?.id || `poly_${Date.now()}`;
+      const rawStatus = typeof response?.status === 'string' ? response.status : '';
+      const status = rawStatus.toUpperCase() || 'PENDING';
+
+      this.log.info('Order placed on Polymarket', {
+        orderId,
+        status,
+        raw: response,
+      });
+
+      return {
+        id: orderId,
+        platform: 'polymarket',
+        marketId: order.marketId,
+        outcomeIndex: order.outcomeIndex,
+        side: order.side,
+        type: order.type,
+        price: order.price,
+        size: order.size,
+        filledSize: status === 'MATCHED' || status === 'FILLED' ? order.size : 0,
+        avgFillPrice: status === 'MATCHED' || status === 'FILLED' ? order.price : 0,
+        status: this.mapPolyStatus(status),
+        timestamp: new Date(),
+        fees: 0, // Polymarket has no fees
+        raw: response,
+      };
+    } catch (err) {
+      this.log.error('Failed to place order on Polymarket', {
+        error: (err as Error).message,
+        order,
+      });
+      return {
+        id: `poly_failed_${Date.now()}`,
+        platform: 'polymarket',
+        marketId: order.marketId,
+        outcomeIndex: order.outcomeIndex,
+        side: order.side,
+        type: order.type,
+        price: order.price,
+        size: order.size,
+        filledSize: 0,
+        avgFillPrice: 0,
+        status: 'FAILED',
+        timestamp: new Date(),
+        fees: 0,
+        raw: { error: (err as Error).message },
+      };
+    }
   }
 
   async cancelOrder(orderId: string): Promise<boolean> {
+    const client = this.ensureClobClient();
     this.log.info('Cancelling order on Polymarket', { orderId });
-    // Would DELETE to CLOB /order/{orderId}
-    return true;
+
+    try {
+      await client.cancelOrder({ orderID: orderId });
+      this.log.info('Order cancelled on Polymarket', { orderId });
+      return true;
+    } catch (err) {
+      this.log.error('Failed to cancel order on Polymarket', {
+        orderId,
+        error: (err as Error).message,
+      });
+      return false;
+    }
+  }
+
+  async cancelAllOrders(): Promise<boolean> {
+    const client = this.ensureClobClient();
+    try {
+      await client.cancelAll();
+      this.log.info('All orders cancelled on Polymarket');
+      return true;
+    } catch (err) {
+      this.log.error('Failed to cancel all orders', { error: (err as Error).message });
+      return false;
+    }
   }
 
   async getOpenOrders(): Promise<OrderResult[]> {
-    // Would GET from CLOB /orders with API credentials
-    return [];
+    const client = this.ensureClobClient();
+
+    try {
+      const response = await client.getOpenOrders();
+      const orders: OpenOrder[] = Array.isArray(response) ? response : (response as any)?.data || [];
+
+      return orders.map((o: OpenOrder) => this.mapOpenOrderToResult(o));
+    } catch (err) {
+      this.log.error('Failed to get open orders', { error: (err as Error).message });
+      return [];
+    }
   }
 
   async getPositions(): Promise<Position[]> {
-    // Would GET from data-api with API credentials
+    // Polymarket doesn't have a direct positions endpoint in the CLOB client.
+    // We can derive positions from balance allowance or trade history.
+    // For now, return empty — positions are tracked in-memory by RiskManager.
+    this.log.debug('getPositions: using RiskManager in-memory tracking');
     return [];
   }
 
   async getBalance(): Promise<number> {
-    // Would query USDC balance on Polygon
-    return 0;
+    const client = this.ensureClobClient();
+
+    try {
+      // Get USDC (collateral) balance via the CLOB client
+      const balanceResponse = await client.getBalanceAllowance({
+        asset_type: AssetType.COLLATERAL,
+      });
+      const balanceStr = balanceResponse?.balance || '0';
+      // CLOB API returns USDC balance in micro-units (6 decimals)
+      const balance = parseFloat(balanceStr) / 1e6;
+      this.log.debug('Polymarket balance fetched', { balance, raw: balanceStr });
+      return balance;
+    } catch (err) {
+      this.log.error('Failed to get Polymarket balance', { error: (err as Error).message });
+      return 0;
+    }
+  }
+
+  /** Get order details by ID */
+  async getOrder(orderId: string): Promise<OrderResult | null> {
+    const client = this.ensureClobClient();
+    try {
+      const order = await client.getOrder(orderId);
+      if (!order) return null;
+      return this.mapOpenOrderToResult(order);
+    } catch (err) {
+      this.log.error('Failed to get order', { orderId, error: (err as Error).message });
+      return null;
+    }
+  }
+
+  // ─── Trading Helpers ────────────────────────────────────────────────────
+
+  private mapPolyStatus(status: string): OrderResult['status'] {
+    switch (status.toUpperCase()) {
+      case 'LIVE':
+      case 'OPEN':
+        return 'OPEN';
+      case 'MATCHED':
+      case 'FILLED':
+        return 'FILLED';
+      case 'CANCELLED':
+      case 'CANCELED':
+        return 'CANCELLED';
+      case 'PENDING':
+        return 'PENDING';
+      default:
+        return 'PENDING';
+    }
+  }
+
+  private mapOpenOrderToResult(o: OpenOrder): OrderResult {
+    const originalSize = parseFloat(o.original_size || '0');
+    const sizeMatched = parseFloat(o.size_matched || '0');
+    const price = parseFloat(o.price || '0');
+
+    let status: OrderResult['status'] = 'OPEN';
+    if (o.status === 'MATCHED' || o.status === 'FILLED') status = 'FILLED';
+    else if (o.status === 'CANCELLED' || o.status === 'CANCELED') status = 'CANCELLED';
+    else if (sizeMatched >= originalSize && originalSize > 0) status = 'FILLED';
+    else if (sizeMatched > 0) status = 'PARTIALLY_FILLED';
+
+    return {
+      id: o.id,
+      platform: 'polymarket',
+      marketId: o.market || '',
+      outcomeIndex: 0, // Would need token→outcome mapping
+      side: o.side === 'BUY' ? 'BUY' : 'SELL',
+      type: o.order_type === 'FOK' ? 'MARKET' : 'LIMIT',
+      price,
+      size: originalSize,
+      filledSize: sizeMatched,
+      avgFillPrice: sizeMatched > 0 ? price : 0, // Approximate
+      status,
+      timestamp: new Date(o.created_at * 1000),
+      fees: 0, // Polymarket has no fees
+      raw: o,
+    };
   }
 
   // ─── Normalization ─────────────────────────────────────────────────────
@@ -384,8 +749,8 @@ export class PolymarketConnector extends BaseConnector {
       outcomes,
       outcomeTokenIds: tokenIds,
       outcomePrices,
-      volume: raw.volume || 0,
-      liquidity: raw.liquidity || 0,
+      volume: Number(raw.volumeNum ?? raw.volume) || 0,
+      liquidity: Number(raw.liquidityNum ?? raw.liquidity) || 0,
       active: raw.active && !raw.closed,
       endDate: raw.endDate ? new Date(raw.endDate) : null,
       lastUpdated: new Date(raw.updatedAt || Date.now()),

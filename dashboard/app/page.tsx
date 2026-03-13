@@ -48,6 +48,20 @@ interface Opportunity {
   maxSize: number;
   matchConfidence: number;
   executed: boolean;
+  status?: 'open' | 'executing' | 'executed' | 'failed' | 'expired' | 'rejected';
+  failReason?: string;
+}
+
+interface PositionItem {
+  platform: string;
+  marketId: string;
+  marketQuestion: string;
+  outcomeIndex: number;
+  side: string;
+  size: number;
+  avgEntryPrice: number;
+  currentPrice: number;
+  unrealizedPnl: number;
 }
 
 interface BotStatus {
@@ -92,7 +106,14 @@ interface WsMessage {
 }
 
 // ─── Tab selector type ─────────────────────────────────────────────────────
-type ActiveTab = 'opportunities' | 'markets' | 'trades';
+type ActiveTab = 'opportunities' | 'markets' | 'trades' | 'positions';
+
+// ─── Platform URL helpers ────────────────────────────────────────────────
+function getPlatformMarketUrl(platform: string, marketId: string): string {
+  if (platform === 'polymarket') return `https://polymarket.com/event/${marketId}`;
+  if (platform === 'predictfun') return `https://predict.fun/market/${marketId}`;
+  return '#';
+}
 
 // ─── Utils ─────────────────────────────────────────────────────────────────
 
@@ -139,7 +160,7 @@ function sparkline(data: number[], width = 40): string {
 
 function getApiBase(): string {
   if (typeof window === 'undefined') return '';
-  return process.env.NEXT_PUBLIC_API_URL || '';
+  return process.env.NEXT_PUBLIC_API_URL || `http://${window.location.hostname}:3848`;
 }
 
 function getWsUrl(): string {
@@ -147,7 +168,7 @@ function getWsUrl(): string {
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL;
   if (wsUrl) return wsUrl;
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${window.location.host}`;
+  return `${proto}://${window.location.hostname}:3848`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -174,6 +195,11 @@ export default function DashboardPage() {
   const [bookSelection, setBookSelection] = useState<BookSelection | null>(null);
   const [manualMatchMode, setManualMatchMode] = useState(false);
   const [manualMatchA, setManualMatchA] = useState<{ id: string; platform: string; question: string } | null>(null);
+  const [positions, setPositions] = useState<PositionItem[]>([]);
+  const [oppSearch, setOppSearch] = useState('');
+  const [pairSearch, setPairSearch] = useState('');
+  const [marketSearch, setMarketSearch] = useState('');
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -241,18 +267,20 @@ export default function DashboardPage() {
     const apiBase = getApiBase();
     const poll = async () => {
       try {
-        const [s, m, t, o, mk] = await Promise.all([
+        const [s, m, t, o, mk, pos] = await Promise.all([
           fetch(`${apiBase}/api/status`).then(r => r.json()),
           fetch(`${apiBase}/api/metrics`).then(r => r.json()),
           fetch(`${apiBase}/api/trades?limit=30`).then(r => r.json()),
           fetch(`${apiBase}/api/opportunities?limit=30`).then(r => r.json()),
           fetch(`${apiBase}/api/markets`).then(r => r.json()).catch(() => ({ platforms: {}, matchedPairs: [] })),
+          fetch(`${apiBase}/api/positions`).then(r => r.json()).catch(() => []),
         ]);
         setStatus(s);
         setMetrics(m);
         setTrades(t);
         setOpportunities(o);
         setMarketsSummary(mk);
+        setPositions(Array.isArray(pos) ? pos : []);
       } catch { /* server not up yet */ }
     };
     poll();
@@ -313,6 +341,26 @@ export default function DashboardPage() {
     await fetch(`${apiBase}/api/bot/${cmd}`, { method: 'POST' });
   };
 
+  const handleReset = async () => {
+    try {
+      const apiBase = getApiBase();
+      const resp = await fetch(`${apiBase}/api/bot/reset`, { method: 'POST' });
+      const data = await resp.json();
+      // Clear local state — bot will auto-restart
+      setTrades([]);
+      setOpportunities([]);
+      setMarketsSummary({ platforms: {}, matchedPairs: [] });
+      setPositions([]);
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: 'Full reset — bot restarting', cls: 'amber' }, ...prev.slice(0, 49)]);
+      setPnlHistory([]);
+      setStatus(s => ({ ...s, state: data.state || 'RUNNING' }));
+      setMetrics({ pnl24h: 0, pnl7d: 0, pnlAllTime: 0, winRate: 0, totalTrades: 0, avgProfitPerTrade: 0, sharpeRatio: 0, currentExposure: 0, maxDrawdown: 0 });
+    } catch (err) {
+      alert(`Reset failed: ${(err as Error).message}`);
+    }
+    setShowResetConfirm(false);
+  };
+
   const updatePairStatus = async (pairId: string, status: string) => {
     const apiBase = getApiBase();
     await fetch(`${apiBase}/api/pairs/${encodeURIComponent(pairId)}/status`, {
@@ -343,6 +391,50 @@ export default function DashboardPage() {
   const totalMarkets = platformNames.reduce((s, p) => s + (marketsSummary.platforms[p]?.total || 0), 0);
   const totalMatched = marketsSummary.matchedPairs.length;
 
+  // ─── Opportunity status helpers ─────────────────────────────────────────
+  const getOppStatus = (opp: Opportunity): { label: string; cls: string } => {
+    if (opp.status === 'failed') return { label: 'FAILED', cls: 'status-failed-trade' };
+    if (opp.status === 'expired') return { label: 'EXPIRED', cls: 'status-expired' };
+    if (opp.status === 'rejected') return { label: 'REJECTED', cls: 'status-rejected-opp' };
+    if (opp.status === 'executing') return { label: 'EXEC...', cls: 'status-executing' };
+    if (opp.executed || opp.status === 'executed') return { label: 'EXECUTED', cls: 'status-executed' };
+    return { label: 'OPEN', cls: 'status-pending-trade' };
+  };
+
+  // ─── Filtered + searched opportunities ─────────────────────────────────
+  const filteredOpps = opportunities.filter(opp => {
+    if (!oppSearch) return true;
+    const q = oppSearch.toLowerCase();
+    return (opp.legA.marketQuestion?.toLowerCase().includes(q) ||
+            opp.legB.marketQuestion?.toLowerCase().includes(q) ||
+            opp.legA.platform.toLowerCase().includes(q) ||
+            opp.legB.platform.toLowerCase().includes(q));
+  });
+
+  // ─── Sorted + filtered matched pairs ───────────────────────────────────
+  const pairStatusOrder: Record<string, number> = { approved: 0, pending: 1, paused: 2, rejected: 3 };
+  const sortedPairs = [...marketsSummary.matchedPairs]
+    .filter(p => pairStatusFilter === 'all' || p.status === pairStatusFilter)
+    .filter(p => {
+      if (!pairSearch) return true;
+      const q = pairSearch.toLowerCase();
+      return (p.marketA.question.toLowerCase().includes(q) ||
+              p.marketB.question.toLowerCase().includes(q) ||
+              p.matchMethod.toLowerCase().includes(q));
+    })
+    .sort((a, b) => (pairStatusOrder[a.status] ?? 99) - (pairStatusOrder[b.status] ?? 99));
+
+  // Group pairs by status for section headers
+  const pairGroups: { status: string; pairs: MatchedPair[] }[] = [];
+  let lastStatus = '';
+  for (const p of sortedPairs) {
+    if (p.status !== lastStatus) {
+      pairGroups.push({ status: p.status, pairs: [] });
+      lastStatus = p.status;
+    }
+    pairGroups[pairGroups.length - 1].pairs.push(p);
+  }
+
   // Build filtered market list for Markets tab
   const getFilteredMarkets = () => {
     const allMarkets: (MarketItem & { platform: string })[] = [];
@@ -351,6 +443,10 @@ export default function DashboardPage() {
         if (platformFilter !== 'all' && platform !== platformFilter) continue;
         if (marketFilter === 'matched' && !m.matched) continue;
         if (marketFilter === 'unmatched' && m.matched) continue;
+        if (marketSearch) {
+          const q = marketSearch.toLowerCase();
+          if (!m.question.toLowerCase().includes(q) && !platform.toLowerCase().includes(q) && !(m.category || '').toLowerCase().includes(q)) continue;
+        }
         allMarkets.push({ ...m, platform });
       }
     }
@@ -382,6 +478,7 @@ export default function DashboardPage() {
             <button className="btn btn-success" onClick={() => sendCommand('resume')}>▶ RESUME</button>
           ) : null}
           <button className="btn btn-danger" onClick={() => sendCommand('stop')}>■ STOP</button>
+          <button className="btn btn-reset" onClick={() => setShowResetConfirm(true)}>⟳ RESET</button>
         </div>
       </div>
 
@@ -437,6 +534,9 @@ export default function DashboardPage() {
             <button className={`tab-btn ${activeTab === 'trades' ? 'tab-active' : ''}`} onClick={() => setActiveTab('trades')}>
               TRADES ({metrics.totalTrades})
             </button>
+            <button className={`tab-btn ${activeTab === 'positions' ? 'tab-active' : ''}`} onClick={() => setActiveTab('positions')}>
+              POSITIONS ({positions.length})
+            </button>
           </div>
 
           {/* Tab content */}
@@ -444,9 +544,21 @@ export default function DashboardPage() {
             {/* ─── OPPORTUNITIES TAB ─── */}
             {activeTab === 'opportunities' && (
               <>
-                {opportunities.length === 0 ? (
-                  <div className="empty-state">Scanning for opportunities...</div>
-                ) : opportunities.map(opp => (
+                <div className="search-bar-wrap">
+                  <input
+                    type="text"
+                    className="search-input"
+                    placeholder="Search opportunities..."
+                    value={oppSearch}
+                    onChange={e => setOppSearch(e.target.value)}
+                  />
+                  {oppSearch && <button className="search-clear" onClick={() => setOppSearch('')}>✕</button>}
+                </div>
+                {filteredOpps.length === 0 ? (
+                  <div className="empty-state">{opportunities.length === 0 ? 'Scanning for opportunities...' : 'No matches'}</div>
+                ) : filteredOpps.map(opp => {
+                  const oppSt = getOppStatus(opp);
+                  return (
                   <div className="opp-card clickable" key={opp.id} onClick={() => navigateToPairFromOpp(opp)}>
                     <div className="opp-card-header">
                       <span className="row-time">{formatTime(opp.discoveredAt)}</span>
@@ -456,10 +568,11 @@ export default function DashboardPage() {
                       <span className="opp-bps">{opp.expectedProfitBps?.toFixed(0) || '—'} bps</span>
                       {opp.maxSize != null && <span className="opp-size">sz {opp.maxSize.toFixed(0)}</span>}
                       <span className="row-confidence" title="Match confidence">{formatPct(opp.matchConfidence * 100)}</span>
-                      <span className={`row-status ${opp.executed ? 'status-executed' : 'status-pending-trade'}`}>
-                        {opp.executed ? 'EXEC' : 'OPEN'}
-                      </span>
+                      <span className={`row-status ${oppSt.cls}`}>{oppSt.label}</span>
                     </div>
+                    {opp.failReason && (
+                      <div className="opp-fail-reason">{opp.failReason}</div>
+                    )}
                     <div className="opp-card-legs">
                       <div className="opp-leg">
                         <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
@@ -480,7 +593,8 @@ export default function DashboardPage() {
                       </div>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </>
             )}
 
@@ -512,85 +626,113 @@ export default function DashboardPage() {
                     <button className={`filter-btn ${pairStatusFilter === 'paused' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('paused')}>PAUSED</button>
                     <button className={`filter-btn ${pairStatusFilter === 'rejected' ? 'filter-active' : ''}`} onClick={() => setPairStatusFilter('rejected')}>REJECTED</button>
                   </div>
-                  <div className="filter-group" style={{ marginLeft: 'auto' }}>
-                    <button
-                      className={`filter-btn ${manualMatchMode ? 'manual-match-active' : ''}`}
-                      onClick={() => { setManualMatchMode(!manualMatchMode); setManualMatchA(null); }}
-                    >
-                      {manualMatchMode ? '✕ CANCEL MATCH' : '+ MANUAL MATCH'}
-                    </button>
-                  </div>
                 </div>
-
-                {/* Manual match banner */}
-                {manualMatchMode && (
-                  <div className="manual-match-banner">
-                    {!manualMatchA
-                      ? 'Select the FIRST market from the list below'
-                      : <>
-                          Selected: <span className={`row-platform platform-${manualMatchA.platform}`}>{manualMatchA.platform.slice(0, 5).toUpperCase()}</span>{' '}
-                          <span style={{ color: 'var(--text-primary)' }}>{manualMatchA.question.slice(0, 50)}</span>
-                          {' — now select a market from the OTHER platform'}
-                        </>
-                    }
-                  </div>
-                )}
 
                 {/* Matched pairs section */}
                 {marketFilter !== 'unmatched' && marketsSummary.matchedPairs.length > 0 && (
                   <div className="matched-pairs-section">
                     <div className="section-header">
                       <span className="section-title">MATCHED PAIRS</span>
-                      <span className="panel-tag">{marketsSummary.matchedPairs.filter(p => pairStatusFilter === 'all' || p.status === pairStatusFilter).length}</span>
+                      <span className="panel-tag">{sortedPairs.length}</span>
                     </div>
-                    {marketsSummary.matchedPairs
-                      .filter(p => pairStatusFilter === 'all' || p.status === pairStatusFilter)
-                      .map((pair, i) => (
-                      <div className={`pair-row pair-status-${pair.status} clickable`} key={pair.pairId || i}
-                        onClick={() => navigateToPair(pair)}>
-                        <div className="pair-info">
-                          <div className="pair-markets">
-                            <span className={`row-platform platform-${pair.marketA.platform}`}>
-                              {pair.marketA.platform.slice(0, 5).toUpperCase()}
-                            </span>
-                            <span className="pair-question">{pair.marketA.question.slice(0, 55)}</span>
+                    <div className="search-bar-wrap">
+                      <input
+                        type="text"
+                        className="search-input"
+                        placeholder="Search pairs..."
+                        value={pairSearch}
+                        onChange={e => setPairSearch(e.target.value)}
+                      />
+                      {pairSearch && <button className="search-clear" onClick={() => setPairSearch('')}>✕</button>}
+                    </div>
+                    {sortedPairs.length === 0 ? (
+                      <div className="empty-state">No pairs match filters</div>
+                    ) : pairGroups.map(group => (
+                      <div key={group.status}>
+                        <div className="pair-group-header">
+                          <span className={`pair-group-label status-${group.status}`}>{group.status.toUpperCase()}</span>
+                          <span className="pair-group-count">{group.pairs.length}</span>
+                        </div>
+                        {group.pairs.map((pair, i) => (
+                          <div className={`pair-row pair-status-${pair.status} clickable`} key={pair.pairId || i}
+                            onClick={() => navigateToPair(pair)}>
+                            <div className="pair-info">
+                              <div className="pair-markets">
+                                <span className={`row-platform platform-${pair.marketA.platform}`}>
+                                  {pair.marketA.platform.slice(0, 5).toUpperCase()}
+                                </span>
+                                <span className="pair-question">{pair.marketA.question.slice(0, 55)}</span>
+                              </div>
+                              <div className="pair-separator">⟷</div>
+                              <div className="pair-markets">
+                                <span className={`row-platform platform-${pair.marketB.platform}`}>
+                                  {pair.marketB.platform.slice(0, 5).toUpperCase()}
+                                </span>
+                                <span className="pair-question">{pair.marketB.question.slice(0, 55)}</span>
+                              </div>
+                            </div>
+                            <div className="pair-meta">
+                              <span className="pair-confidence">{formatPct(pair.confidence * 100)}</span>
+                              <span className={`pair-method method-${pair.matchMethod}`}>{pair.matchMethod.replace('_', ' ')}</span>
+                              <span className={`pair-status-badge status-${pair.status ?? 'pending'}`}>{(pair.status ?? 'pending').toUpperCase()}</span>
+                            </div>
+                            {pair.llmReasoning && (
+                              <div className="pair-reasoning">{pair.llmReasoning}</div>
+                            )}
+                            <div className="pair-actions" onClick={e => e.stopPropagation()}>
+                              {pair.status !== 'approved' && (
+                                <button className="pair-btn pair-btn-approve" onClick={() => updatePairStatus(pair.pairId, 'approved')}>APPROVE</button>
+                              )}
+                              {pair.status !== 'paused' && pair.status !== 'rejected' && (
+                                <button className="pair-btn pair-btn-pause" onClick={() => updatePairStatus(pair.pairId, 'paused')}>PAUSE</button>
+                              )}
+                              {pair.status !== 'rejected' && (
+                                <button className="pair-btn pair-btn-reject" onClick={() => updatePairStatus(pair.pairId, 'rejected')}>REJECT</button>
+                              )}
+                            </div>
                           </div>
-                          <div className="pair-separator">⟷</div>
-                          <div className="pair-markets">
-                            <span className={`row-platform platform-${pair.marketB.platform}`}>
-                              {pair.marketB.platform.slice(0, 5).toUpperCase()}
-                            </span>
-                            <span className="pair-question">{pair.marketB.question.slice(0, 55)}</span>
-                          </div>
-                        </div>
-                        <div className="pair-meta">
-                          <span className="pair-confidence">{formatPct(pair.confidence * 100)}</span>
-                          <span className={`pair-method method-${pair.matchMethod}`}>{pair.matchMethod.replace('_', ' ')}</span>
-                          <span className={`pair-status-badge status-${pair.status ?? 'pending'}`}>{(pair.status ?? 'pending').toUpperCase()}</span>
-                        </div>
-                        {pair.llmReasoning && (
-                          <div className="pair-reasoning">{pair.llmReasoning}</div>
-                        )}
-                        <div className="pair-actions" onClick={e => e.stopPropagation()}>
-                          {pair.status !== 'approved' && (
-                            <button className="pair-btn pair-btn-approve" onClick={() => updatePairStatus(pair.pairId, 'approved')}>APPROVE</button>
-                          )}
-                          {pair.status !== 'paused' && pair.status !== 'rejected' && (
-                            <button className="pair-btn pair-btn-pause" onClick={() => updatePairStatus(pair.pairId, 'paused')}>PAUSE</button>
-                          )}
-                          {pair.status !== 'rejected' && (
-                            <button className="pair-btn pair-btn-reject" onClick={() => updatePairStatus(pair.pairId, 'rejected')}>REJECT</button>
-                          )}
-                        </div>
+                        ))}
                       </div>
                     ))}
                   </div>
                 )}
 
+                {/* Manual match section */}
+                <div className="manual-match-section">
+                  <button
+                    className={`filter-btn ${manualMatchMode ? 'manual-match-active' : ''}`}
+                    onClick={() => { setManualMatchMode(!manualMatchMode); setManualMatchA(null); }}
+                  >
+                    {manualMatchMode ? '✕ CANCEL MATCH' : '+ MANUAL MATCH'}
+                  </button>
+                  {manualMatchMode && (
+                    <div className="manual-match-banner">
+                      {!manualMatchA
+                        ? 'Select the FIRST market from the list below'
+                        : <>
+                            Selected: <span className={`row-platform platform-${manualMatchA.platform}`}>{manualMatchA.platform.slice(0, 5).toUpperCase()}</span>{' '}
+                            <span style={{ color: 'var(--text-primary)' }}>{manualMatchA.question.slice(0, 50)}</span>
+                            {' — now select a market from the OTHER platform'}
+                          </>
+                      }
+                    </div>
+                  )}
+                </div>
+
                 {/* All markets list */}
                 <div className="section-header" style={{ marginTop: 8 }}>
                   <span className="section-title">ALL MARKETS</span>
                   <span className="panel-tag">{getFilteredMarkets().length}</span>
+                </div>
+                <div className="search-bar-wrap">
+                  <input
+                    type="text"
+                    className="search-input"
+                    placeholder="Search markets..."
+                    value={marketSearch}
+                    onChange={e => setMarketSearch(e.target.value)}
+                  />
+                  {marketSearch && <button className="search-clear" onClick={() => setMarketSearch('')}>✕</button>}
                 </div>
                 {getFilteredMarkets().length === 0 ? (
                   <div className="empty-state">No markets loaded yet</div>
@@ -650,6 +792,34 @@ export default function DashboardPage() {
                     </span>
                     {t.notes && <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>{t.notes}</span>}
                   </div>
+                ))}
+              </>
+            )}
+
+            {/* ─── POSITIONS TAB ─── */}
+            {activeTab === 'positions' && (
+              <>
+                {positions.length === 0 ? (
+                  <div className="empty-state">No open positions</div>
+                ) : positions.map((pos, i) => (
+                  <a
+                    className="position-row clickable"
+                    key={`${pos.platform}-${pos.marketId}-${i}`}
+                    href={getPlatformMarketUrl(pos.platform, pos.marketId)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <span className={`row-platform platform-${pos.platform}`}>{pos.platform.slice(0, 5).toUpperCase()}</span>
+                    <span className={`row-outcome ${pos.side === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>{pos.side}</span>
+                    <span className="pos-size">{pos.size.toFixed(1)} shares</span>
+                    <span className="pos-entry">@ {pos.avgEntryPrice.toFixed(3)}</span>
+                    <span className="pos-current">now {pos.currentPrice.toFixed(3)}</span>
+                    <span className={`row-profit ${pnlClass(pos.unrealizedPnl)}`}>
+                      {formatUsd(pos.unrealizedPnl)}
+                    </span>
+                    <span className="pos-question">{pos.marketQuestion?.slice(0, 45) || pos.marketId}</span>
+                    <span className="pos-link-icon">↗</span>
+                  </a>
                 ))}
               </>
             )}
@@ -735,6 +905,30 @@ export default function DashboardPage() {
           selection={bookSelection}
           onClose={() => setBookSelection(null)}
         />
+      )}
+
+      {/* ─── RESET CONFIRMATION MODAL ────────────────────────── */}
+      {showResetConfirm && (
+        <div className="reset-overlay" onClick={() => setShowResetConfirm(false)}>
+          <div className="reset-modal" onClick={e => e.stopPropagation()}>
+            <div className="reset-modal-title">RESET ALL DATA</div>
+            <div className="reset-modal-body">
+              This will permanently delete all data including:
+              <ul className="reset-list">
+                <li>All matched market pairs</li>
+                <li>All trade history</li>
+                <li>All discovered opportunities</li>
+                <li>All position tracking</li>
+                <li>Bot state and configuration overrides</li>
+              </ul>
+              <div className="reset-warning">This action cannot be undone.</div>
+            </div>
+            <div className="reset-modal-actions">
+              <button className="btn" onClick={() => setShowResetConfirm(false)}>CANCEL</button>
+              <button className="btn btn-danger" onClick={handleReset}>CONFIRM RESET</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

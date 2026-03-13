@@ -15,7 +15,7 @@ import {
 import { MarketConnector } from '../types/connector';
 import { Strategy } from '../types/strategy';
 import { RiskManager } from './risk-manager';
-import { insertOpportunity, insertTrade, updateTradeStatus, markOpportunityExecuted } from '../db/database';
+import { insertOpportunity, insertTrade, updateTradeStatus, markOpportunityExecuted, updateOpportunityStatus } from '../db/database';
 import { createChildLogger } from '../utils/logger';
 import { eventBus } from '../utils/event-bus';
 
@@ -118,6 +118,7 @@ export class ExecutionEngine {
           id: opp.id.slice(0, 8),
           error: (err as Error).message,
         });
+        updateOpportunityStatus(opp.id, 'failed', (err as Error).message);
       }
     }
 
@@ -133,17 +134,20 @@ export class ExecutionEngine {
       const stillValid = await strategy.validate(opp);
       if (!stillValid) {
         log.info('Opportunity no longer valid after re-check', { id: opp.id.slice(0, 8) });
+        updateOpportunityStatus(opp.id, 'expired', 'No longer profitable at current prices');
         return;
       }
     }
 
     // Step 2: Risk check
+    updateOpportunityStatus(opp.id, 'executing');
     const riskResult = await this.riskManager.checkOpportunity(opp);
     if (!riskResult.approved) {
       log.info('Opportunity rejected by risk manager', {
         id: opp.id.slice(0, 8),
         reason: riskResult.reason,
       });
+      updateOpportunityStatus(opp.id, 'rejected', riskResult.reason || 'Risk check failed');
       return;
     }
 
@@ -212,6 +216,7 @@ export class ExecutionEngine {
     const connB = this.connectors.get(opp.legB.platform);
     if (!connA || !connB) {
       updateTradeStatus(trade.id, 'FAILED', { notes: 'Missing connector' });
+      updateOpportunityStatus(opp.id, 'failed', 'Missing platform connector');
       return;
     }
 
@@ -251,6 +256,7 @@ export class ExecutionEngine {
       updateTradeStatus(trade.id, 'FAILED', {
         notes: `Leg A failed to place: ${(err as Error).message}`,
       });
+      updateOpportunityStatus(opp.id, 'failed', `Leg A failed: ${(err as Error).message}`);
       eventBus.emit('trade:failed', { tradeId: trade.id, error: (err as Error).message });
       log.error('Leg A placement failed — no exposure, aborting', {
         error: (err as Error).message,
@@ -263,6 +269,7 @@ export class ExecutionEngine {
       updateTradeStatus(trade.id, 'FAILED', {
         notes: `Leg A immediately rejected: ${resultA.status}`,
       });
+      updateOpportunityStatus(opp.id, 'failed', `Leg A rejected: ${resultA.status}`);
       eventBus.emit('trade:failed', { tradeId: trade.id, error: `Leg A rejected: ${resultA.status}` });
       return;
     }
@@ -416,6 +423,7 @@ export class ExecutionEngine {
       updateTradeStatus(trade.id, 'FAILED', {
         notes: `Neither leg filled. A: ${finalA.status}, B: ${finalB.status}`,
       });
+      updateOpportunityStatus(opp.id, 'failed', `Neither leg filled. A: ${finalA.status}, B: ${finalB.status}`);
       eventBus.emit('trade:failed', { tradeId: trade.id, error: 'Neither leg filled' });
     }
   }
@@ -485,6 +493,7 @@ export class ExecutionEngine {
       updateTradeStatus(ctx.tradeId, 'FAILED', {
         notes: `CRITICAL: Recovery failed. Unhedged position on ${ctx.filledPlatform}. Manual intervention required. Error: ${(err as Error).message}`,
       });
+      updateOpportunityStatus(ctx.opportunity.id, 'failed', `Recovery failed: ${(err as Error).message}`);
 
       eventBus.emit('trade:failed', {
         tradeId: ctx.tradeId,
@@ -733,6 +742,7 @@ export class ExecutionEngine {
     updateTradeStatus(ctx.tradeId, 'FAILED', {
       notes: `UNHEDGED POSITION — ${reason}. Platform: ${ctx.filledPlatform}, Value: $${filledValue.toFixed(2)}, Order: ${ctx.filledLeg.id}. REQUIRES MANUAL REVIEW.`,
     });
+    updateOpportunityStatus(ctx.opportunity.id, 'failed', `Unhedged: ${reason}`);
 
     eventBus.emit('trade:failed', {
       tradeId: ctx.tradeId,
