@@ -32,6 +32,8 @@ export const config = {
   predictfun: {
     apiKey: process.env.PREDICTFUN_API_KEY || '',
     privateKey: process.env.PREDICTFUN_PRIVATE_KEY || '',
+    // Smart Wallet address — serves as both predictAccount (for SDK signing) and deposit address (for balance)
+    smartWallet: process.env.PREDICTFUN_SMART_WALLET || '',
     apiUrl: 'https://api.predict.fun',
     testnetUrl: 'https://api-testnet.predict.fun',
     // WebSocket lives on a separate subdomain from the REST API.

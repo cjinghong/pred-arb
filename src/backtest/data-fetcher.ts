@@ -173,7 +173,7 @@ export class BacktestDataFetcher {
   private async fetchPredictFunMarkets(limit: number): Promise<NormalizedMarket[]> {
     const params = new URLSearchParams({
       first: String(limit),
-      tradingStatus: 'OPEN',
+      status: 'OPEN',
       sort: 'VOLUME_TOTAL_DESC',
     });
 

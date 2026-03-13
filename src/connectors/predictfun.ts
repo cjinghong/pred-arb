@@ -189,7 +189,7 @@ export class PredictFunConnector extends BaseConnector {
   async connect(): Promise<void> {
     try {
       // Test REST connectivity — pass auth headers so mainnet doesn't 401
-      await this.httpGet(`${this.apiUrl}/v1/markets?first=1&tradingStatus=OPEN`, this.getAuthHeaders());
+      await this.httpGet(`${this.apiUrl}/v1/markets?first=1&status=OPEN`, this.getAuthHeaders());
       this._isConnected = true;
       this.emit('connected');
       this.log.info('Connected to predict.fun REST API', { url: this.apiUrl });
@@ -218,7 +218,7 @@ export class PredictFunConnector extends BaseConnector {
 
   /** Initialize the predict.fun OrderBuilder for EIP-712 signing */
   private async initTradingClient(): Promise<void> {
-    const { privateKey } = config.predictfun;
+    const { privateKey, smartWallet } = config.predictfun;
 
     if (!privateKey) {
       this.log.warn('PREDICTFUN_PRIVATE_KEY not set — trading disabled');
@@ -226,14 +226,21 @@ export class PredictFunConnector extends BaseConnector {
     }
 
     try {
-      this.wallet = new Wallet(privateKey);
+      // Ensure private key has 0x prefix (ethers v6 requires it)
+      const formattedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+      this.wallet = new Wallet(formattedKey);
       this.walletAddress = this.wallet.address;
 
       const chainId = config.predictfun.useTestnet ? ChainId.BnbTestnet : ChainId.BnbMainnet;
-      this.orderBuilder = await OrderBuilder.make(chainId, this.wallet);
+
+      // If smartWallet (Predict Account / Smart Wallet) is configured,
+      // pass it so the SDK uses the Smart Wallet for orders and balances
+      const options = smartWallet ? { predictAccount: smartWallet } : undefined;
+      this.orderBuilder = await OrderBuilder.make(chainId, this.wallet, options);
 
       this.log.info('predict.fun OrderBuilder initialized', {
         address: this.walletAddress,
+        smartWallet: smartWallet || 'none (using EOA)',
         chainId,
       });
     } catch (err) {
@@ -261,32 +268,50 @@ export class PredictFunConnector extends BaseConnector {
       return;
     }
 
+    // When using a Smart Wallet (Predict Account), we must authenticate as the
+    // Smart Wallet address (not the Privy wallet). The signature is wrapped via
+    // the SDK's signPredictAccountMessage() to include the ECDSA validator.
+    const { smartWallet } = config.predictfun;
+    const authAddress = smartWallet || this.walletAddress;
+
     try {
       // Step 1: Get auth message
-      const { message } = await this.httpGet<PredictFunAuthMessage>(
+      const authMsgResponse = await this.httpGet<any>(
         `${this.apiUrl}/v1/auth/message`,
         this.getAuthHeaders(),
       );
 
-      this.log.info('Auth message received, signing...');
+      const message = authMsgResponse?.message || authMsgResponse?.data?.message;
+      if (!message) {
+        throw new Error(`Unexpected auth message response: ${JSON.stringify(authMsgResponse)}`);
+      }
 
-      // Step 2: Sign message with private key
-      const signature = await this.wallet.signMessage(message);
+      this.log.info('Auth message received, signing...', { authAddress });
+
+      // Step 2: Sign message
+      let signature: string;
+      if (smartWallet && this.orderBuilder) {
+        // Use SDK to create a Smart Wallet signature (wraps with ECDSA validator)
+        signature = await this.orderBuilder.signPredictAccountMessage(message);
+      } else {
+        // Direct EOA signature
+        signature = await this.wallet.signMessage(message);
+      }
 
       // Step 3: Exchange for JWT
-      const authResponse = await this.httpPost<{ token: string }>(
+      const authResponse = await this.httpPost<any>(
         `${this.apiUrl}/v1/auth`,
         {
-          signer: this.walletAddress,
+          signer: authAddress,
           signature,
           message,
         },
         this.getAuthHeaders(),
       );
 
-      this.jwtToken = authResponse.token;
+      this.jwtToken = authResponse?.token || authResponse?.data?.token;
       this.log.info('predict.fun JWT authentication successful', {
-        address: this.walletAddress,
+        address: authAddress,
       });
     } catch (err) {
       this.log.error('predict.fun authentication failed — trading may be limited', {
@@ -321,12 +346,10 @@ export class PredictFunConnector extends BaseConnector {
     params.set('first', String(options?.limit ?? 100));
     if (options?.offset) params.set('after', String(options.offset));
 
-    // ─── Server-side filters (per https://dev.predict.fun docs) ─────────
-    // NB: the query parameter is `tradingStatus`, not `status`.
-    // `status` is the market lifecycle field (REGISTERED/RESOLVED/etc.);
-    // `tradingStatus` controls whether the order book is open (OPEN/CANCEL_ONLY/CLOSED).
+    // ─── Server-side filters ────────────────────────────────────────────
+    // Query parameter is `status` (not `tradingStatus`).
     if (options?.activeOnly !== false) {
-      params.set('tradingStatus', 'OPEN');
+      params.set('status', 'OPEN');
     }
 
     // predict.fun supports sort: VOLUME_TOTAL_DESC, VOLUME_24H_DESC, etc.
@@ -340,10 +363,8 @@ export class PredictFunConnector extends BaseConnector {
       if (sortValue) params.set('sort', sortValue);
     }
 
-    const response = await this.httpGet<PredictFunMarketsResponse>(
-      `${this.apiUrl}/v1/markets?${params.toString()}`,
-      this.getAuthHeaders(),
-    );
+    const url = `${this.apiUrl}/v1/markets?${params.toString()}`;
+    const response = await this.httpGet<PredictFunMarketsResponse>(url, this.getAuthHeaders());
 
     const markets = response.data || [];
 
@@ -368,7 +389,9 @@ export class PredictFunConnector extends BaseConnector {
         this.getAuthHeaders(),
       );
       const raw = response.data ?? response as unknown as PredictFunRawMarket;
-      return this.normalizeMarket(raw);
+      const normalized = this.normalizeMarket(raw);
+      this.marketCache.set(normalized.id, normalized);
+      return normalized;
     } catch {
       return null;
     }
@@ -468,15 +491,19 @@ export class PredictFunConnector extends BaseConnector {
     const ob = this.ensureOrderBuilder();
     await this.ensureAuthenticated();
 
-    const market = this.marketCache.get(order.marketId);
-    if (!market) throw new Error(`Market ${order.marketId} not in cache`);
+    let market = this.marketCache.get(order.marketId);
+    if (!market) {
+      // Auto-fetch market if not in cache
+      market = await this.fetchMarket(order.marketId) ?? undefined;
+      if (!market) throw new Error(`Market ${order.marketId} not found`);
+    }
 
     const rawMarket = market.raw as PredictFunRawMarket;
     const tokenId = market.outcomeTokenIds[order.outcomeIndex];
     if (!tokenId) throw new Error(`No token for outcome index ${order.outcomeIndex}`);
 
     const side = order.side === 'BUY' ? PredictSide.BUY : PredictSide.SELL;
-    const precision = BigInt(10) ** BigInt(18);  // predict.fun uses 18 decimals
+    // predict.fun uses 18 decimals for all wei values
     const priceWei = BigInt(Math.round(order.price * 1e18));
     const quantityWei = BigInt(Math.round(order.size * 1e18));
 
@@ -486,6 +513,8 @@ export class PredictFunConnector extends BaseConnector {
       side: order.side,
       price: order.price,
       size: order.size,
+      priceWei: priceWei.toString(),
+      quantityWei: quantityWei.toString(),
       isNegRisk: rawMarket.isNegRisk,
     });
 
@@ -515,14 +544,15 @@ export class PredictFunConnector extends BaseConnector {
       const orderHash = ob.buildTypedDataHash(typedData);
 
       // Submit to predict.fun API
+      // pricePerShare must be an integer string in wei (e.g., "10000000000000000" for $0.01)
       const strategy = order.type === 'MARKET' ? 'MARKET' : 'LIMIT';
       const response = await this.httpPost<any>(
         `${this.apiUrl}/v1/orders`,
         {
           data: {
-            pricePerShare: order.price.toString(),
+            pricePerShare: priceWei.toString(),
             strategy,
-            isFillOrKill: order.type === 'MARKET',
+            ...(order.type === 'MARKET' ? { isFillOrKill: true } : {}),
             order: {
               ...signedOrder,
               hash: orderHash,
@@ -532,12 +562,15 @@ export class PredictFunConnector extends BaseConnector {
         this.getAuthHeaders(),
       );
 
-      const orderId = response?.hash || orderHash || `pfun_${Date.now()}`;
+      // Response: { success: true, data: { code: "OK", orderId: "...", orderHash: "..." } }
+      const respData = response?.data || response;
+      const orderId = respData?.orderId || respData?.orderHash || orderHash || `pfun_${Date.now()}`;
       const fees = PredictFunConnector.calculateTakerFee(order.price, order.size);
 
       this.log.info('Order placed on predict.fun', {
         orderId,
-        status: response?.status,
+        orderHash: respData?.orderHash,
+        code: respData?.code,
         raw: response,
       });
 
@@ -606,28 +639,44 @@ export class PredictFunConnector extends BaseConnector {
     await this.ensureAuthenticated();
 
     try {
+      // GET /v1/orders returns { success, cursor, data: [{ id, marketId, order, status, amount, amountFilled, ... }] }
       const response = await this.httpGet<any>(
-        `${this.apiUrl}/v1/orders`,
+        `${this.apiUrl}/v1/orders?status=OPEN`,
         this.getAuthHeaders(),
       );
 
-      const orders = response?.data || response?.edges?.map((e: any) => e.node) || [];
-      return orders.map((o: any) => ({
-        id: o.hash || o.id || '',
-        platform: 'predictfun' as Platform,
-        marketId: o.marketId || '',
-        outcomeIndex: 0,
-        side: o.side === 0 || o.side === 'BUY' ? 'BUY' as const : 'SELL' as const,
-        type: 'LIMIT' as const,
-        price: parseFloat(o.pricePerShare || o.price || '0'),
-        size: parseFloat(o.originalSize || o.size || '0') / 1e18,
-        filledSize: parseFloat(o.matchedSize || '0') / 1e18,
-        avgFillPrice: 0,
-        status: this.mapPredictFunStatus(o.status),
-        timestamp: new Date(o.createdAt || Date.now()),
-        fees: 0,
-        raw: o,
-      }));
+      const orders = response?.data || [];
+      return orders.map((o: any) => {
+        const orderData = o.order || {};
+        const side = orderData.side === 0 ? 'BUY' as const : 'SELL' as const;
+        // makerAmount and takerAmount are wei strings
+        const makerAmount = Number(BigInt(orderData.makerAmount || '0')) / 1e18;
+        const takerAmount = Number(BigInt(orderData.takerAmount || '0')) / 1e18;
+        // For BUY: price = makerAmount / takerAmount (USDT per share)
+        // For SELL: price = takerAmount / makerAmount
+        const price = side === 'BUY'
+          ? (takerAmount > 0 ? makerAmount / takerAmount : 0)
+          : (makerAmount > 0 ? takerAmount / makerAmount : 0);
+        const amount = Number(BigInt(o.amount || '0')) / 1e18;
+        const amountFilled = Number(BigInt(o.amountFilled || '0')) / 1e18;
+
+        return {
+          id: o.id || orderData.hash || '',
+          platform: 'predictfun' as Platform,
+          marketId: String(o.marketId || ''),
+          outcomeIndex: 0,
+          side,
+          type: (o.strategy || 'LIMIT') as 'LIMIT' | 'MARKET',
+          price,
+          size: amount,
+          filledSize: amountFilled,
+          avgFillPrice: 0,
+          status: this.mapPredictFunStatus(o.status),
+          timestamp: new Date(),
+          fees: 0,
+          raw: o,
+        };
+      });
     } catch (err) {
       this.log.error('Failed to get open orders', { error: (err as Error).message });
       return [];
@@ -662,27 +711,28 @@ export class PredictFunConnector extends BaseConnector {
   }
 
   async getBalance(): Promise<number> {
-    // Option 1: Use SDK if available
-    if (this.orderBuilder) {
-      try {
-        const balanceWei = await this.orderBuilder.balanceOf('USDT');
-        const balance = Number(balanceWei) / 1e18;
-        this.log.debug('predict.fun balance fetched via SDK', { balance });
-        return balance;
-      } catch (err) {
-        this.log.warn('SDK balance fetch failed, trying API', { error: (err as Error).message });
-      }
-    }
-
-    // Option 2: Try API endpoint
-    await this.ensureAuthenticated();
     try {
-      const response = await this.httpGet<any>(
-        `${this.apiUrl}/v1/account/balance`,
-        this.getAuthHeaders(),
-      );
-      const balance = parseFloat(response?.balance || response?.data?.balance || '0');
-      this.log.debug('predict.fun balance fetched via API', { balance });
+      const { JsonRpcProvider, Contract } = await import('ethers');
+      const provider = new JsonRpcProvider('https://bsc-dataseed.bnbchain.org/');
+      const USDT_ADDRESS = '0x55d398326f99059fF775485246999027B3197955';
+      const usdt = new Contract(USDT_ADDRESS, [
+        'function balanceOf(address) view returns (uint256)',
+      ], provider);
+
+      // Check balance of the Smart Wallet if configured,
+      // otherwise fall back to the signer wallet address
+      const { smartWallet } = config.predictfun;
+      const balanceAddress = smartWallet || this.walletAddress || this.wallet?.address;
+
+      if (!balanceAddress) {
+        this.log.warn('predict.fun: no address available for balance check');
+        return 0;
+      }
+
+      const balanceWei = await usdt.balanceOf(balanceAddress);
+      // USDT on BNB has 18 decimals
+      const balance = Number(balanceWei) / 1e18;
+      this.log.debug('predict.fun balance fetched', { balance, address: balanceAddress });
       return balance;
     } catch (err) {
       this.log.error('Failed to get predict.fun balance', { error: (err as Error).message });

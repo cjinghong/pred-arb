@@ -228,7 +228,9 @@ export class PolymarketConnector extends BaseConnector {
     }
 
     try {
-      const wallet = new Wallet(privateKey);
+      // Ensure private key has 0x prefix (ethers v6 requires it)
+      const formattedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+      const wallet = new Wallet(formattedKey);
       this.walletAddress = wallet.address;
       const signer = walletToClobSigner(wallet);
 
