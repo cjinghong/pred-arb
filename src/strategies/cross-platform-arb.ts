@@ -18,6 +18,7 @@ import {
   ArbitrageOpportunity,
   NormalizedMarket,
   OrderBook,
+  PriceLevel,
   ArbLeg,
 } from '../types';
 import { MarketConnector } from '../types/connector';
@@ -83,6 +84,45 @@ export class CrossPlatformArbStrategy implements Strategy {
       maxBookAgeMs: 5000,
     },
   };
+
+  /**
+   * Dynamic profit threshold: adjusts minProfitBps based on execution risk.
+   * Higher risk factors → higher required profit to compensate.
+   *
+   * Risk factors:
+   * - Match confidence: lower confidence → higher threshold (risk of wrong match)
+   * - Book spread: wider spread → higher threshold (harder to fill at expected price)
+   * - Cross-platform execution: always adds base premium for timing risk
+   * - Size relative to depth: larger % of book → higher threshold (slippage risk)
+   */
+  private getDynamicMinProfitBps(
+    matchConfidence: number,
+    spreadA: number | null,
+    spreadB: number | null,
+    size: number,
+    depthA: number,
+    depthB: number,
+  ): number {
+    const base = this.config.minProfitBps;
+
+    // 1. Match confidence penalty: 0 at 1.0, up to +25bps at 0.6
+    const confidencePenalty = Math.max(0, (1 - matchConfidence) * 62.5);
+
+    // 2. Spread penalty: wider spreads = harder to fill at expected price
+    // Only penalize unusually wide spreads (>3% combined)
+    const totalSpread = (spreadA ?? 0.01) + (spreadB ?? 0.01);
+    const spreadPenalty = totalSpread > 0.03 ? (totalSpread - 0.03) * 1000 : 0;
+
+    // 3. Size-to-depth penalty: if taking >70% of available depth, add buffer
+    const minDepth = Math.min(depthA || Infinity, depthB || Infinity);
+    const sizeRatio = minDepth > 0 ? size / minDepth : 1;
+    const depthPenalty = sizeRatio > 0.7 ? (sizeRatio - 0.7) * 50 : 0;
+
+    const adjusted = base + confidencePenalty + spreadPenalty + depthPenalty;
+
+    // Cap at 2x the base to avoid being overly conservative
+    return Math.min(adjusted, base * 2);
+  }
 
   get state(): StrategyState {
     return this._state;
@@ -317,6 +357,104 @@ export class CrossPlatformArbStrategy implements Strategy {
     }
     // Polymarket has no fees
     return 0;
+  }
+
+  // ─── Book Walking ─────────────────────────────────────────────────────
+
+  /**
+   * Walk through multiple price levels on both order books to find the
+   * maximum profitable size. Instead of only looking at top-of-book,
+   * we accumulate size across levels until the marginal cost exceeds $1
+   * (minus fees and profit threshold).
+   *
+   * Returns the optimal { size, avgPriceA, avgPriceB, profitBps }.
+   */
+  private walkBooksForOptimalSize(
+    platformA: Platform,
+    platformB: Platform,
+    levelsA: PriceLevel[],  // asks for the "buy" side
+    levelsB: PriceLevel[],  // asks or inverted bids for the "buy" side
+    minProfitBps: number,
+    maxPositionUsd: number,
+  ): { size: number; avgPriceA: number; avgPriceB: number; profitPerShare: number; profitBps: number } | null {
+    if (levelsA.length === 0 || levelsB.length === 0) return null;
+
+    let idxA = 0, idxB = 0;
+    let remainA = levelsA[0].size, remainB = levelsB[0].size;
+    let totalSize = 0;
+    let totalCostA = 0, totalCostB = 0;
+    let totalFees = 0;
+
+    while (idxA < levelsA.length && idxB < levelsB.length) {
+      const priceA = levelsA[idxA].price;
+      const priceB = levelsB[idxB].price;
+
+      // Fee per share at these price levels
+      const feePerShare = this.estimateFees(platformA, priceA, 1)
+                         + this.estimateFees(platformB, priceB, 1);
+
+      // Check if this level is still profitable
+      const totalCostPerShare = priceA + priceB;
+      const profitPerShare = 1 - totalCostPerShare - feePerShare;
+      const profitBps = totalCostPerShare > 0 ? (profitPerShare / totalCostPerShare) * 10000 : 0;
+
+      if (profitBps < minProfitBps) break; // Stop walking — no longer profitable
+
+      // Take the minimum available at this price level
+      const chunk = Math.min(remainA, remainB);
+
+      // Check position size limit
+      const chunkCost = (priceA + priceB) * chunk;
+      const totalCostSoFar = (totalCostA + totalCostB);
+      if (totalCostSoFar + chunkCost > maxPositionUsd) {
+        // Partial fill to hit the limit
+        const remainingBudget = maxPositionUsd - totalCostSoFar;
+        const partialChunk = remainingBudget / (priceA + priceB);
+        if (partialChunk > 0) {
+          totalSize += partialChunk;
+          totalCostA += priceA * partialChunk;
+          totalCostB += priceB * partialChunk;
+          totalFees += feePerShare * partialChunk;
+        }
+        break;
+      }
+
+      totalSize += chunk;
+      totalCostA += priceA * chunk;
+      totalCostB += priceB * chunk;
+      totalFees += feePerShare * chunk;
+
+      remainA -= chunk;
+      remainB -= chunk;
+
+      // Advance to next level if exhausted
+      if (remainA <= 0) {
+        idxA++;
+        if (idxA < levelsA.length) remainA = levelsA[idxA].size;
+      }
+      if (remainB <= 0) {
+        idxB++;
+        if (idxB < levelsB.length) remainB = levelsB[idxB].size;
+      }
+    }
+
+    if (totalSize <= 0) return null;
+
+    const avgPriceA = totalCostA / totalSize;
+    const avgPriceB = totalCostB / totalSize;
+    const netProfit = totalSize - totalCostA - totalCostB - totalFees;
+    const avgProfitPerShare = netProfit / totalSize;
+    const avgProfitBps = (totalCostA + totalCostB) > 0
+      ? (avgProfitPerShare / ((totalCostA + totalCostB) / totalSize)) * 10000
+      : 0;
+
+    return {
+      size: totalSize,
+      avgPriceA,
+      avgPriceB,
+      profitPerShare: avgProfitPerShare,
+      profitBps: avgProfitBps,
+    };
   }
 
   getMetrics(): StrategyMetrics {
@@ -639,66 +777,97 @@ export class CrossPlatformArbStrategy implements Strategy {
     const minDepthUsd = this.config.params.minDepthUsd as number;
 
     // Direction 1: Buy YES on A, Buy NO on B
+    // To buy NO on B, we use B's YES bids inverted: cost_NO = 1 - bid_price
     if (bookAYes.bestAsk !== null && bookBYes.bestBid !== null) {
-      const costYesA = bookAYes.bestAsk;
-      const costNoB = 1 - bookBYes.bestBid;
-      const totalCost = costYesA + costNoB;
+      // Invert B's bids into "NO ask levels": price = 1 - bid, size = bid size
+      // Sorted lowest price first (like an ask book)
+      const noBLevels: PriceLevel[] = bookBYes.bids.map(b => ({
+        price: 1 - b.price,
+        size: b.size,
+      })).sort((a, b) => a.price - b.price);
 
-      const maxSizeA = bookAYes.asks[0]?.size ?? 0;
-      const maxSizeB = bookBYes.bids[0]?.size ?? 0;
-      const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
+      // Dynamic profit threshold based on execution risk
+      const depthA = bookAYes.asks.reduce((s, l) => s + l.size, 0);
+      const depthB = bookBYes.bids.reduce((s, l) => s + l.size, 0);
+      const dynamicMinBps = this.getDynamicMinProfitBps(
+        pair.confidence, bookAYes.spread, bookBYes.spread,
+        Math.min(depthA, depthB), depthA, depthB,
+      );
 
-      // Estimate fees: predict.fun charges taker fees, Polymarket doesn't
-      const feesPerShare = this.estimateFees(pair.marketA.platform, costYesA, 1)
-                         + this.estimateFees(pair.marketB.platform, costNoB, 1);
-      const profitPerShare = 1 - totalCost - feesPerShare;
-      const profitBps = totalCost > 0 ? (profitPerShare / totalCost) * 10000 : 0;
+      // Walk both books for optimal size
+      const walkResult = this.walkBooksForOptimalSize(
+        pair.marketA.platform,
+        pair.marketB.platform,
+        bookAYes.asks,   // buy YES on A at ask levels
+        noBLevels,        // buy NO on B (inverted bid levels)
+        dynamicMinBps,
+        this.config.maxPositionUsd,
+      );
 
-      if (profitBps >= this.config.minProfitBps) {
-        if (minDepthUsd <= 0 || maxSize * totalCost >= minDepthUsd) {
+      if (walkResult && walkResult.size > 0) {
+        const totalValue = walkResult.size * (walkResult.avgPriceA + walkResult.avgPriceB);
+        if (minDepthUsd <= 0 || totalValue >= minDepthUsd) {
           opportunities.push(this.createOpportunity(
-            pair, 'YES', costYesA, bookAYes, maxSizeA,
-            'NO', costNoB, bookBYes, maxSizeB,
-            profitPerShare * maxSize, profitBps, maxSize,
+            pair,
+            'YES', walkResult.avgPriceA, bookAYes, walkResult.size,
+            'NO', walkResult.avgPriceB, bookBYes, walkResult.size,
+            walkResult.profitPerShare * walkResult.size, walkResult.profitBps, walkResult.size,
           ));
         } else {
           onSkip('below_depth');
         }
       } else {
-        onSkip('below_profit');
+        // Check if it was a book issue or a profit issue
+        const topCost = bookAYes.bestAsk + (1 - bookBYes.bestBid);
+        if (topCost >= 1.0) onSkip('below_profit');
+        else onSkip('below_profit');
       }
     } else {
       onSkip('null_book');
     }
 
     // Direction 2: Buy NO on A, Buy YES on B
+    // To buy NO on A, we use A's YES bids inverted: cost_NO = 1 - bid_price
     if (bookAYes.bestBid !== null && bookBYes.bestAsk !== null) {
-      const costNoA = 1 - bookAYes.bestBid;
-      const costYesB = bookBYes.bestAsk;
-      const totalCost = costNoA + costYesB;
+      // Invert A's bids into "NO ask levels"
+      const noALevels: PriceLevel[] = bookAYes.bids.map(b => ({
+        price: 1 - b.price,
+        size: b.size,
+      })).sort((a, b) => a.price - b.price);
 
-      const maxSizeA = bookAYes.bids[0]?.size ?? 0;
-      const maxSizeB = bookBYes.asks[0]?.size ?? 0;
-      const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
+      // Dynamic profit threshold based on execution risk
+      const depthA2 = bookAYes.bids.reduce((s, l) => s + l.size, 0);
+      const depthB2 = bookBYes.asks.reduce((s, l) => s + l.size, 0);
+      const dynamicMinBps2 = this.getDynamicMinProfitBps(
+        pair.confidence, bookAYes.spread, bookBYes.spread,
+        Math.min(depthA2, depthB2), depthA2, depthB2,
+      );
 
-      // Estimate fees
-      const feesPerShare = this.estimateFees(pair.marketA.platform, costNoA, 1)
-                         + this.estimateFees(pair.marketB.platform, costYesB, 1);
-      const profitPerShare = 1 - totalCost - feesPerShare;
-      const profitBps = totalCost > 0 ? (profitPerShare / totalCost) * 10000 : 0;
+      const walkResult = this.walkBooksForOptimalSize(
+        pair.marketA.platform,
+        pair.marketB.platform,
+        noALevels,        // buy NO on A (inverted bid levels)
+        bookBYes.asks,    // buy YES on B at ask levels
+        dynamicMinBps2,
+        this.config.maxPositionUsd,
+      );
 
-      if (profitBps >= this.config.minProfitBps) {
-        if (minDepthUsd <= 0 || maxSize * totalCost >= minDepthUsd) {
+      if (walkResult && walkResult.size > 0) {
+        const totalValue = walkResult.size * (walkResult.avgPriceA + walkResult.avgPriceB);
+        if (minDepthUsd <= 0 || totalValue >= minDepthUsd) {
           opportunities.push(this.createOpportunity(
-            pair, 'NO', costNoA, bookAYes, maxSizeA,
-            'YES', costYesB, bookBYes, maxSizeB,
-            profitPerShare * maxSize, profitBps, maxSize,
+            pair,
+            'NO', walkResult.avgPriceA, bookAYes, walkResult.size,
+            'YES', walkResult.avgPriceB, bookBYes, walkResult.size,
+            walkResult.profitPerShare * walkResult.size, walkResult.profitBps, walkResult.size,
           ));
         } else {
           onSkip('below_depth');
         }
       } else {
-        onSkip('below_profit');
+        const topCost = (1 - bookAYes.bestBid) + bookBYes.bestAsk;
+        if (topCost >= 1.0) onSkip('below_profit');
+        else onSkip('below_profit');
       }
     } else {
       onSkip('null_book');

@@ -598,11 +598,12 @@ Return ONLY a JSON array of matched pairs. If a market has no match, omit it. Fo
 Only include matches you're confident about (>= 0.85). Return [] if no matches found.`;
 
     try {
+      const apiKey = this.llmVerifier['apiKey'] || process.env.ANTHROPIC_API_KEY || '';
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': this.llmVerifier['apiKey'] || process.env.ANTHROPIC_API_KEY || '',
+          'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
@@ -614,7 +615,11 @@ Only include matches you're confident about (>= 0.85). Return [] if no matches f
 
       if (!response.ok) {
         const errText = await response.text();
-        log.error('LLM batch-match API error', { status: response.status, error: errText.slice(0, 200) });
+        // Disable the verifier permanently on billing/quota errors
+        const disabled = this.llmVerifier.checkAndDisableOnPermanentError(errText, response.status);
+        if (!disabled) {
+          log.error('LLM batch-match API error', { status: response.status, error: errText.slice(0, 200) });
+        }
         return [];
       }
 

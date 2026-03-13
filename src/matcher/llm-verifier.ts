@@ -38,12 +38,22 @@ interface CandidatePair {
  * This is a critical safety layer — incorrect matches would mean we're
  * taking two unhedged positions instead of an arb.
  */
+/** Errors that warrant permanently disabling the LLM verifier for the session */
+const PERMANENT_DISABLE_PATTERNS = [
+  'credit balance is too low',
+  'Your credit balance',
+  'insufficient_quota',
+  'billing',
+  'payment',
+];
+
 export class LLMVerifier {
   private apiKey: string;
   private apiUrl = 'https://api.anthropic.com/v1/messages';
   private model = 'claude-sonnet-4-20250514';
   private maxBatchSize = 15; // pairs per LLM call
   private enabled: boolean;
+  private disableReason: string | null = null;
 
   /** Cache: `${marketA.id}:${marketB.id}` → result */
   private cache = new Map<string, LLMVerificationResult>();
@@ -58,6 +68,35 @@ export class LLMVerifier {
 
   get isEnabled(): boolean {
     return this.enabled;
+  }
+
+  /**
+   * Permanently disable the LLM verifier for this session.
+   * Called when we receive a billing error or other unrecoverable API failure.
+   */
+  disable(reason: string): void {
+    if (this.enabled) {
+      this.enabled = false;
+      this.disableReason = reason;
+      log.warn('LLM verifier permanently disabled for this session', { reason });
+    }
+  }
+
+  /**
+   * Check if an error body indicates a permanent failure (billing, quota, etc.)
+   * and if so, self-disable to avoid hammering the API.
+   */
+  checkAndDisableOnPermanentError(errorBody: string, statusCode: number): boolean {
+    if (statusCode === 400 || statusCode === 402 || statusCode === 429) {
+      const isPermanent = PERMANENT_DISABLE_PATTERNS.some(p =>
+        errorBody.toLowerCase().includes(p.toLowerCase()),
+      );
+      if (isPermanent) {
+        this.disable(`API error ${statusCode}: ${errorBody.slice(0, 100)}`);
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -178,6 +217,8 @@ ${pairsText}`;
 
     if (!response.ok) {
       const errorText = await response.text();
+      // Check for permanent errors (billing, quota) and self-disable
+      this.checkAndDisableOnPermanentError(errorText, response.status);
       throw new Error(`Anthropic API error ${response.status}: ${errorText}`);
     }
 

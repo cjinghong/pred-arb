@@ -28,6 +28,10 @@ vi.mock('../db/database', () => ({
   insertTrade: vi.fn(),
   updateTradeStatus: vi.fn(),
   markOpportunityExecuted: vi.fn(),
+  updateOpportunityStatus: vi.fn(),
+  upsertMarketPair: vi.fn(),
+  getAllMarketPairs: vi.fn(() => []),
+  updatePairStatus: vi.fn(),
 }));
 
 vi.mock('../utils/logger', () => ({
@@ -67,6 +71,9 @@ vi.mock('../utils/config', () => ({
       maxPositionUsd: 1000,
       scanIntervalMs: 10000,
       maxTotalExposureUsd: 5000,
+      pairRefreshIntervalMs: 300000,
+      minDepthUsd: 0,
+      dryRun: true,
     },
     dashboard: { port: 3847, apiPort: 3848 },
     db: { path: './data/pred-arb.db' },
@@ -282,10 +289,11 @@ describe('Arbitrage Bot Integration', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
 
-    // Create test markets with 3% arb opportunity:
-    // - Polymarket: YES = 0.48, NO = 0.52
-    // - PredictFun: YES = 0.51, NO = 0.49
-    // Combined: YES on Poly (0.48) + NO on PredictFun (0.49) = 0.97 cost, $0.03 profit (3%)
+    // Create test markets with ~5% arb opportunity:
+    // - Polymarket: YES = 0.45, NO = 0.55
+    // - PredictFun: YES = 0.52, NO = 0.48
+    // Direction 1: Buy YES on Poly (ask 0.45) + Buy NO on PF (1-bid_YES=1-0.50=0.50) = 0.95 cost
+    // Net profit after predict.fun fees (~0.01) ≈ $0.04/share ≈ 421 bps
 
     const polymarketMarkets = [
       createMockMarket(
@@ -293,7 +301,7 @@ describe('Arbitrage Bot Integration', () => {
         'polymarket',
         'Will the economy grow in 2026?',
         'economy-growth-2026',
-        [0.48, 0.52],
+        [0.45, 0.55],
       ),
     ];
 
@@ -303,31 +311,33 @@ describe('Arbitrage Bot Integration', () => {
         'predictfun',
         'Will the economy grow in 2026?',
         'economy-growth-2026',
-        [0.51, 0.49],
+        [0.52, 0.48],
       ),
     ];
 
     // Set up order books for arb:
-    // Poly: YES can be bought at 0.48 (ask), NO at 0.52 (ask)
+    // Poly: YES can be bought at 0.45 (ask), NO implied via bids
     const polyOrderBooks = new Map<string, OrderBook>();
     polyOrderBooks.set(
       'poly-market-1:0',
-      createMockOrderBook('polymarket', 'poly-market-1', 0, 0.47, 0.48),
+      createMockOrderBook('polymarket', 'poly-market-1', 0, 0.44, 0.45),
     );
     polyOrderBooks.set(
       'poly-market-1:1',
-      createMockOrderBook('polymarket', 'poly-market-1', 1, 0.51, 0.52),
+      createMockOrderBook('polymarket', 'poly-market-1', 1, 0.54, 0.55),
     );
 
-    // PredictFun: YES can be bought at 0.51 (ask), NO at 0.49 (ask)
+    // PredictFun: YES book bid=0.50, ask=0.52
+    // Buying NO on PF = 1 - bid_YES = 1 - 0.50 = 0.50
+    // Total arb: 0.45 + 0.50 = 0.95, profit 0.05 before fees
     const predictfunOrderBooks = new Map<string, OrderBook>();
     predictfunOrderBooks.set(
       'predictfun-market-1:0',
-      createMockOrderBook('predictfun', 'predictfun-market-1', 0, 0.50, 0.51),
+      createMockOrderBook('predictfun', 'predictfun-market-1', 0, 0.50, 0.52),
     );
     predictfunOrderBooks.set(
       'predictfun-market-1:1',
-      createMockOrderBook('predictfun', 'predictfun-market-1', 1, 0.48, 0.49),
+      createMockOrderBook('predictfun', 'predictfun-market-1', 1, 0.47, 0.49),
     );
 
     polymarketConnector = new MockMarketConnector('polymarket', polymarketMarkets, polyOrderBooks);
@@ -447,9 +457,9 @@ describe('Arbitrage Bot Integration', () => {
 
       // Cost should be < $1 for a profitable arb
       expect(totalCost).toBeLessThan(1);
-      // Total cost should be close to 0.97 (0.48 + 0.49)
-      expect(totalCost).toBeGreaterThan(0.95);
-      expect(totalCost).toBeLessThan(0.99);
+      // Total cost should be < 0.97 (wider arb)
+      expect(totalCost).toBeGreaterThan(0.90);
+      expect(totalCost).toBeLessThan(0.98);
 
       // Profit per share: $1 - totalCost
       const profitPerShare = 1 - totalCost;

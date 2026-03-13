@@ -236,6 +236,11 @@ export class ExecutionEngine {
     // rejection fires before we can cancel. Sequential placement lets us
     // abort before placing leg B if leg A fails outright.
     // However, if leg A places successfully and leg B fails, we need recovery.
+    //
+    // ── SMART LEG ORDERING ──
+    // We place the LESS LIQUID leg first. If it fails, we have zero exposure
+    // (safe abort). If the more-liquid leg fails after the thinner one fills,
+    // recovery/unwind is easier on the deeper book.
     await this.executeLiveArbitrage(opp, trade, size);
   }
 
@@ -256,86 +261,126 @@ export class ExecutionEngine {
       return;
     }
 
-    const orderA: OrderRequest = {
-      platform: opp.legA.platform,
-      marketId: opp.legA.marketId,
-      outcomeIndex: opp.legA.outcomeIndex,
+    // ── Smart Leg Ordering ──────────────────────────────────────────────
+    // Place the LESS liquid leg first (thinner book depth). If it fails,
+    // we have no exposure (safe). If the deeper leg fails later, recovery
+    // is easier on the more liquid book.
+    const depthA = opp.legA.availableSize * opp.legA.price;
+    const depthB = opp.legB.availableSize * opp.legB.price;
+    const firstLegIsA = depthA <= depthB; // place thinner leg first
+
+    const firstLeg = firstLegIsA ? opp.legA : opp.legB;
+    const secondLeg = firstLegIsA ? opp.legB : opp.legA;
+    const firstConn = firstLegIsA ? connA : connB;
+    const secondConn = firstLegIsA ? connB : connA;
+
+    log.info('Leg ordering decided', {
+      first: `${firstLeg.platform} (depth $${(firstLegIsA ? depthA : depthB).toFixed(0)})`,
+      second: `${secondLeg.platform} (depth $${(firstLegIsA ? depthB : depthA).toFixed(0)})`,
+    });
+
+    // ── Aggressive Pricing ──────────────────────────────────────────────
+    // Bid slightly above the best ask to increase fill probability on
+    // time-sensitive arbs. The overshoot is capped at half a tick to
+    // avoid paying significantly more than intended.
+    const tickA = firstLeg.orderBook.tickSize || 0.01;
+    const tickB = secondLeg.orderBook.tickSize || 0.01;
+    const aggressiveFirstPrice = Math.min(firstLeg.price + tickA * 0.5, 0.99);
+    const aggressiveSecondPrice = Math.min(secondLeg.price + tickB * 0.5, 0.99);
+
+    // Verify aggressive prices still yield a profitable arb
+    const aggressiveTotalCost = aggressiveFirstPrice + aggressiveSecondPrice;
+    const useAggressivePricing = aggressiveTotalCost < 1.0;
+
+    const orderFirst: OrderRequest = {
+      platform: firstLeg.platform,
+      marketId: firstLeg.marketId,
+      outcomeIndex: firstLeg.outcomeIndex,
       side: 'BUY',
       type: 'LIMIT',
-      price: opp.legA.price,
+      price: useAggressivePricing ? aggressiveFirstPrice : firstLeg.price,
       size,
     };
 
-    const orderB: OrderRequest = {
-      platform: opp.legB.platform,
-      marketId: opp.legB.marketId,
-      outcomeIndex: opp.legB.outcomeIndex,
+    const orderSecond: OrderRequest = {
+      platform: secondLeg.platform,
+      marketId: secondLeg.marketId,
+      outcomeIndex: secondLeg.outcomeIndex,
       side: 'BUY',
       type: 'LIMIT',
-      price: opp.legB.price,
+      price: useAggressivePricing ? aggressiveSecondPrice : secondLeg.price,
       size,
     };
 
-    // ── Leg A: Place first ──────────────────────────────────────────────
+    if (useAggressivePricing) {
+      log.info('Using aggressive pricing', {
+        firstOriginal: firstLeg.price.toFixed(4),
+        firstAggressive: orderFirst.price.toFixed(4),
+        secondOriginal: secondLeg.price.toFixed(4),
+        secondAggressive: orderSecond.price.toFixed(4),
+        totalCost: aggressiveTotalCost.toFixed(4),
+      });
+    }
 
-    let resultA: OrderResult;
+    // ── First Leg: Place ────────────────────────────────────────────────
+
+    let resultFirst: OrderResult;
     try {
-      await rateLimit(opp.legA.platform);
-      resultA = await connA.placeOrder(orderA);
-      trade.legA = resultA;
-      log.info('Leg A placed', {
-        orderId: resultA.id,
-        platform: opp.legA.platform,
-        status: resultA.status,
+      await rateLimit(firstLeg.platform);
+      resultFirst = await firstConn.placeOrder(orderFirst);
+      if (firstLegIsA) trade.legA = resultFirst; else trade.legB = resultFirst;
+      log.info('First leg placed', {
+        orderId: resultFirst.id,
+        platform: firstLeg.platform,
+        status: resultFirst.status,
       });
     } catch (err) {
-      // Leg A failed outright — no exposure, safe to bail
+      // First leg failed outright — no exposure, safe to bail
       updateTradeStatus(trade.id, 'FAILED', {
-        notes: `Leg A failed to place: ${(err as Error).message}`,
+        notes: `First leg (${firstLeg.platform}) failed to place: ${(err as Error).message}`,
       });
-      updateOpportunityStatus(opp.id, 'failed', `Leg A failed: ${(err as Error).message}`);
+      updateOpportunityStatus(opp.id, 'failed', `First leg failed: ${(err as Error).message}`);
       eventBus.emit('trade:failed', { tradeId: trade.id, error: (err as Error).message });
-      log.error('Leg A placement failed — no exposure, aborting', {
+      log.error('First leg placement failed — no exposure, aborting', {
         error: (err as Error).message,
       });
       return;
     }
 
-    // If leg A was immediately rejected (some platforms return FAILED/CANCELLED status)
-    if (resultA.status === 'FAILED' || resultA.status === 'CANCELLED') {
+    // If first leg was immediately rejected
+    if (resultFirst.status === 'FAILED' || resultFirst.status === 'CANCELLED') {
       updateTradeStatus(trade.id, 'FAILED', {
-        notes: `Leg A immediately rejected: ${resultA.status}`,
+        notes: `First leg immediately rejected: ${resultFirst.status}`,
       });
-      updateOpportunityStatus(opp.id, 'failed', `Leg A rejected: ${resultA.status}`);
-      eventBus.emit('trade:failed', { tradeId: trade.id, error: `Leg A rejected: ${resultA.status}` });
+      updateOpportunityStatus(opp.id, 'failed', `First leg rejected: ${resultFirst.status}`);
+      eventBus.emit('trade:failed', { tradeId: trade.id, error: `First leg rejected: ${resultFirst.status}` });
       return;
     }
 
-    // ── Leg B: Place second ─────────────────────────────────────────────
+    // ── Second Leg: Place ───────────────────────────────────────────────
 
-    let resultB: OrderResult;
+    let resultSecond: OrderResult;
     try {
-      await rateLimit(opp.legB.platform);
-      resultB = await connB.placeOrder(orderB);
-      trade.legB = resultB;
-      log.info('Leg B placed', {
-        orderId: resultB.id,
-        platform: opp.legB.platform,
-        status: resultB.status,
+      await rateLimit(secondLeg.platform);
+      resultSecond = await secondConn.placeOrder(orderSecond);
+      if (firstLegIsA) trade.legB = resultSecond; else trade.legA = resultSecond;
+      log.info('Second leg placed', {
+        orderId: resultSecond.id,
+        platform: secondLeg.platform,
+        status: resultSecond.status,
       });
     } catch (err) {
-      // DANGER: Leg A is open/filled but leg B failed to place
-      // We have unhedged exposure on platform A
-      log.error('LEG B FAILED — initiating recovery for unhedged leg A', {
-        legA: resultA.id,
+      // DANGER: First leg is open/filled but second leg failed to place
+      log.error('SECOND LEG FAILED — initiating recovery for unhedged first leg', {
+        firstLeg: resultFirst.id,
         error: (err as Error).message,
       });
 
       await this.handleFailedLeg({
         tradeId: trade.id,
-        filledLeg: resultA,
+        filledLeg: resultFirst,
         failedLeg: {
-          ...orderB,
+          ...orderSecond,
           id: 'NEVER_PLACED',
           filledSize: 0,
           avgFillPrice: 0,
@@ -343,30 +388,33 @@ export class ExecutionEngine {
           timestamp: new Date(),
           fees: 0,
         },
-        filledPlatform: opp.legA.platform,
+        filledPlatform: firstLeg.platform,
         opportunity: opp,
       });
       return;
     }
 
-    // If leg B was immediately rejected
-    if (resultB.status === 'FAILED' || resultB.status === 'CANCELLED') {
-      log.error('Leg B immediately rejected — initiating recovery', {
-        legA: resultA.id,
-        legBStatus: resultB.status,
+    // If second leg was immediately rejected
+    if (resultSecond.status === 'FAILED' || resultSecond.status === 'CANCELLED') {
+      log.error('Second leg immediately rejected — initiating recovery', {
+        firstLeg: resultFirst.id,
+        secondLegStatus: resultSecond.status,
       });
 
       await this.handleFailedLeg({
         tradeId: trade.id,
-        filledLeg: resultA,
-        failedLeg: resultB,
-        filledPlatform: opp.legA.platform,
+        filledLeg: resultFirst,
+        failedLeg: resultSecond,
+        filledPlatform: firstLeg.platform,
         opportunity: opp,
       });
       return;
     }
 
     // ── Both legs placed — monitor fill status ──────────────────────────
+    // Map results back to A/B for consistent downstream handling
+    const resultA = firstLegIsA ? resultFirst : resultSecond;
+    const resultB = firstLegIsA ? resultSecond : resultFirst;
 
     trade.legA = resultA;
     trade.legB = resultB;

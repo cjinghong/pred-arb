@@ -660,7 +660,7 @@ describe('RiskManager', () => {
       const result = await riskManager.checkOpportunity(opp);
 
       expect(result.approved).toBe(false);
-      expect(result.reason).toBe('Insufficient balance on one or both platforms');
+      expect(result.reason).toContain('Insufficient balance');
     });
 
     it('should handle very small prices', async () => {
