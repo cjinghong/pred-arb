@@ -30,7 +30,7 @@ export type ConnectorEventHandler = (event: ConnectorEvent, data: unknown) => vo
  *  1. Fetching and normalizing market data
  *  2. Fetching and normalizing order books
  *  3. Placing and managing orders
- *  4. Streaming real-time updates (optional)
+ *  4. Streaming real-time updates via WebSocket
  */
 export interface MarketConnector {
   /** Which platform this connector serves */
@@ -41,6 +41,9 @@ export interface MarketConnector {
 
   /** Whether the connector is currently connected and healthy */
   readonly isConnected: boolean;
+
+  /** Whether the WebSocket is connected and streaming */
+  readonly isWsConnected: boolean;
 
   // ─── Lifecycle ───────────────────────────────────────────────────────
 
@@ -58,8 +61,17 @@ export interface MarketConnector {
   /** Fetch a single market by ID */
   fetchMarket(marketId: string): Promise<NormalizedMarket | null>;
 
-  /** Fetch the order book for a specific outcome token */
+  /** Fetch the order book for a specific outcome token.
+   *  Prefers the live WebSocket cache; falls back to REST if stale. */
   fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook>;
+
+  // ─── WebSocket Streaming ───────────────────────────────────────────
+
+  /** Subscribe to real-time order book updates for the given markets */
+  subscribeOrderBooks(markets: NormalizedMarket[]): void;
+
+  /** Unsubscribe from real-time updates */
+  unsubscribeOrderBooks(marketIds: string[]): void;
 
   // ─── Trading ─────────────────────────────────────────────────────────
 
@@ -96,6 +108,12 @@ export interface FetchMarketsOptions {
   limit?: number;
   /** Pagination offset / cursor */
   offset?: number | string;
-  /** Minimum liquidity in USD */
+  /** Minimum liquidity in USD (server-side on Polymarket, client-side on predict.fun) */
   minLiquidity?: number;
+  /** Minimum volume in USD (server-side on Polymarket, client-side on predict.fun) */
+  minVolume?: number;
+  /** Sort field (server-side on Polymarket) */
+  sortBy?: 'liquidity' | 'volume' | 'updatedAt';
+  /** Sort direction */
+  sortDirection?: 'asc' | 'desc';
 }

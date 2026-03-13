@@ -15,6 +15,7 @@ import {
   PriceLevel,
 } from '../types';
 import { config } from '../utils/config';
+import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
 
 // ─── Raw Polymarket API Types ────────────────────────────────────────────
 
@@ -53,20 +54,63 @@ export class PolymarketConnector extends BaseConnector {
 
   private gammaUrl: string;
   private clobUrl: string;
+  private wsManager: WsOrderBookManager;
+
+  /** Cache: marketId → NormalizedMarket (to avoid refetching for token lookups) */
+  private marketCache = new Map<string, NormalizedMarket>();
 
   constructor() {
     super('polymarket');
     this.gammaUrl = config.polymarket.gammaUrl;
     this.clobUrl = config.polymarket.clobUrl;
+
+    // ─── Polymarket WebSocket setup ─────────────────────────────────────
+    // URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    // Subscribe: { "assets_ids": [...tokenIds], "type": "market" }
+    // Events: book (full snapshot), price_change, last_trade_price, tick_size_change
+    this.wsManager = new WsOrderBookManager(
+      {
+        platform: 'polymarket',
+        wsUrl: config.polymarket.wsUrl,
+        maxReconnects: 0,              // infinite reconnects
+        reconnectBaseDelayMs: 1000,
+        reconnectMaxDelayMs: 30000,
+        heartbeatIntervalMs: 0,        // Polymarket has no heartbeat requirement
+        staleThresholdMs: 5000,
+      },
+      // Subscribe message builder
+      (assetIds: string[]) => JSON.stringify({
+        assets_ids: assetIds,
+        type: 'market',
+      }),
+      // Unsubscribe message builder (Polymarket doesn't have explicit unsubscribe;
+      // we just stop processing events for those IDs)
+      (_assetIds: string[]) => '',
+      // Heartbeat response builder (Polymarket has no heartbeat requirement)
+      (_msg: unknown) => null,
+      // Book update parser
+      (raw: unknown) => this.parsePolymarketWsEvent(raw),
+    );
   }
 
   async connect(): Promise<void> {
     try {
-      // Test connectivity by fetching a single market
+      // Test REST connectivity by fetching a single market
       await this.httpGet(`${this.gammaUrl}/markets?limit=1`);
       this._isConnected = true;
       this.emit('connected');
-      this.log.info('Connected to Polymarket');
+      this.log.info('Connected to Polymarket REST API');
+
+      // Connect WebSocket for real-time book streaming
+      try {
+        await this.wsManager.connect();
+        this._isWsConnected = true;
+        this.log.info('Connected to Polymarket WebSocket');
+      } catch (wsErr) {
+        this.log.warn('WebSocket connection failed, will use REST fallback', {
+          error: (wsErr as Error).message,
+        });
+      }
     } catch (err) {
       this.log.error('Failed to connect to Polymarket', { error: (err as Error).message });
       throw err;
@@ -74,7 +118,10 @@ export class PolymarketConnector extends BaseConnector {
   }
 
   async disconnect(): Promise<void> {
+    await this.wsManager.disconnect();
+    this._isWsConnected = false;
     this._isConnected = false;
+    this.marketCache.clear();
     this.emit('disconnected');
     this.log.info('Disconnected from Polymarket');
   }
@@ -85,27 +132,45 @@ export class PolymarketConnector extends BaseConnector {
     const params = new URLSearchParams();
     params.set('limit', String(options?.limit ?? 100));
     if (options?.offset) params.set('offset', String(options.offset));
+
+    // ─── Server-side filters (Polymarket Gamma API supports these) ──────
     if (options?.activeOnly !== false) params.set('active', 'true');
     params.set('closed', 'false');
+
+    // Liquidity & volume filters — let the API do the heavy lifting
+    if (options?.minLiquidity) {
+      params.set('liquidity_num_min', String(options.minLiquidity));
+    }
+    if (options?.minVolume) {
+      params.set('volume_num_min', String(options.minVolume));
+    }
+
+    // Sorting — default to highest liquidity first for better arb candidates
+    if (options?.sortBy) {
+      const sortFieldMap: Record<string, string> = {
+        liquidity: 'liquidity',
+        volume: 'volume',
+        updatedAt: 'updatedAt',
+      };
+      params.set('order', sortFieldMap[options.sortBy] || options.sortBy);
+      params.set('ascending', String(options.sortDirection === 'asc'));
+    }
 
     const raw = await this.httpGet<PolymarketRawMarket[]>(
       `${this.gammaUrl}/markets?${params.toString()}`
     );
 
+    // Client-side: only filter for binary markets (no API param for outcome count)
     return raw
       .filter(m => {
         try {
           const outcomes = JSON.parse(m.outcomes || '[]');
-          return outcomes.length === 2; // binary markets only for now
+          return outcomes.length === 2;
         } catch {
           return false;
         }
       })
-      .map(m => this.normalizeMarket(m))
-      .filter(m => {
-        if (options?.minLiquidity && m.liquidity < options.minLiquidity) return false;
-        return true;
-      });
+      .map(m => this.normalizeMarket(m));
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {
@@ -120,8 +185,14 @@ export class PolymarketConnector extends BaseConnector {
   }
 
   async fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook> {
-    // First we need the token ID for this outcome
-    const market = await this.fetchMarket(marketId);
+    // Try WebSocket cache first (sub-millisecond)
+    const wsBook = this.wsManager.getBookByMarket(marketId, outcomeIndex);
+    if (wsBook && this.wsManager.isBookFresh(marketId + ':' + outcomeIndex)) {
+      return wsBook;
+    }
+
+    // Fallback to REST
+    const market = await this.getOrFetchMarket(marketId);
     if (!market) throw new Error(`Market ${marketId} not found`);
 
     const tokenId = market.outcomeTokenIds[outcomeIndex];
@@ -132,6 +203,58 @@ export class PolymarketConnector extends BaseConnector {
     );
 
     return this.normalizeOrderBook(raw, marketId, outcomeIndex);
+  }
+
+  // ─── WebSocket Subscriptions ─────────────────────────────────────────
+
+  subscribeOrderBooks(markets: NormalizedMarket[]): void {
+    const assetIds: string[] = [];
+    const mappings: Array<{ assetId: string; marketId: string; outcomeIndex: number }> = [];
+
+    for (const market of markets) {
+      // Cache the market for token lookups
+      this.marketCache.set(market.id, market);
+
+      // Subscribe to both YES and NO token IDs
+      for (let i = 0; i < market.outcomeTokenIds.length; i++) {
+        const tokenId = market.outcomeTokenIds[i];
+        if (tokenId) {
+          assetIds.push(tokenId);
+          mappings.push({ assetId: tokenId, marketId: market.id, outcomeIndex: i });
+        }
+      }
+    }
+
+    if (assetIds.length > 0) {
+      this.wsManager.subscribe(assetIds, mappings);
+      this.log.info('Subscribed to Polymarket WS books', {
+        markets: markets.length,
+        tokens: assetIds.length,
+      });
+    }
+  }
+
+  unsubscribeOrderBooks(marketIds: string[]): void {
+    const assetIds: string[] = [];
+    for (const mid of marketIds) {
+      const market = this.marketCache.get(mid);
+      if (market) {
+        assetIds.push(...market.outcomeTokenIds.filter(Boolean));
+        this.marketCache.delete(mid);
+      }
+    }
+    if (assetIds.length > 0) {
+      this.wsManager.unsubscribe(assetIds);
+    }
+  }
+
+  /** Get market from cache or fetch via REST */
+  private async getOrFetchMarket(marketId: string): Promise<NormalizedMarket | null> {
+    const cached = this.marketCache.get(marketId);
+    if (cached) return cached;
+    const market = await this.fetchMarket(marketId);
+    if (market) this.marketCache.set(marketId, market);
+    return market;
   }
 
   /** Batch-fetch order books for multiple token IDs */
@@ -260,6 +383,55 @@ export class PolymarketConnector extends BaseConnector {
       endDate: raw.endDate ? new Date(raw.endDate) : null,
       lastUpdated: new Date(raw.updatedAt || Date.now()),
       raw,
+    };
+  }
+
+  // ─── WebSocket Event Parsing ─────────────────────────────────────────
+
+  /**
+   * Parse a Polymarket WebSocket event into a book update.
+   *
+   * Polymarket market channel events:
+   *  - event_type: "book" — full order book snapshot
+   *    { event_type, asset_id, market, bids: [{price, size}], asks: [{price, size}],
+   *      timestamp, hash, min_order_size, tick_size, neg_risk }
+   *
+   *  - event_type: "price_change" — price level update (ignored, we use full books)
+   *  - event_type: "last_trade_price" — trade executed
+   *  - event_type: "tick_size_change" — tick size changed
+   */
+  private parsePolymarketWsEvent(raw: unknown): ParsedBookUpdate | null {
+    const msg = raw as Record<string, unknown>;
+    if (msg.event_type !== 'book') return null;
+
+    const assetId = msg.asset_id as string;
+    if (!assetId) return null;
+
+    // Look up market mapping from our cache
+    let marketId = '';
+    let outcomeIndex = 0;
+    for (const [mid, market] of this.marketCache.entries()) {
+      const idx = market.outcomeTokenIds.indexOf(assetId);
+      if (idx !== -1) {
+        marketId = mid;
+        outcomeIndex = idx;
+        break;
+      }
+    }
+    if (!marketId) return null;
+
+    const rawBids = (msg.bids as Array<{ price: string; size: string }>) || [];
+    const rawAsks = (msg.asks as Array<{ price: string; size: string }>) || [];
+
+    return {
+      assetId,
+      marketId,
+      outcomeIndex,
+      bids: rawBids.map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) })),
+      asks: rawAsks.map(a => ({ price: parseFloat(a.price), size: parseFloat(a.size) })),
+      timestamp: new Date(parseInt(msg.timestamp as string) * 1000 || Date.now()),
+      minOrderSize: (msg.min_order_size as number) ?? 1,
+      tickSize: (msg.tick_size as number) ?? 0.01,
     };
   }
 

@@ -188,9 +188,21 @@ export class CrossPlatformArbStrategy implements Strategy {
       return;
     }
 
+    // Push filtering to the API wherever possible:
+    // - Polymarket: activeOnly, minLiquidity, sortBy all handled server-side
+    // - predict.fun: activeOnly (status=active) handled server-side;
+    //                minLiquidity falls back to client-side filtering
+    const fetchOpts = {
+      activeOnly: true,
+      limit: 200,
+      minLiquidity: 100,               // skip illiquid markets that can't fill
+      sortBy: 'liquidity' as const,    // best arb candidates first
+      sortDirection: 'desc' as const,
+    };
+
     const [marketsA, marketsB] = await Promise.all([
-      connA.fetchMarkets({ activeOnly: true, limit: 200 }),
-      connB.fetchMarkets({ activeOnly: true, limit: 200 }),
+      connA.fetchMarkets(fetchOpts),
+      connB.fetchMarkets(fetchOpts),
     ]);
 
     log.info('Markets fetched', {
@@ -198,8 +210,52 @@ export class CrossPlatformArbStrategy implements Strategy {
       predictfun: marketsB.length,
     });
 
+    const oldPairIds = new Set(this.cachedPairs.map(p => `${p.marketA.id}:${p.marketB.id}`));
     this.cachedPairs = this.matcher.findPairs(marketsA, marketsB);
     this.lastPairRefresh = Date.now();
+
+    // Subscribe to WebSocket order book updates for newly matched pairs
+    this.subscribeToMatchedPairs(connA, connB, oldPairIds);
+  }
+
+  /**
+   * Subscribe connectors to WebSocket order book feeds for all matched pairs.
+   * This ensures we get real-time book updates for markets we're actively
+   * monitoring, rather than polling REST on every scan.
+   */
+  private subscribeToMatchedPairs(
+    connA: MarketConnector,
+    connB: MarketConnector,
+    oldPairIds: Set<string>,
+  ): void {
+    const newMarketsA: NormalizedMarket[] = [];
+    const newMarketsB: NormalizedMarket[] = [];
+
+    for (const pair of this.cachedPairs) {
+      const pairId = `${pair.marketA.id}:${pair.marketB.id}`;
+      if (!oldPairIds.has(pairId)) {
+        newMarketsA.push(pair.marketA);
+        newMarketsB.push(pair.marketB);
+      }
+    }
+
+    if (newMarketsA.length > 0) {
+      try {
+        connA.subscribeOrderBooks(newMarketsA);
+        log.info(`Subscribed ${newMarketsA.length} new markets on ${connA.platform} for WS books`);
+      } catch (err) {
+        log.warn('Failed to subscribe WS books on platform A', { error: (err as Error).message });
+      }
+    }
+
+    if (newMarketsB.length > 0) {
+      try {
+        connB.subscribeOrderBooks(newMarketsB);
+        log.info(`Subscribed ${newMarketsB.length} new markets on ${connB.platform} for WS books`);
+      } catch (err) {
+        log.warn('Failed to subscribe WS books on platform B', { error: (err as Error).message });
+      }
+    }
   }
 
   /**

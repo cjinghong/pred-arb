@@ -33,6 +33,8 @@ export const config = {
     privateKey: process.env.PREDICTFUN_PRIVATE_KEY || '',
     apiUrl: 'https://api.predict.fun',
     testnetUrl: 'https://api-testnet.predict.fun',
+    wsUrl: 'wss://api.predict.fun/ws',
+    wsTestnetUrl: 'wss://api-testnet.predict.fun/ws',
     useTestnet: process.env.PREDICTFUN_USE_TESTNET === 'true',
   },
 

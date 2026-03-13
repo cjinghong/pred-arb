@@ -40,3 +40,5 @@ dashboard/.next/
 # Misc
 *.tsbuildinfo
 .cache/
+
+id_do

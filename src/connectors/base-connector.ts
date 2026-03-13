@@ -23,6 +23,7 @@ export abstract class BaseConnector implements MarketConnector {
   abstract readonly name: string;
 
   protected _isConnected = false;
+  protected _isWsConnected = false;
   protected events = new EventEmitter();
   protected log;
 
@@ -35,11 +36,17 @@ export abstract class BaseConnector implements MarketConnector {
     return this._isConnected;
   }
 
+  get isWsConnected(): boolean {
+    return this._isWsConnected;
+  }
+
   abstract connect(): Promise<void>;
   abstract disconnect(): Promise<void>;
   abstract fetchMarkets(options?: FetchMarketsOptions): Promise<NormalizedMarket[]>;
   abstract fetchMarket(marketId: string): Promise<NormalizedMarket | null>;
   abstract fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook>;
+  abstract subscribeOrderBooks(markets: NormalizedMarket[]): void;
+  abstract unsubscribeOrderBooks(marketIds: string[]): void;
   abstract placeOrder(order: OrderRequest): Promise<OrderResult>;
   abstract cancelOrder(orderId: string): Promise<boolean>;
   abstract getOpenOrders(): Promise<OrderResult[]>;

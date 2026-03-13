@@ -12,6 +12,8 @@
     "start:dev": "tsx src/index.ts",
     "dashboard:dev": "cd dashboard && npm run dev",
     "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "setup": "npm install && cd dashboard && npm install"
   },
@@ -34,6 +36,7 @@
     "@types/uuid": "^9.0.7",
     "@types/ws": "^8.5.10",
     "tsx": "^4.7.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^4.0.18"
   }
 }

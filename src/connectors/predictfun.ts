@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: predict.fun Connector
-// Connects to the predict.fun REST API for markets and order books
+// Connects to the predict.fun REST API and WebSocket for real-time order books
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { BaseConnector } from './base-connector';
@@ -15,6 +15,7 @@ import {
   PriceLevel,
 } from '../types';
 import { config } from '../utils/config';
+import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
 
 // ─── Raw predict.fun API Types ───────────────────────────────────────────
 
@@ -57,21 +58,108 @@ export class PredictFunConnector extends BaseConnector {
 
   private apiUrl: string;
   private jwtToken: string | null = null;
+  private wsManager: WsOrderBookManager;
+
+  /** Cache: marketId → NormalizedMarket (for token lookups and WS event parsing) */
+  private marketCache = new Map<string, NormalizedMarket>();
+
+  /** Auto-incrementing request ID for predict.fun WS protocol */
+  private nextRequestId = 1;
 
   constructor() {
     super('predictfun');
     this.apiUrl = config.predictfun.useTestnet
       ? config.predictfun.testnetUrl
       : config.predictfun.apiUrl;
+
+    const wsUrl = config.predictfun.useTestnet
+      ? config.predictfun.wsTestnetUrl
+      : config.predictfun.wsUrl;
+
+    // Build the WS URL with API key query param if available
+    const wsUrlWithAuth = config.predictfun.apiKey
+      ? `${wsUrl}?apiKey=${config.predictfun.apiKey}`
+      : wsUrl;
+
+    // ─── predict.fun WebSocket setup ───────────────────────────────────
+    // Protocol:
+    //   - Connect to /ws?apiKey=<key>
+    //   - Heartbeat every 15s from server; client must respond with same timestamp
+    //   - Subscribe: { "type": "subscribe", "channel": "orderbook", "marketId": "...", "requestId": N }
+    //   - Unsubscribe: { "type": "unsubscribe", "channel": "orderbook", "marketId": "...", "requestId": N }
+    //   - Book updates: { "type": "orderbook", "marketId": "...", "bids": [...], "asks": [...] }
+    this.wsManager = new WsOrderBookManager(
+      {
+        platform: 'predictfun',
+        wsUrl: wsUrlWithAuth,
+        maxReconnects: 0,               // infinite reconnects
+        reconnectBaseDelayMs: 1000,
+        reconnectMaxDelayMs: 30000,
+        heartbeatIntervalMs: 15000,      // predict.fun sends heartbeat every 15s
+        staleThresholdMs: 20000,         // slightly more than heartbeat interval
+      },
+      // Subscribe message builder
+      // predict.fun subscribes per-market, so we send one message per asset
+      // (asset IDs are market IDs for predict.fun)
+      (assetIds: string[]) => {
+        // Send all subscribe messages as a JSON array (the WS manager sends this
+        // as a single message, so we batch them)
+        const messages = assetIds.map(marketId => ({
+          type: 'subscribe',
+          channel: 'orderbook',
+          marketId,
+          requestId: this.nextRequestId++,
+        }));
+        // If only one, send as single object; otherwise batch
+        return messages.length === 1
+          ? JSON.stringify(messages[0])
+          : JSON.stringify(messages);
+      },
+      // Unsubscribe message builder
+      (assetIds: string[]) => {
+        const messages = assetIds.map(marketId => ({
+          type: 'unsubscribe',
+          channel: 'orderbook',
+          marketId,
+          requestId: this.nextRequestId++,
+        }));
+        return messages.length === 1
+          ? JSON.stringify(messages[0])
+          : JSON.stringify(messages);
+      },
+      // Heartbeat response builder
+      // predict.fun sends: { "type": "heartbeat", "timestamp": <number> }
+      // Client must respond: { "type": "heartbeat", "timestamp": <same_number> }
+      (msg: unknown) => {
+        const m = msg as Record<string, unknown>;
+        if (m.type === 'heartbeat' && m.timestamp !== undefined) {
+          return JSON.stringify({ type: 'heartbeat', timestamp: m.timestamp });
+        }
+        return null;
+      },
+      // Book update parser
+      (raw: unknown) => this.parsePredictFunWsEvent(raw),
+    );
   }
 
   async connect(): Promise<void> {
     try {
-      // Test connectivity
+      // Test REST connectivity
       await this.httpGet(`${this.apiUrl}/v1/markets?first=1`);
       this._isConnected = true;
       this.emit('connected');
-      this.log.info('Connected to predict.fun', { url: this.apiUrl });
+      this.log.info('Connected to predict.fun REST API', { url: this.apiUrl });
+
+      // Connect WebSocket for real-time book streaming
+      try {
+        await this.wsManager.connect();
+        this._isWsConnected = true;
+        this.log.info('Connected to predict.fun WebSocket');
+      } catch (wsErr) {
+        this.log.warn('WebSocket connection failed, will use REST fallback', {
+          error: (wsErr as Error).message,
+        });
+      }
     } catch (err) {
       this.log.error('Failed to connect to predict.fun', { error: (err as Error).message });
       throw err;
@@ -79,8 +167,11 @@ export class PredictFunConnector extends BaseConnector {
   }
 
   async disconnect(): Promise<void> {
+    await this.wsManager.disconnect();
+    this._isWsConnected = false;
     this.jwtToken = null;
     this._isConnected = false;
+    this.marketCache.clear();
     this.emit('disconnected');
     this.log.info('Disconnected from predict.fun');
   }
@@ -98,7 +189,6 @@ export class PredictFunConnector extends BaseConnector {
     );
 
     // Step 2: Sign message with private key (would use ethers.js)
-    // For now, this is a scaffold
     this.log.info('Auth message received, signing required for trading');
 
     // Step 3: Exchange for JWT
@@ -158,12 +248,64 @@ export class PredictFunConnector extends BaseConnector {
   }
 
   async fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook> {
+    // Try WebSocket cache first (sub-millisecond)
+    const wsBook = this.wsManager.getBookByMarket(marketId, outcomeIndex);
+    if (wsBook && this.wsManager.isBookFresh(marketId)) {
+      return wsBook;
+    }
+
+    // Fallback to REST
     const raw = await this.httpGet<PredictFunRawOrderBook>(
       `${this.apiUrl}/v1/markets/${marketId}/orderbook`,
       this.getAuthHeaders(),
     );
 
     return this.normalizeOrderBook(raw, marketId, outcomeIndex);
+  }
+
+  // ─── WebSocket Subscriptions ──────────────────────────────────────────
+
+  subscribeOrderBooks(markets: NormalizedMarket[]): void {
+    // For predict.fun, the "asset ID" in the WS manager is the market ID itself
+    // since predict.fun subscribes per-market (not per-token)
+    const assetIds: string[] = [];
+    const mappings: Array<{ assetId: string; marketId: string; outcomeIndex: number }> = [];
+
+    for (const market of markets) {
+      // Cache the market for WS event parsing
+      this.marketCache.set(market.id, market);
+
+      // predict.fun sends order book data for the whole market,
+      // so we subscribe once per market but create mappings for both outcomes
+      if (!assetIds.includes(market.id)) {
+        assetIds.push(market.id);
+      }
+
+      // Map the market ID to both YES (0) and NO (1) outcomes
+      // The WS manager will store one book per assetId, but we parse
+      // both outcomes from a single update event
+      mappings.push({ assetId: market.id, marketId: market.id, outcomeIndex: 0 });
+      // For NO outcome, we create a separate mapping key
+      mappings.push({ assetId: `${market.id}:NO`, marketId: market.id, outcomeIndex: 1 });
+    }
+
+    if (assetIds.length > 0) {
+      this.wsManager.subscribe(assetIds, mappings);
+      this.log.info('Subscribed to predict.fun WS books', {
+        markets: markets.length,
+      });
+    }
+  }
+
+  unsubscribeOrderBooks(marketIds: string[]): void {
+    const assetIds: string[] = [];
+    for (const mid of marketIds) {
+      assetIds.push(mid);
+      this.marketCache.delete(mid);
+    }
+    if (assetIds.length > 0) {
+      this.wsManager.unsubscribe(assetIds);
+    }
   }
 
   // ─── Trading (requires auth) ───────────────────────────────────────────
@@ -219,6 +361,47 @@ export class PredictFunConnector extends BaseConnector {
 
   async getBalance(): Promise<number> {
     return 0;
+  }
+
+  // ─── WebSocket Event Parsing ─────────────────────────────────────────
+
+  /**
+   * Parse a predict.fun WebSocket event into a book update.
+   *
+   * predict.fun WS events:
+   *   - type: "orderbook"
+   *     { type, marketId, bids: [[price, qty], ...], asks: [[price, qty], ...], timestamp }
+   *   - type: "heartbeat"
+   *     { type, timestamp } — handled by the heartbeat callback
+   *   - type: "subscribed" / "unsubscribed" — ack messages
+   */
+  private parsePredictFunWsEvent(raw: unknown): ParsedBookUpdate | null {
+    const msg = raw as Record<string, unknown>;
+
+    if (msg.type !== 'orderbook') return null;
+
+    const marketId = msg.marketId as string;
+    if (!marketId) return null;
+
+    // Check if we're tracking this market
+    const market = this.marketCache.get(marketId);
+    if (!market) return null;
+
+    const rawBids = (msg.bids as Array<[number, number]>) || [];
+    const rawAsks = (msg.asks as Array<[number, number]>) || [];
+
+    // predict.fun sends YES-side order book data
+    // We store the YES book directly (outcomeIndex 0)
+    return {
+      assetId: marketId,
+      marketId,
+      outcomeIndex: 0,
+      bids: rawBids.map(([price, size]) => ({ price, size })),
+      asks: rawAsks.map(([price, size]) => ({ price, size })),
+      timestamp: new Date((msg.timestamp as number) || Date.now()),
+      minOrderSize: 1,
+      tickSize: 0.01,
+    };
   }
 
   // ─── Normalization ─────────────────────────────────────────────────────
