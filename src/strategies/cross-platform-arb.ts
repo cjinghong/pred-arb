@@ -529,6 +529,29 @@ export class CrossPlatformArbStrategy implements Strategy {
     return pairId;
   }
 
+  /** Runtime category override (dashboard can change this without restart) */
+  private runtimeCategory: string | null = null;
+
+  /** Get the effective category (runtime override > env var) */
+  getCategory(): string {
+    return this.runtimeCategory ?? config.bot.marketCategory;
+  }
+
+  /** Set category at runtime (from dashboard). Pass '' to clear. */
+  setCategory(category: string): void {
+    this.runtimeCategory = category || null;
+    log.info('Market category updated at runtime', { category: this.getCategory() });
+  }
+
+  /**
+   * Force a refresh of market pairs — bypasses the time check.
+   * Called from dashboard "Refresh Markets" button.
+   */
+  async forceRefreshPairs(): Promise<void> {
+    this.lastPairRefresh = 0; // Reset the timer so refreshPairsIfNeeded actually runs
+    await this.refreshPairsIfNeeded();
+  }
+
   /** Reset all in-memory state (called from dashboard reset) */
   reset(): void {
     this.stopEventDrivenScanning();
@@ -557,11 +580,11 @@ export class CrossPlatformArbStrategy implements Strategy {
 
   /** Expose market/pair data for the dashboard */
   getMarketsSummary(): {
-    platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; matched: boolean }> }>;
+    platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; slug: string; eventSlug?: string; matched: boolean }> }>;
     matchedPairs: Array<{
       pairId: string;
-      marketA: { id: string; platform: string; question: string };
-      marketB: { id: string; platform: string; question: string };
+      marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
+      marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
       confidence: number;
       matchMethod: string;
       status: string;
@@ -577,7 +600,7 @@ export class CrossPlatformArbStrategy implements Strategy {
       matchedIds.get(pair.marketB.platform)!.add(pair.marketB.id);
     }
 
-    const platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; matched: boolean }> }> = {};
+    const platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; slug: string; eventSlug?: string; matched: boolean }> }> = {};
     for (const [platform, markets] of this.lastFetchedMarkets.entries()) {
       const pMatched = matchedIds.get(platform) || new Set();
       platforms[platform] = {
@@ -586,6 +609,8 @@ export class CrossPlatformArbStrategy implements Strategy {
           id: m.id,
           question: m.question,
           category: m.category,
+          slug: m.slug,
+          eventSlug: m.eventSlug,
           matched: pMatched.has(m.id),
         })),
       };
@@ -593,8 +618,8 @@ export class CrossPlatformArbStrategy implements Strategy {
 
     const matchedPairs = this.cachedPairs.map(p => ({
       pairId: p.pairId,
-      marketA: { id: p.marketA.id, platform: p.marketA.platform, question: p.marketA.question },
-      marketB: { id: p.marketB.id, platform: p.marketB.platform, question: p.marketB.question },
+      marketA: { id: p.marketA.id, platform: p.marketA.platform, question: p.marketA.question, slug: p.marketA.slug || '', eventSlug: p.marketA.eventSlug },
+      marketB: { id: p.marketB.id, platform: p.marketB.platform, question: p.marketB.question, slug: p.marketB.slug || '', eventSlug: p.marketB.eventSlug },
       confidence: p.confidence,
       matchMethod: p.matchMethod,
       status: p.status,
@@ -619,7 +644,7 @@ export class CrossPlatformArbStrategy implements Strategy {
       return;
     }
 
-    const category = config.bot.marketCategory || undefined;
+    const category = this.getCategory() || undefined;
     const isCategoryFiltered = !!category;
 
     // When filtering by category, fetch ALL markets (pagination handles it).

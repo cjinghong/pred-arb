@@ -37,6 +37,9 @@ export class ApiServer {
   private addManualPair: ((marketAId: string, marketBId: string) => string | null) | null = null;
   private getPositions: (() => unknown[]) | null = null;
   private resetStrategy: (() => void | Promise<void>) | null = null;
+  private refreshMarkets: (() => Promise<void>) | null = null;
+  private getCategory: (() => string) | null = null;
+  private setCategory: ((category: string) => void) | null = null;
   private connectors = new Map<Platform, MarketConnector>();
 
   constructor(
@@ -72,6 +75,17 @@ export class ApiServer {
   /** Wire up strategy reset handler */
   setResetHandler(fn: () => void | Promise<void>): void {
     this.resetStrategy = fn;
+  }
+
+  /** Wire up market refresh handler */
+  setRefreshMarketsHandler(fn: () => Promise<void>): void {
+    this.refreshMarkets = fn;
+  }
+
+  /** Wire up category getter/setter for runtime config */
+  setCategoryHandlers(get: () => string, set: (category: string) => void): void {
+    this.getCategory = get;
+    this.setCategory = set;
   }
 
   /** Wire up connectors for order book fetching */
@@ -117,7 +131,39 @@ export class ApiServer {
         maxTotalExposureUsd: config.bot.maxTotalExposureUsd,
         scanIntervalMs: config.bot.scanIntervalMs,
         minDepthUsd: config.bot.minDepthUsd,
+        marketCategory: this.getCategory ? this.getCategory() : config.bot.marketCategory,
       });
+    });
+
+    this.app.post('/api/config/category', (req, res) => {
+      const { category } = req.body;
+      if (typeof category !== 'string') {
+        res.status(400).json({ error: 'category must be a string' });
+        return;
+      }
+      if (!this.setCategory) {
+        res.status(503).json({ error: 'Category handler not initialized' });
+        return;
+      }
+      this.setCategory(category.toLowerCase().trim());
+      log.info('Market category updated via API', { category });
+      res.json({ category: this.getCategory ? this.getCategory() : category });
+    });
+
+    this.app.post('/api/bot/refresh-markets', async (_req, res) => {
+      if (!this.refreshMarkets) {
+        res.status(503).json({ error: 'Refresh handler not initialized' });
+        return;
+      }
+      try {
+        log.info('Market refresh triggered via dashboard');
+        await this.refreshMarkets();
+        const summary = this.getMarketsSummary ? this.getMarketsSummary() : {};
+        res.json({ success: true, markets: summary });
+      } catch (err) {
+        log.error('Market refresh failed', { error: (err as Error).message });
+        res.status(500).json({ error: (err as Error).message });
+      }
     });
 
     this.app.get('/api/markets', (_req, res) => {

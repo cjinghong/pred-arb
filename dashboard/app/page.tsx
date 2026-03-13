@@ -74,13 +74,15 @@ interface MarketItem {
   id: string;
   question: string;
   category: string;
+  slug: string;
+  eventSlug?: string;
   matched: boolean;
 }
 
 interface MatchedPair {
   pairId: string;
-  marketA: { id: string; platform: string; question: string };
-  marketB: { id: string; platform: string; question: string };
+  marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
+  marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
   confidence: number;
   matchMethod: string;
   status: 'pending' | 'approved' | 'paused' | 'rejected';
@@ -109,9 +111,14 @@ interface WsMessage {
 type ActiveTab = 'opportunities' | 'markets' | 'trades' | 'positions';
 
 // ─── Platform URL helpers ────────────────────────────────────────────────
-function getPlatformMarketUrl(platform: string, marketId: string): string {
-  if (platform === 'polymarket') return `https://polymarket.com/event/${marketId}`;
-  if (platform === 'predictfun') return `https://predict.fun/market/${marketId}`;
+function getPlatformMarketUrl(platform: string, slug: string, marketId: string, eventSlug?: string): string {
+  if (platform === 'polymarket') {
+    if (eventSlug && slug) return `https://polymarket.com/event/${eventSlug}/${slug}`;
+    if (eventSlug) return `https://polymarket.com/event/${eventSlug}`;
+    if (slug) return `https://polymarket.com/event/${slug}`;
+    return `https://polymarket.com/event/${marketId}`;
+  }
+  if (platform === 'predictfun') return slug ? `https://predict.fun/market/${slug}` : `https://predict.fun/market/${marketId}`;
   return '#';
 }
 
@@ -200,6 +207,8 @@ export default function DashboardPage() {
   const [pairSearch, setPairSearch] = useState('');
   const [marketSearch, setMarketSearch] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [marketCategory, setMarketCategory] = useState('');
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -339,6 +348,49 @@ export default function DashboardPage() {
   const sendCommand = async (cmd: string) => {
     const apiBase = getApiBase();
     await fetch(`${apiBase}/api/bot/${cmd}`, { method: 'POST' });
+  };
+
+  // Fetch initial config (category)
+  useEffect(() => {
+    const apiBase = getApiBase();
+    fetch(`${apiBase}/api/config`).then(r => r.json()).then(cfg => {
+      if (cfg.marketCategory !== undefined) setMarketCategory(cfg.marketCategory);
+    }).catch(() => {});
+  }, []);
+
+  const handleRefreshMarkets = async () => {
+    setIsRefreshing(true);
+    try {
+      const apiBase = getApiBase();
+      const resp = await fetch(`${apiBase}/api/bot/refresh-markets`, { method: 'POST' });
+      const data = await resp.json();
+      if (data.markets) setMarketsSummary(data.markets as MarketsSummary);
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Markets refreshed${marketCategory ? ` (${marketCategory})` : ''}`, cls: 'cyan' }, ...prev.slice(0, 49)]);
+    } catch (err) {
+      alert(`Refresh failed: ${(err as Error).message}`);
+    }
+    setIsRefreshing(false);
+  };
+
+  const handleCategoryChange = async (newCategory: string) => {
+    setMarketCategory(newCategory);
+    try {
+      const apiBase = getApiBase();
+      await fetch(`${apiBase}/api/config/category`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category: newCategory }),
+      });
+      // Auto-refresh markets after category change
+      setIsRefreshing(true);
+      const resp = await fetch(`${apiBase}/api/bot/refresh-markets`, { method: 'POST' });
+      const data = await resp.json();
+      if (data.markets) setMarketsSummary(data.markets as MarketsSummary);
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Category → ${newCategory || 'ALL'}, markets refreshed`, cls: 'cyan' }, ...prev.slice(0, 49)]);
+    } catch (err) {
+      alert(`Category update failed: ${(err as Error).message}`);
+    }
+    setIsRefreshing(false);
   };
 
   const handleReset = async () => {
@@ -601,6 +653,44 @@ export default function DashboardPage() {
             {/* ─── MARKETS TAB ─── */}
             {activeTab === 'markets' && (
               <>
+                {/* Category + Refresh bar */}
+                <div className="filter-bar" style={{ alignItems: 'center' }}>
+                  <div className="filter-group">
+                    <span className="filter-label">CATEGORY</span>
+                    <select
+                      className="category-select"
+                      value={marketCategory}
+                      onChange={e => handleCategoryChange(e.target.value)}
+                    >
+                      <option value="">ALL MARKETS</option>
+                      <optgroup label="Sports">
+                        <option value="sports">ALL SPORTS</option>
+                        <option value="basketball">BASKETBALL</option>
+                        <option value="football">FOOTBALL</option>
+                        <option value="soccer">SOCCER</option>
+                        <option value="baseball">BASEBALL</option>
+                        <option value="hockey">HOCKEY</option>
+                        <option value="mma">MMA / UFC</option>
+                        <option value="tennis">TENNIS</option>
+                        <option value="golf">GOLF</option>
+                        <option value="motorsports">MOTORSPORTS</option>
+                        <option value="boxing">BOXING</option>
+                        <option value="cricket">CRICKET</option>
+                      </optgroup>
+                      <optgroup label="Other">
+                        <option value="esports">ESPORTS</option>
+                      </optgroup>
+                    </select>
+                  </div>
+                  <button
+                    className={`btn btn-refresh ${isRefreshing ? 'btn-refreshing' : ''}`}
+                    onClick={handleRefreshMarkets}
+                    disabled={isRefreshing}
+                  >
+                    {isRefreshing ? '↻ REFRESHING...' : '↻ REFRESH MARKETS'}
+                  </button>
+                </div>
+
                 {/* Filter bar */}
                 <div className="filter-bar">
                   <div className="filter-group">
@@ -662,6 +752,14 @@ export default function DashboardPage() {
                                   {pair.marketA.platform.slice(0, 5).toUpperCase()}
                                 </span>
                                 <span className="pair-question">{pair.marketA.question.slice(0, 55)}</span>
+                                <a
+                                  className="platform-link"
+                                  href={getPlatformMarketUrl(pair.marketA.platform, pair.marketA.slug, pair.marketA.id, pair.marketA.eventSlug)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={e => e.stopPropagation()}
+                                  title={`View on ${pair.marketA.platform}`}
+                                >↗</a>
                               </div>
                               <div className="pair-separator">⟷</div>
                               <div className="pair-markets">
@@ -669,6 +767,14 @@ export default function DashboardPage() {
                                   {pair.marketB.platform.slice(0, 5).toUpperCase()}
                                 </span>
                                 <span className="pair-question">{pair.marketB.question.slice(0, 55)}</span>
+                                <a
+                                  className="platform-link"
+                                  href={getPlatformMarketUrl(pair.marketB.platform, pair.marketB.slug, pair.marketB.id, pair.marketB.eventSlug)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={e => e.stopPropagation()}
+                                  title={`View on ${pair.marketB.platform}`}
+                                >↗</a>
                               </div>
                             </div>
                             <div className="pair-meta">
@@ -755,6 +861,14 @@ export default function DashboardPage() {
                     </span>
                     <span className="market-question">{m.question}</span>
                     {m.category && <span className="market-category">{m.category}</span>}
+                    <a
+                      className="platform-link"
+                      href={getPlatformMarketUrl(m.platform, m.slug, m.id, m.eventSlug)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={e => e.stopPropagation()}
+                      title={`View on ${m.platform}`}
+                    >↗</a>
                   </div>
                   );
                 })}
@@ -805,7 +919,7 @@ export default function DashboardPage() {
                   <a
                     className="position-row clickable"
                     key={`${pos.platform}-${pos.marketId}-${i}`}
-                    href={getPlatformMarketUrl(pos.platform, pos.marketId)}
+                    href={getPlatformMarketUrl(pos.platform, '', pos.marketId)}
                     target="_blank"
                     rel="noopener noreferrer"
                   >

@@ -8,8 +8,8 @@ import OrderBookViewer, { BookSelection } from '../orderbook-viewer';
 
 interface MatchedPair {
   pairId: string;
-  marketA: { id: string; platform: string; question: string };
-  marketB: { id: string; platform: string; question: string };
+  marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
+  marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
   confidence: number;
   matchMethod: string;
   status: string;
@@ -25,6 +25,17 @@ function getApiBase(): string {
 
 function formatPct(n: number): string {
   return `${n.toFixed(1)}%`;
+}
+
+function getPlatformMarketUrl(platform: string, slug: string, marketId: string, eventSlug?: string): string {
+  if (platform === 'polymarket') {
+    if (eventSlug && slug) return `https://polymarket.com/event/${eventSlug}/${slug}`;
+    if (eventSlug) return `https://polymarket.com/event/${eventSlug}`;
+    if (slug) return `https://polymarket.com/event/${slug}`;
+    return `https://polymarket.com/event/${marketId}`;
+  }
+  if (platform === 'predictfun') return slug ? `https://predict.fun/market/${slug}` : `https://predict.fun/market/${marketId}`;
+  return '#';
 }
 
 // ─── Page ─────────────────────────────────────────────────────────────────
@@ -122,11 +133,25 @@ function PairPageContent() {
         <div className="pair-page-q">
           <span className={`row-platform platform-${selection.platformA}`}>{selection.platformA.toUpperCase()}</span>
           <span className="pair-page-question-text">{selection.questionA}</span>
+          <a
+            className="platform-link"
+            href={getPlatformMarketUrl(selection.platformA, pair.marketA.slug, selection.marketIdA, pair.marketA.eventSlug)}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`View on ${selection.platformA}`}
+          >↗</a>
         </div>
         <span className="pair-page-separator">⟷</span>
         <div className="pair-page-q">
           <span className={`row-platform platform-${selection.platformB}`}>{selection.platformB?.toUpperCase()}</span>
           <span className="pair-page-question-text">{selection.questionB}</span>
+          <a
+            className="platform-link"
+            href={getPlatformMarketUrl(selection.platformB || '', pair.marketB.slug || '', selection.marketIdB || '', pair.marketB.eventSlug)}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`View on ${selection.platformB}`}
+          >↗</a>
         </div>
       </div>
 

@@ -1121,3 +1121,57 @@ html, body {
   gap: 8px;
   margin-top: 16px;
 }
+
+/* ─── Platform External Link ──────────────────────────────────────────── */
+.platform-link {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 11px;
+  flex-shrink: 0;
+  padding: 0 3px;
+  transition: color 0.15s;
+}
+.platform-link:hover {
+  color: var(--accent-cyan);
+}
+
+/* ─── Category Select ─────────────────────────────────────────────────── */
+.category-select {
+  padding: 4px 8px;
+  border: 1px solid var(--border-bright);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  outline: none;
+  min-width: 140px;
+}
+.category-select:hover { border-color: var(--accent-amber); }
+.category-select:focus { border-color: var(--accent-cyan); }
+.category-select option { background: var(--bg-secondary); color: var(--text-primary); }
+.category-select optgroup { color: var(--accent-amber); font-style: normal; }
+
+/* ─── Refresh Button ──────────────────────────────────────────────────── */
+.btn-refresh {
+  padding: 4px 14px;
+  border: 1px solid var(--accent-cyan);
+  background: rgba(0, 212, 255, 0.06);
+  color: var(--accent-cyan);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.btn-refresh:hover { background: rgba(0, 212, 255, 0.15); box-shadow: 0 0 10px rgba(0, 212, 255, 0.1); }
+.btn-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-refreshing { animation: spin-icon 1s linear infinite; }
+@keyframes spin-icon {
+  0% { opacity: 1; }
+  50% { opacity: 0.5; }
+  100% { opacity: 1; }
+}

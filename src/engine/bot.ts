@@ -95,6 +95,17 @@ export class Bot {
       return xPlatformArb.addManualPair(marketAId, marketBId);
     });
     this.apiServer.setPositionsGetter(() => this.riskManager.getPositions());
+    this.apiServer.setRefreshMarketsHandler(async () => {
+      await xPlatformArb.forceRefreshPairs();
+      // Run a scan after refresh to find new opportunities immediately
+      await xPlatformArb.scan().catch(err =>
+        log.error('Post-refresh scan failed', { error: err.message })
+      );
+    });
+    this.apiServer.setCategoryHandlers(
+      () => xPlatformArb.getCategory(),
+      (cat) => xPlatformArb.setCategory(cat),
+    );
     this.apiServer.setResetHandler(async () => {
       // Reset in-memory state
       xPlatformArb.reset();

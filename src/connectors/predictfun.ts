@@ -73,6 +73,32 @@ interface PredictFunMarketsResponse {
   data: PredictFunRawMarket[];
 }
 
+interface PredictFunRawCategory {
+  id: number;
+  slug: string;                     // URL slug (e.g. "sea-tor-par-2026-03-13")
+  title: string;
+  description: string;
+  imageUrl: string;
+  isNegRisk: boolean;
+  isYieldBearing: boolean;
+  marketVariant: string;
+  variantData: unknown;
+  createdAt: string;
+  publishedAt: string | null;
+  markets: PredictFunRawMarket[];
+  startsAt: string | null;
+  endsAt: string | null;
+  status: string;
+  isVisible: boolean;
+  tags: unknown[];
+}
+
+interface PredictFunCategoriesResponse {
+  success: boolean;
+  cursor: string | null;
+  data: PredictFunRawCategory[];
+}
+
 interface PredictFunOrderBookResponse {
   success: boolean;
   data: PredictFunRawOrderBook;
@@ -217,7 +243,7 @@ export class PredictFunConnector extends BaseConnector {
   async connect(): Promise<void> {
     try {
       // Test REST connectivity — pass auth headers so mainnet doesn't 401
-      await this.httpGet(`${this.apiUrl}/v1/markets?first=1&status=OPEN`, this.getAuthHeaders());
+      await this.httpGet(`${this.apiUrl}/v1/categories?first=1&status=OPEN`, this.getAuthHeaders());
       this._isConnected = true;
       this.emit('connected');
       this.log.info('Connected to predict.fun REST API', { url: this.apiUrl });
@@ -396,29 +422,37 @@ export class PredictFunConnector extends BaseConnector {
       if (sortValue) params.set('sort', sortValue);
     }
 
-    const url = `${this.apiUrl}/v1/markets?${params.toString()}`;
-    const response = await this.httpGet<PredictFunMarketsResponse>(url, this.getAuthHeaders());
+    // Use /v1/categories to get the category slug (needed for frontend URLs)
+    const url = `${this.apiUrl}/v1/categories?${params.toString()}`;
+    const response = await this.httpGet<PredictFunCategoriesResponse>(url, this.getAuthHeaders());
 
-    const markets = response.data || [];
+    const categories = response.data || [];
+    const allMarkets: NormalizedMarket[] = [];
 
-    // ─── Client-side filters ────────────────────────────────────────────
-    // predict.fun API doesn't expose liquidity/volume fields for filtering,
-    // so binary-only and tradingStatus checks are done here
-    return (Array.isArray(markets) ? markets : [])
-      .filter(m => {
-        // Binary markets only
-        if ((m.outcomes || []).length !== 2) return false;
-        // Must be actively tradable
-        if (m.tradingStatus !== 'OPEN') return false;
-        return true;
-      })
-      .map(m => this.normalizeMarket(m));
+    // Each category contains nested markets; extract and normalize with the parent slug
+    for (const cat of (Array.isArray(categories) ? categories : [])) {
+      for (const m of (cat.markets || [])) {
+        // Binary markets only + actively tradable
+        if ((m.outcomes || []).length !== 2) continue;
+        if (m.tradingStatus !== 'OPEN') continue;
+        allMarkets.push(this.normalizeMarket(m, cat.slug));
+      }
+    }
+
+    return allMarkets;
   }
 
   /**
    * Fetch ALL markets in a specific category with pagination.
-   * Uses `category` query param where supported, plus client-side filtering
-   * by `categorySlug` and `marketVariant` for sports markets.
+   *
+   * predict.fun API supports:
+   *   - `marketVariant` param: SPORTS_MATCH, SPORTS_TEAM_MATCH, etc. (server-side)
+   *   - `tagIds` param: comma-separated tag IDs (server-side, via GET /v1/tags)
+   *   - Client-side: filter by `categorySlug` on each raw market
+   *
+   * For broad "sports" we use marketVariant=SPORTS_MATCH (two requests for both variants).
+   * For specific sports (basketball, football, etc.) we filter by categorySlug client-side
+   * plus use SPORTS_MATCH/SPORTS_TEAM_MATCH variant filters to narrow server results.
    */
   private async fetchMarketsByCategory(
     category: string,
@@ -427,9 +461,7 @@ export class PredictFunConnector extends BaseConnector {
     const categorySlugs = PREDICTFUN_CATEGORY_SLUGS[category] || [category];
     const isBroadSports = category === 'sports';
     const allMarkets: NormalizedMarket[] = [];
-    const pageSize = 100;
-    let cursor: string | null = null;
-    const maxPages = 20; // Safety limit: 2000 markets max
+    const seenIds = new Set<number>();
 
     this.log.info('Fetching predict.fun markets by category', {
       category,
@@ -437,43 +469,50 @@ export class PredictFunConnector extends BaseConnector {
       isBroadSports,
     });
 
-    for (let page = 0; page < maxPages; page++) {
-      const params = new URLSearchParams();
-      params.set('first', String(pageSize));
-      if (cursor) params.set('after', cursor);
-      if (options?.activeOnly !== false) params.set('status', 'OPEN');
+    // Fetch for each sports variant (SPORTS_MATCH and SPORTS_TEAM_MATCH)
+    // to get server-side filtering on market type
+    const variants = isBroadSports
+      ? ['SPORTS_MATCH', 'SPORTS_TEAM_MATCH']
+      : ['SPORTS_MATCH', 'SPORTS_TEAM_MATCH'];
 
-      // Try server-side category filter if it's a specific slug
-      if (categorySlugs.length === 1) {
-        params.set('category', categorySlugs[0]);
-      }
+    for (const variant of variants) {
+      let cursor: string | null = null;
+      const pageSize = 100;
+      const maxPages = 20;
 
-      const url = `${this.apiUrl}/v1/markets?${params.toString()}`;
-      const response = await this.httpGet<PredictFunMarketsResponse>(url, this.getAuthHeaders());
+      for (let page = 0; page < maxPages; page++) {
+        const params = new URLSearchParams();
+        params.set('first', String(pageSize));
+        if (cursor) params.set('after', cursor);
+        if (options?.activeOnly !== false) params.set('status', 'OPEN');
+        params.set('marketVariant', variant);
 
-      const markets = response.data || [];
-      if (!markets || markets.length === 0) break;
+        // Use /v1/categories to get the category slug (needed for frontend URLs)
+        const url = `${this.apiUrl}/v1/categories?${params.toString()}`;
+        const response = await this.httpGet<PredictFunCategoriesResponse>(url, this.getAuthHeaders());
 
-      // Client-side filter: binary + open + category match
-      const filtered = markets.filter(m => {
-        if ((m.outcomes || []).length !== 2) return false;
-        if (m.tradingStatus !== 'OPEN') return false;
+        const categories = response.data || [];
+        if (!categories || categories.length === 0) break;
 
-        // Category filtering
-        if (isBroadSports) {
-          // "sports" = any market with a sports variant OR a sports-related category slug
-          return SPORTS_VARIANTS.has(m.marketVariant) ||
-            Object.values(PREDICTFUN_CATEGORY_SLUGS).flat().includes(m.categorySlug);
+        // Each category contains nested markets; extract with parent slug
+        for (const cat of categories) {
+          for (const m of (cat.markets || [])) {
+            if (seenIds.has(m.id)) continue;
+            if ((m.outcomes || []).length !== 2) continue;
+            if (m.tradingStatus !== 'OPEN') continue;
+
+            // For broad sports: accept all sports variants
+            // For specific sport: match by categorySlug on the market
+            if (!isBroadSports && !categorySlugs.includes(m.categorySlug)) continue;
+
+            seenIds.add(m.id);
+            allMarkets.push(this.normalizeMarket(m, cat.slug));
+          }
         }
-        // Specific sport: match by categorySlug
-        return categorySlugs.includes(m.categorySlug);
-      });
 
-      allMarkets.push(...filtered.map(m => this.normalizeMarket(m)));
-
-      // Use cursor-based pagination
-      cursor = response.cursor || null;
-      if (!cursor || markets.length < pageSize) break;
+        cursor = response.cursor || null;
+        if (!cursor || categories.length < pageSize) break;
+      }
     }
 
     this.log.info('predict.fun category fetch complete', {
@@ -953,7 +992,7 @@ export class PredictFunConnector extends BaseConnector {
 
   // ─── Normalization ─────────────────────────────────────────────────────
 
-  private normalizeMarket(raw: PredictFunRawMarket): NormalizedMarket {
+  private normalizeMarket(raw: PredictFunRawMarket, parentCategorySlug?: string): NormalizedMarket {
     const outcomes = (raw.outcomes || []).map(o => o.name || 'Unknown');
     const outcomeTokenIds = (raw.outcomes || []).map(o => o.onChainId || '');
     // predict.fun doesn't return current prices in the markets endpoint;
@@ -964,7 +1003,7 @@ export class PredictFunConnector extends BaseConnector {
       id: String(raw.id),           // numeric → string for our normalized type
       platform: 'predictfun',
       question: raw.question || raw.title,
-      slug: raw.conditionId || '',
+      slug: parentCategorySlug || '',  // URL slug from parent category (for predict.fun/market/{slug})
       category: raw.categorySlug || '',
       outcomes,
       outcomeTokenIds,

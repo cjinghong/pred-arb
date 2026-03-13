@@ -838,11 +838,15 @@ export class PolymarketConnector extends BaseConnector {
     try { outcomePrices = JSON.parse(raw.outcomePrices || '[]').map(Number); } catch { outcomePrices = []; }
     try { tokenIds = JSON.parse(raw.clobTokenIds || '[]'); } catch { tokenIds = []; }
 
+    // Extract event slug from nested events array (Gamma API includes it)
+    const eventSlug = raw.events?.[0]?.slug || '';
+
     return {
       id: raw.id || raw.conditionId,
       platform: 'polymarket',
       question: raw.question,
       slug: raw.slug,
+      eventSlug,
       category: raw.category || '',
       outcomes,
       outcomeTokenIds: tokenIds,

@@ -35,6 +35,8 @@ export interface NormalizedMarket {
   question: string;
   /** URL slug or identifier */
   slug: string;
+  /** Parent event slug (Polymarket only — for building /event/{eventSlug}/{slug} URLs) */
+  eventSlug?: string;
   /** Category / tag */
   category: string;
   /** Outcome labels (usually ["Yes", "No"]) */
