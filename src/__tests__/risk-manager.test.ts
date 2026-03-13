@@ -119,6 +119,7 @@ function createMockConnector(
     placeOrder: vi.fn(),
     cancelOrder: vi.fn(),
     getOpenOrders: vi.fn(),
+    getOrder: vi.fn(),
     getPositions: vi.fn(),
     getBalance: vi.fn().mockResolvedValue(balance),
     on: vi.fn(),

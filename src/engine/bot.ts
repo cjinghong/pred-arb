@@ -31,6 +31,7 @@ export class Bot {
   private riskManager: RiskManager;
   private apiServer: ApiServer;
   private pairRefreshTimer: NodeJS.Timeout | null = null;
+  private balanceRefreshTimer: NodeJS.Timeout | null = null;
   private startTime = Date.now();
 
   constructor() {
@@ -150,6 +151,15 @@ export class Bot {
       }
     }, config.bot.pairRefreshIntervalMs);
 
+    // Periodically refresh cached balances (every 60s)
+    this.balanceRefreshTimer = setInterval(() => {
+      if (this.state === 'RUNNING') {
+        this.riskManager.refreshBalances().catch(err =>
+          log.error('Balance refresh failed', { error: err.message })
+        );
+      }
+    }, 60_000);
+
     log.info('Bot is RUNNING (event-driven mode)', {
       platforms: Array.from(this.connectors.keys()),
       strategies: Array.from(this.strategies.keys()),
@@ -166,6 +176,10 @@ export class Bot {
     if (this.pairRefreshTimer) {
       clearInterval(this.pairRefreshTimer);
       this.pairRefreshTimer = null;
+    }
+    if (this.balanceRefreshTimer) {
+      clearInterval(this.balanceRefreshTimer);
+      this.balanceRefreshTimer = null;
     }
 
     // Shutdown strategies (also stops event-driven scanning)

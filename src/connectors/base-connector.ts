@@ -50,6 +50,7 @@ export abstract class BaseConnector implements MarketConnector {
   abstract placeOrder(order: OrderRequest): Promise<OrderResult>;
   abstract cancelOrder(orderId: string): Promise<boolean>;
   abstract getOpenOrders(): Promise<OrderResult[]>;
+  abstract getOrder(orderId: string): Promise<OrderResult | null>;
   abstract getPositions(): Promise<Position[]>;
   abstract getBalance(): Promise<number>;
 

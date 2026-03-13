@@ -2,12 +2,22 @@
 // PRED-ARB :: Execution Engine
 // Validates opportunities, runs risk checks, executes trades, and handles
 // failed-leg recovery to prevent unhedged directional exposure.
+//
+// Live trading flow:
+//   opportunity:found → submit() → validate → risk check → place leg A →
+//   place leg B → monitor fills → finalize (update positions + P&L)
+//
+// If a leg fails after the other has filled, the recovery system kicks in:
+//   1. RETRY the failed leg (arb may still exist)
+//   2. UNWIND the filled leg (sell back to flatten)
+//   3. ACCEPT the loss (flag for manual review)
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { v4 as uuid } from 'uuid';
 import {
   ArbitrageOpportunity,
   Platform,
+  Position,
   TradeRecord,
   OrderRequest,
   OrderResult,
@@ -18,15 +28,22 @@ import { RiskManager } from './risk-manager';
 import { insertOpportunity, insertTrade, updateTradeStatus, markOpportunityExecuted, updateOpportunityStatus } from '../db/database';
 import { createChildLogger } from '../utils/logger';
 import { eventBus } from '../utils/event-bus';
+import { rateLimit } from '../utils/rate-limiter';
 
 const log = createChildLogger('execution');
 
+// ─── Tuning Constants ────────────────────────────────────────────────────
+
 /** Maximum time to wait for a fill confirmation (ms) */
-const FILL_TIMEOUT_MS = 15_000;
+const FILL_TIMEOUT_MS = 30_000;
+/** Polling interval for fill checks (ms) */
+const FILL_POLL_INTERVAL_MS = 1_500;
 /** Maximum attempts to unwind a stuck leg */
 const MAX_UNWIND_ATTEMPTS = 3;
 /** How long to wait between unwind retries */
 const UNWIND_RETRY_DELAY_MS = 2_000;
+/** Max time between discovering an opportunity and starting execution (ms) — stale filter */
+const MAX_OPP_AGE_MS = 10_000;
 
 // ─── Failed-Leg Recovery Types ────────────────────────────────────────────
 
@@ -62,6 +79,9 @@ export class ExecutionEngine {
   /** Track active recovery operations to prevent double-recovery */
   private activeRecoveries = new Set<string>();
 
+  /** Track opportunities currently being executed to prevent double-execution */
+  private executingOpps = new Set<string>();
+
   constructor(riskManager: RiskManager, dryRun = true) {
     this.riskManager = riskManager;
     this.dryRun = dryRun;
@@ -89,6 +109,19 @@ export class ExecutionEngine {
    * The opportunity goes through validation → risk check → execution pipeline.
    */
   async submit(opportunity: ArbitrageOpportunity): Promise<void> {
+    // Dedup: don't execute the same opportunity twice
+    if (this.executingOpps.has(opportunity.id)) {
+      log.debug('Opportunity already executing, skipping', { id: opportunity.id.slice(0, 8) });
+      return;
+    }
+
+    // Stale check: reject opportunities that are too old
+    const ageMs = Date.now() - opportunity.discoveredAt.getTime();
+    if (ageMs > MAX_OPP_AGE_MS) {
+      log.info('Opportunity too old, skipping', { id: opportunity.id.slice(0, 8), ageMs });
+      return;
+    }
+
     // Persist the opportunity
     insertOpportunity(opportunity);
 
@@ -112,6 +145,7 @@ export class ExecutionEngine {
       const opp = this.queue.shift()!;
 
       try {
+        this.executingOpps.add(opp.id);
         await this.executeOpportunity(opp);
       } catch (err) {
         log.error('Failed to execute opportunity', {
@@ -119,6 +153,8 @@ export class ExecutionEngine {
           error: (err as Error).message,
         });
         updateOpportunityStatus(opp.id, 'failed', (err as Error).message);
+      } finally {
+        this.executingOpps.delete(opp.id);
       }
     }
 
@@ -128,7 +164,7 @@ export class ExecutionEngine {
   private async executeOpportunity(opp: ArbitrageOpportunity): Promise<void> {
     const tradeId = uuid();
 
-    // Step 1: Re-validate with the strategy
+    // Step 1: Re-validate with the strategy (re-fetches books to confirm arb still exists)
     const strategy = this.strategies.get(opp.strategyId);
     if (strategy) {
       const stillValid = await strategy.validate(opp);
@@ -139,7 +175,7 @@ export class ExecutionEngine {
       }
     }
 
-    // Step 2: Risk check
+    // Step 2: Risk check (balance, exposure, position limits)
     updateOpportunityStatus(opp.id, 'executing');
     const riskResult = await this.riskManager.checkOpportunity(opp);
     if (!riskResult.approved) {
@@ -244,6 +280,7 @@ export class ExecutionEngine {
 
     let resultA: OrderResult;
     try {
+      await rateLimit(opp.legA.platform);
       resultA = await connA.placeOrder(orderA);
       trade.legA = resultA;
       log.info('Leg A placed', {
@@ -278,6 +315,7 @@ export class ExecutionEngine {
 
     let resultB: OrderResult;
     try {
+      await rateLimit(opp.legB.platform);
       resultB = await connB.placeOrder(orderB);
       trade.legB = resultB;
       log.info('Leg B placed', {
@@ -334,20 +372,21 @@ export class ExecutionEngine {
     trade.legB = resultB;
     trade.fees = resultA.fees + resultB.fees;
 
-    await this.monitorAndFinalize(trade, opp, resultA, resultB);
+    await this.monitorAndFinalize(trade, opp, resultA, resultB, size);
   }
 
   /**
-   * After both legs are placed, wait for fills and handle the outcome.
+   * After both legs are placed, poll for fills and handle the outcome.
+   * Uses getOrder() for precise single-order lookups, falling back to
+   * getOpenOrders() if getOrder() isn't supported or fails.
    */
   private async monitorAndFinalize(
     trade: TradeRecord,
     opp: ArbitrageOpportunity,
     resultA: OrderResult,
     resultB: OrderResult,
+    size: number,
   ): Promise<void> {
-    // Wait briefly for fills to confirm (many platforms fill limit orders instantly
-    // if there's sufficient liquidity on the book)
     const [finalA, finalB] = await Promise.all([
       this.waitForFill(opp.legA.platform, resultA, FILL_TIMEOUT_MS),
       this.waitForFill(opp.legB.platform, resultB, FILL_TIMEOUT_MS),
@@ -358,9 +397,10 @@ export class ExecutionEngine {
     const bFilled = finalB.status === 'FILLED' || finalB.status === 'PARTIALLY_FILLED';
 
     if (bothFilled) {
-      // Happy path — both legs filled
+      // ── Happy path — both legs filled ──────────────────────────────
+      const hedgedSize = Math.min(finalA.filledSize, finalB.filledSize);
       const realizedProfit =
-        1 * Math.min(finalA.filledSize, finalB.filledSize) -
+        1 * hedgedSize -
         finalA.avgFillPrice * finalA.filledSize -
         finalB.avgFillPrice * finalB.filledSize -
         (finalA.fees + finalB.fees);
@@ -370,16 +410,23 @@ export class ExecutionEngine {
         fees: finalA.fees + finalB.fees,
       });
       markOpportunityExecuted(opp.id);
+
+      // Track positions in risk manager
+      this.recordPositions(opp, finalA, finalB);
+
+      trade.status = 'EXECUTED';
+      trade.legA = finalA;
+      trade.legB = finalB;
       eventBus.emit('trade:executed', trade);
 
       log.info('Trade executed successfully', {
         id: trade.id.slice(0, 8),
         realizedProfit: `$${realizedProfit.toFixed(2)}`,
-        fillA: finalA.filledSize,
-        fillB: finalB.filledSize,
+        fillA: `${finalA.filledSize} @ ${finalA.avgFillPrice.toFixed(3)}`,
+        fillB: `${finalB.filledSize} @ ${finalB.avgFillPrice.toFixed(3)}`,
+        totalFees: `$${(finalA.fees + finalB.fees).toFixed(4)}`,
       });
     } else if (aFilled && !bFilled) {
-      // Leg A filled, leg B didn't
       log.warn('PARTIAL EXECUTION — Leg A filled, Leg B not filled', {
         legA: `${finalA.status} (${finalA.filledSize}/${finalA.size})`,
         legB: `${finalB.status} (${finalB.filledSize}/${finalB.size})`,
@@ -393,7 +440,6 @@ export class ExecutionEngine {
         opportunity: opp,
       });
     } else if (bFilled && !aFilled) {
-      // Leg B filled, leg A didn't
       log.warn('PARTIAL EXECUTION — Leg B filled, Leg A not filled', {
         legA: `${finalA.status} (${finalA.filledSize}/${finalA.size})`,
         legB: `${finalB.status} (${finalB.filledSize}/${finalB.size})`,
@@ -413,19 +459,59 @@ export class ExecutionEngine {
         legB: finalB.status,
       });
 
-      const connA = this.connectors.get(opp.legA.platform);
-      const connB = this.connectors.get(opp.legB.platform);
       await Promise.allSettled([
-        connA?.cancelOrder(finalA.id),
-        connB?.cancelOrder(finalB.id),
+        connA_cancel(this.connectors.get(opp.legA.platform), finalA.id),
+        connA_cancel(this.connectors.get(opp.legB.platform), finalB.id),
       ]);
 
       updateTradeStatus(trade.id, 'FAILED', {
-        notes: `Neither leg filled. A: ${finalA.status}, B: ${finalB.status}`,
+        notes: `Neither leg filled within ${FILL_TIMEOUT_MS / 1000}s. A: ${finalA.status}, B: ${finalB.status}`,
       });
       updateOpportunityStatus(opp.id, 'failed', `Neither leg filled. A: ${finalA.status}, B: ${finalB.status}`);
       eventBus.emit('trade:failed', { tradeId: trade.id, error: 'Neither leg filled' });
     }
+  }
+
+  /**
+   * After a successful arb execution, record the hedged positions
+   * in the risk manager so exposure tracking stays accurate.
+   */
+  private recordPositions(
+    opp: ArbitrageOpportunity,
+    fillA: OrderResult,
+    fillB: OrderResult,
+  ): void {
+    const posA: Position = {
+      platform: opp.legA.platform,
+      marketId: opp.legA.marketId,
+      marketQuestion: opp.legA.marketQuestion,
+      outcomeIndex: opp.legA.outcomeIndex,
+      side: opp.legA.outcome,
+      size: fillA.filledSize,
+      avgEntryPrice: fillA.avgFillPrice,
+      currentPrice: fillA.avgFillPrice,
+      unrealizedPnl: 0,
+    };
+
+    const posB: Position = {
+      platform: opp.legB.platform,
+      marketId: opp.legB.marketId,
+      marketQuestion: opp.legB.marketQuestion,
+      outcomeIndex: opp.legB.outcomeIndex,
+      side: opp.legB.outcome,
+      size: fillB.filledSize,
+      avgEntryPrice: fillB.avgFillPrice,
+      currentPrice: fillB.avgFillPrice,
+      unrealizedPnl: 0,
+    };
+
+    this.riskManager.addPosition(posA);
+    this.riskManager.addPosition(posB);
+
+    log.info('Positions recorded', {
+      legA: `${posA.side} ${posA.size} @ ${posA.avgEntryPrice.toFixed(3)} on ${posA.platform}`,
+      legB: `${posB.side} ${posB.size} @ ${posB.avgEntryPrice.toFixed(3)} on ${posB.platform}`,
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -466,6 +552,7 @@ export class ExecutionEngine {
 
         const conn = this.connectors.get(failedPlatform);
         if (conn) {
+          await rateLimit(failedPlatform);
           await conn.cancelOrder(ctx.failedLeg.id).catch(() => {});
         }
       }
@@ -513,6 +600,7 @@ export class ExecutionEngine {
       // Try to cancel the placed-but-unfilled leg
       const conn = this.connectors.get(ctx.filledPlatform);
       if (conn) {
+        await rateLimit(ctx.filledPlatform);
         const cancelled = await conn.cancelOrder(ctx.filledLeg.id).catch(() => false);
         if (cancelled) {
           return { type: 'ACCEPT_LOSS', reason: 'Filled leg had 0 fills, successfully cancelled' };
@@ -563,6 +651,7 @@ export class ExecutionEngine {
 
       try {
         // Re-fetch order book to get current price
+        await rateLimit(failedPlatform);
         const currentBook = await conn.fetchOrderBook(
           failedOppLeg.marketId,
           failedOppLeg.outcomeIndex,
@@ -599,6 +688,7 @@ export class ExecutionEngine {
           size: ctx.filledLeg.filledSize || ctx.filledLeg.size,
         };
 
+        await rateLimit(failedPlatform);
         const result = await conn.placeOrder(retryOrder);
 
         if (result.status === 'FILLED' || result.status === 'PENDING' || result.status === 'OPEN') {
@@ -618,6 +708,14 @@ export class ExecutionEngine {
             });
 
             markOpportunityExecuted(ctx.opportunity.id);
+
+            // Record positions for the recovered trade
+            this.recordPositions(
+              ctx.opportunity,
+              ctx.filledLeg,
+              final,
+            );
+
             log.info('Failed-leg retry SUCCEEDED', {
               tradeId: ctx.tradeId.slice(0, 8),
               attempt,
@@ -627,6 +725,7 @@ export class ExecutionEngine {
           }
 
           // Didn't fill — cancel and try again
+          await rateLimit(failedPlatform);
           await conn.cancelOrder(final.id).catch(() => {});
         }
       } catch (err) {
@@ -668,6 +767,7 @@ export class ExecutionEngine {
 
       try {
         // Fetch current book to find a sellable price
+        await rateLimit(ctx.filledPlatform);
         const book = await conn.fetchOrderBook(
           filledOppLeg.marketId,
           filledOppLeg.outcomeIndex,
@@ -690,6 +790,7 @@ export class ExecutionEngine {
           size: ctx.filledLeg.filledSize || ctx.filledLeg.size,
         };
 
+        await rateLimit(ctx.filledPlatform);
         const result = await conn.placeOrder(unwindOrder);
         const final = await this.waitForFill(ctx.filledPlatform, result, FILL_TIMEOUT_MS);
 
@@ -718,6 +819,7 @@ export class ExecutionEngine {
         }
 
         // Didn't fill — cancel and retry
+        await rateLimit(ctx.filledPlatform);
         await conn.cancelOrder(final.id).catch(() => {});
       } catch (err) {
         log.error(`Unwind attempt ${attempt} failed`, { error: (err as Error).message });
@@ -764,13 +866,15 @@ export class ExecutionEngine {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Helpers
+  // FILL MONITORING
+  //
+  // Uses getOrder() for precise single-order lookups (preferred).
+  // Falls back to getOpenOrders() list scan if getOrder() fails.
+  // If the order disappears from open orders, we assume it filled.
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
    * Poll the order status until it fills or the timeout expires.
-   * In practice, platforms often fill limits instantly if there's book depth,
-   * so this is mostly a safety net.
    */
   private async waitForFill(
     platform: Platform,
@@ -786,35 +890,102 @@ export class ExecutionEngine {
     if (!conn) return order;
 
     const deadline = Date.now() + timeoutMs;
-    const pollInterval = 1000;
+    let lastKnown = order;
+    let consecutiveErrors = 0;
 
     while (Date.now() < deadline) {
-      await sleep(pollInterval);
+      await sleep(FILL_POLL_INTERVAL_MS);
 
       try {
-        // Check open orders to find our order's current status
+        await rateLimit(platform);
+
+        // Prefer getOrder() for precise lookup
+        const single = await conn.getOrder(order.id);
+
+        if (single) {
+          lastKnown = single;
+          consecutiveErrors = 0;
+
+          if (single.status === 'FILLED') {
+            log.info('Order filled', { orderId: order.id, platform, filledSize: single.filledSize });
+            return single;
+          }
+          if (single.status === 'FAILED' || single.status === 'CANCELLED') {
+            return single;
+          }
+          if (single.status === 'PARTIALLY_FILLED' && single.filledSize >= order.size * 0.99) {
+            // Close enough to fully filled (rounding)
+            return { ...single, status: 'FILLED' };
+          }
+          // Still open — keep waiting
+          continue;
+        }
+
+        // getOrder() returned null — order may have been filled and removed
+        // Double-check via getOpenOrders()
+        await rateLimit(platform);
         const openOrders = await conn.getOpenOrders();
         const found = openOrders.find(o => o.id === order.id);
 
         if (found) {
+          lastKnown = found;
           if (found.status === 'FILLED') return found;
           if (found.status === 'FAILED' || found.status === 'CANCELLED') return found;
-          // Still open — keep waiting
+          // Still open
         } else {
-          // Order not in open orders — may have been filled and removed
-          // Return the original with updated status assumption
-          return { ...order, status: 'FILLED', filledSize: order.size, avgFillPrice: order.price };
+          // Not in open orders AND getOrder returned null → assume filled
+          log.info('Order disappeared from open orders — assuming filled', {
+            orderId: order.id,
+            platform,
+          });
+          return {
+            ...order,
+            status: 'FILLED',
+            filledSize: order.size,
+            avgFillPrice: order.price,
+          };
         }
-      } catch {
-        // API error — continue polling
+
+        consecutiveErrors = 0;
+      } catch (err) {
+        consecutiveErrors++;
+        log.warn('Fill poll error', {
+          orderId: order.id,
+          platform,
+          error: (err as Error).message,
+          consecutiveErrors,
+        });
+
+        // After 3 consecutive errors, stop polling to avoid hammering a broken API
+        if (consecutiveErrors >= 3) {
+          log.error('Too many consecutive poll errors, returning last known state', {
+            orderId: order.id,
+          });
+          return lastKnown;
+        }
       }
     }
 
-    // Timeout reached — return current state
-    return order;
+    // Timeout reached — return last known state
+    log.warn('Fill timeout reached', {
+      orderId: order.id,
+      platform,
+      lastStatus: lastKnown.status,
+      timeoutMs,
+    });
+    return lastKnown;
   }
 }
 
+// ─── Helpers ────────────────────────────────────────────────────────────
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Safe cancel helper — ignores missing connectors */
+async function connA_cancel(conn: MarketConnector | undefined, orderId: string): Promise<void> {
+  if (conn && orderId && orderId !== 'NEVER_PLACED') {
+    await conn.cancelOrder(orderId).catch(() => {});
+  }
 }

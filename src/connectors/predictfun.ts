@@ -683,6 +683,52 @@ export class PredictFunConnector extends BaseConnector {
     }
   }
 
+  async getOrder(orderId: string): Promise<OrderResult | null> {
+    await this.ensureAuthenticated();
+
+    try {
+      // predict.fun GET /v1/orders?id=<orderId>
+      const response = await this.httpGet<any>(
+        `${this.apiUrl}/v1/orders?id=${encodeURIComponent(orderId)}`,
+        this.getAuthHeaders(),
+      );
+
+      const orders = response?.data || [];
+      const o = Array.isArray(orders) ? orders[0] : orders;
+      if (!o) return null;
+
+      const orderData = o.order || {};
+      const side = orderData.side === 0 ? 'BUY' as const : 'SELL' as const;
+      const makerAmount = Number(BigInt(orderData.makerAmount || '0')) / 1e18;
+      const takerAmount = Number(BigInt(orderData.takerAmount || '0')) / 1e18;
+      const price = side === 'BUY'
+        ? (takerAmount > 0 ? makerAmount / takerAmount : 0)
+        : (makerAmount > 0 ? takerAmount / makerAmount : 0);
+      const amount = Number(BigInt(o.amount || '0')) / 1e18;
+      const amountFilled = Number(BigInt(o.amountFilled || '0')) / 1e18;
+
+      return {
+        id: o.id || orderData.hash || orderId,
+        platform: 'predictfun' as Platform,
+        marketId: String(o.marketId || ''),
+        outcomeIndex: 0,
+        side,
+        type: (o.strategy || 'LIMIT') as 'LIMIT' | 'MARKET',
+        price,
+        size: amount,
+        filledSize: amountFilled,
+        avgFillPrice: amountFilled > 0 ? price : 0,
+        status: this.mapPredictFunStatus(o.status),
+        timestamp: new Date(),
+        fees: amountFilled > 0 ? PredictFunConnector.calculateTakerFee(price, amountFilled) : 0,
+        raw: o,
+      };
+    } catch (err) {
+      this.log.error('Failed to get order', { orderId, error: (err as Error).message });
+      return null;
+    }
+  }
+
   async getPositions(): Promise<Position[]> {
     await this.ensureAuthenticated();
 

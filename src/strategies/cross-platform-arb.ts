@@ -23,6 +23,7 @@ import {
 import { MarketConnector } from '../types/connector';
 import { MarketMatcher, MarketPair, PairStatus } from '../matcher/market-matcher';
 import { LLMVerifier } from '../matcher/llm-verifier';
+import { PredictFunConnector } from '../connectors/predictfun';
 import { upsertMarketPair, getAllMarketPairs, updatePairStatus as dbUpdatePairStatus } from '../db/database';
 import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
@@ -287,18 +288,35 @@ export class CrossPlatformArbStrategy implements Strategy {
         connB.fetchOrderBook(opportunity.legB.marketId, opportunity.legB.outcomeIndex),
       ]);
 
-      // Check if the combined cost is still < $1 (profitable arb)
+      // Check if the combined cost is still < $1 (profitable arb) including fees
       const costA = bookA.bestAsk ?? 1;
       const costB = bookB.bestAsk ?? 1;
-
       const totalCost = costA + costB;
-      const profitBps = ((1 - totalCost) / totalCost) * 10000;
+
+      // Include estimated fees in the profitability check
+      const feesPerShare = this.estimateFees(opportunity.legA.platform, costA, 1)
+                         + this.estimateFees(opportunity.legB.platform, costB, 1);
+      const profitPerShare = 1 - totalCost - feesPerShare;
+      const profitBps = totalCost > 0 ? (profitPerShare / totalCost) * 10000 : 0;
 
       return profitBps >= this.config.minProfitBps;
     } catch (err) {
       log.warn('Validation failed', { error: (err as Error).message });
       return false;
     }
+  }
+
+  /**
+   * Estimate taker fees per share for a platform.
+   * - Polymarket: 0 (no fees)
+   * - predict.fun: 2% × min(price, 1 - price) per share
+   */
+  private estimateFees(platform: Platform, price: number, shares: number): number {
+    if (platform === 'predictfun') {
+      return PredictFunConnector.calculateTakerFee(price, shares);
+    }
+    // Polymarket has no fees
+    return 0;
   }
 
   getMetrics(): StrategyMetrics {
@@ -625,14 +643,18 @@ export class CrossPlatformArbStrategy implements Strategy {
       const costYesA = bookAYes.bestAsk;
       const costNoB = 1 - bookBYes.bestBid;
       const totalCost = costYesA + costNoB;
-      const profitPerShare = 1 - totalCost;
+
+      const maxSizeA = bookAYes.asks[0]?.size ?? 0;
+      const maxSizeB = bookBYes.bids[0]?.size ?? 0;
+      const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
+
+      // Estimate fees: predict.fun charges taker fees, Polymarket doesn't
+      const feesPerShare = this.estimateFees(pair.marketA.platform, costYesA, 1)
+                         + this.estimateFees(pair.marketB.platform, costNoB, 1);
+      const profitPerShare = 1 - totalCost - feesPerShare;
       const profitBps = totalCost > 0 ? (profitPerShare / totalCost) * 10000 : 0;
 
       if (profitBps >= this.config.minProfitBps) {
-        const maxSizeA = bookAYes.asks[0]?.size ?? 0;
-        const maxSizeB = bookBYes.bids[0]?.size ?? 0;
-        const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
-
         if (minDepthUsd <= 0 || maxSize * totalCost >= minDepthUsd) {
           opportunities.push(this.createOpportunity(
             pair, 'YES', costYesA, bookAYes, maxSizeA,
@@ -654,14 +676,18 @@ export class CrossPlatformArbStrategy implements Strategy {
       const costNoA = 1 - bookAYes.bestBid;
       const costYesB = bookBYes.bestAsk;
       const totalCost = costNoA + costYesB;
-      const profitPerShare = 1 - totalCost;
+
+      const maxSizeA = bookAYes.bids[0]?.size ?? 0;
+      const maxSizeB = bookBYes.asks[0]?.size ?? 0;
+      const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
+
+      // Estimate fees
+      const feesPerShare = this.estimateFees(pair.marketA.platform, costNoA, 1)
+                         + this.estimateFees(pair.marketB.platform, costYesB, 1);
+      const profitPerShare = 1 - totalCost - feesPerShare;
       const profitBps = totalCost > 0 ? (profitPerShare / totalCost) * 10000 : 0;
 
       if (profitBps >= this.config.minProfitBps) {
-        const maxSizeA = bookAYes.bids[0]?.size ?? 0;
-        const maxSizeB = bookBYes.asks[0]?.size ?? 0;
-        const maxSize = Math.min(maxSizeA, maxSizeB, this.config.maxPositionUsd / totalCost);
-
         if (minDepthUsd <= 0 || maxSize * totalCost >= minDepthUsd) {
           opportunities.push(this.createOpportunity(
             pair, 'NO', costNoA, bookAYes, maxSizeA,

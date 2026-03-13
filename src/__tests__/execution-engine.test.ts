@@ -142,6 +142,7 @@ function createMockConnector(platform: Platform): MarketConnector {
     placeOrder: vi.fn().mockResolvedValue(createMockOrderResult('order-1')),
     cancelOrder: vi.fn().mockResolvedValue(true),
     getOpenOrders: vi.fn().mockResolvedValue([]),
+    getOrder: vi.fn().mockResolvedValue(null),
     getPositions: vi.fn().mockResolvedValue([]),
     getBalance: vi.fn().mockResolvedValue(10000),
     on: vi.fn(),

@@ -185,6 +185,10 @@ class MockMarketConnector implements MarketConnector {
     return [...this.openOrders];
   }
 
+  async getOrder(orderId: string): Promise<OrderResult | null> {
+    return this.openOrders.find(o => o.id === orderId) || null;
+  }
+
   async getPositions(): Promise<Position[]> {
     return [...this.positions];
   }

@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: Risk Manager
-// Pre-trade risk checks, position limits, and exposure tracking
+// Pre-trade risk checks, position limits, exposure tracking, and
+// periodic balance caching to avoid rate-limiting platform APIs.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { ArbitrageOpportunity, Platform, Position } from '../types';
@@ -8,8 +9,12 @@ import { MarketConnector } from '../types/connector';
 import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
 import { eventBus } from '../utils/event-bus';
+import { rateLimit } from '../utils/rate-limiter';
 
 const log = createChildLogger('risk');
+
+/** How often to refresh balance caches (ms) */
+const BALANCE_CACHE_TTL_MS = 30_000; // 30 seconds
 
 export interface RiskCheckResult {
   approved: boolean;
@@ -17,9 +22,17 @@ export interface RiskCheckResult {
   adjustedSize?: number;
 }
 
+interface CachedBalance {
+  balance: number;
+  fetchedAt: number;
+}
+
 export class RiskManager {
   private positions: Position[] = [];
   private connectors = new Map<Platform, MarketConnector>();
+
+  /** Cached balances per platform to avoid hammering APIs */
+  private balanceCache = new Map<Platform, CachedBalance>();
 
   /** Maximum total exposure across all platforms */
   private maxTotalExposure = config.bot.maxTotalExposureUsd;
@@ -38,7 +51,14 @@ export class RiskManager {
     log.info('Risk manager initialized', {
       maxExposure: this.maxTotalExposure,
       maxPosition: this.maxPositionSize,
+      maxOpenPositions: this.maxOpenPositions,
+      reserveRatio: this.reserveRatio,
     });
+
+    // Prime the balance cache
+    this.refreshBalances().catch(err =>
+      log.warn('Initial balance fetch failed', { error: err.message })
+    );
   }
 
   /**
@@ -86,11 +106,11 @@ export class RiskManager {
       return { approved: true, reason: 'Size adjusted for position limit', adjustedSize };
     }
 
-    // 4. Check available balance on both platforms
+    // 4. Check available balance on both platforms (using cached values)
     try {
       const [balA, balB] = await Promise.all([
-        this.connectors.get(opp.legA.platform)?.getBalance() ?? Promise.resolve(0),
-        this.connectors.get(opp.legB.platform)?.getBalance() ?? Promise.resolve(0),
+        this.getCachedBalance(opp.legA.platform),
+        this.getCachedBalance(opp.legB.platform),
       ]);
 
       const costA = opp.legA.price * opp.maxSize;
@@ -102,8 +122,18 @@ export class RiskManager {
         const adjustedSize = Math.min(maxAffordableA, maxAffordableB);
 
         if (adjustedSize <= 0) {
-          return { approved: false, reason: 'Insufficient balance on one or both platforms' };
+          return {
+            approved: false,
+            reason: `Insufficient balance. ${opp.legA.platform}: $${balA.toFixed(2)}, ${opp.legB.platform}: $${balB.toFixed(2)}`,
+          };
         }
+
+        log.info('Position size adjusted for available balance', {
+          original: opp.maxSize,
+          adjusted: adjustedSize,
+          balA,
+          balB,
+        });
         return { approved: true, reason: 'Size adjusted for available balance', adjustedSize };
       }
     } catch (err) {
@@ -119,6 +149,64 @@ export class RiskManager {
 
     return { approved: true, reason: 'All risk checks passed' };
   }
+
+  // ─── Balance Caching ────────────────────────────────────────────────────
+
+  /**
+   * Get the cached balance for a platform, refreshing if stale.
+   */
+  private async getCachedBalance(platform: Platform): Promise<number> {
+    const cached = this.balanceCache.get(platform);
+    if (cached && Date.now() - cached.fetchedAt < BALANCE_CACHE_TTL_MS) {
+      return cached.balance;
+    }
+
+    // Cache miss or stale — fetch fresh
+    const conn = this.connectors.get(platform);
+    if (!conn) return 0;
+
+    try {
+      await rateLimit(platform);
+      const balance = await conn.getBalance();
+      this.balanceCache.set(platform, { balance, fetchedAt: Date.now() });
+      return balance;
+    } catch (err) {
+      log.warn('Failed to refresh balance', { platform, error: (err as Error).message });
+      // Return stale cache if available, else 0
+      return cached?.balance ?? 0;
+    }
+  }
+
+  /**
+   * Refresh all platform balances. Called periodically by the bot.
+   */
+  async refreshBalances(): Promise<void> {
+    const results = await Promise.allSettled(
+      Array.from(this.connectors.entries()).map(async ([platform, conn]) => {
+        await rateLimit(platform);
+        const balance = await conn.getBalance();
+        this.balanceCache.set(platform, { balance, fetchedAt: Date.now() });
+        return { platform, balance };
+      })
+    );
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        log.info('Balance cached', result.value);
+      } else {
+        log.warn('Balance refresh failed', { error: result.reason });
+      }
+    }
+  }
+
+  /**
+   * Invalidate balance cache for a platform (e.g., after a trade executes).
+   */
+  invalidateBalance(platform: Platform): void {
+    this.balanceCache.delete(platform);
+  }
+
+  // ─── Exposure & Positions ───────────────────────────────────────────────
 
   /** Get current total exposure across all positions */
   getCurrentExposure(): number {
@@ -136,10 +224,28 @@ export class RiskManager {
   /** Add a new position after trade execution */
   addPosition(position: Position): void {
     this.positions.push(position);
+    // Invalidate the balance cache for this platform since funds were used
+    this.invalidateBalance(position.platform);
+    log.info('Position added', {
+      platform: position.platform,
+      market: position.marketQuestion.slice(0, 50),
+      side: position.side,
+      size: position.size,
+      price: position.avgEntryPrice,
+    });
   }
 
   /** Get all tracked positions */
   getPositions(): Position[] {
     return [...this.positions];
+  }
+
+  /** Get cached balances (for dashboard display) */
+  getBalances(): Record<Platform, number> {
+    const result: Partial<Record<Platform, number>> = {};
+    for (const [platform, cached] of this.balanceCache) {
+      result[platform] = cached.balance;
+    }
+    return result as Record<Platform, number>;
   }
 }

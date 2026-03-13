@@ -84,6 +84,9 @@ export interface MarketConnector {
   /** Get current open orders */
   getOpenOrders(): Promise<OrderResult[]>;
 
+  /** Get a single order by ID (for fill monitoring) */
+  getOrder(orderId: string): Promise<OrderResult | null>;
+
   /** Get current positions */
   getPositions(): Promise<Position[]>;
 
