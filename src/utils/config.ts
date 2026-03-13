@@ -54,6 +54,13 @@ export const config = {
     pairRefreshIntervalMs: envInt('PAIR_REFRESH_INTERVAL_MS', 300000),
     /** Dry-run mode: when true, no real trades are placed. Default: true (safe). */
     dryRun: process.env.DRY_RUN !== 'false',
+    /**
+     * Market category filter. Restricts market fetching to a specific category.
+     * Values: '' (all markets), 'sports', 'basketball', 'football', 'soccer',
+     *         'baseball', 'hockey', 'mma', 'tennis', 'golf', 'motorsports', etc.
+     * When set, fetches ALL markets in that category (pagination) instead of top-200 by volume.
+     */
+    marketCategory: (process.env.MARKET_CATEGORY || '').toLowerCase().trim(),
   },
 
   dashboard: {

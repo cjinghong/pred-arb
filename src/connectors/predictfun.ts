@@ -87,6 +87,34 @@ interface PredictFunAuthMessage {
   message: string;
 }
 
+// ─── Category → predict.fun Mapping ──────────────────────────────────────
+// predict.fun uses `categorySlug` on raw markets and supports `category` query param.
+// We also filter by `marketVariant` for sports-specific types.
+const PREDICTFUN_CATEGORY_SLUGS: Record<string, string[]> = {
+  sports: [], // empty = match any sports variant
+  basketball: ['basketball'],
+  nba: ['basketball'],       // NBA is under basketball slug
+  football: ['football'],
+  nfl: ['football'],
+  soccer: ['soccer'],
+  baseball: ['baseball'],
+  mlb: ['baseball'],
+  hockey: ['hockey'],
+  nhl: ['hockey'],
+  mma: ['mma'],
+  ufc: ['mma'],
+  tennis: ['tennis'],
+  golf: ['golf'],
+  motorsports: ['motorsports'],
+  f1: ['motorsports'],
+  boxing: ['boxing'],
+  cricket: ['cricket'],
+  esports: ['esports'],
+};
+
+/** Market variants that indicate sports markets */
+const SPORTS_VARIANTS = new Set(['SPORTS_MATCH', 'SPORTS_TEAM_MATCH']);
+
 // ─── Connector Implementation ────────────────────────────────────────────
 
 export class PredictFunConnector extends BaseConnector {
@@ -342,6 +370,11 @@ export class PredictFunConnector extends BaseConnector {
   // ─── Market Data ───────────────────────────────────────────────────────
 
   async fetchMarkets(options?: FetchMarketsOptions): Promise<NormalizedMarket[]> {
+    // If a category is specified, use paginated fetching to get ALL markets in that category
+    if (options?.category) {
+      return this.fetchMarketsByCategory(options.category, options);
+    }
+
     const params = new URLSearchParams();
     params.set('first', String(options?.limit ?? 100));
     if (options?.offset) params.set('after', String(options.offset));
@@ -380,6 +413,75 @@ export class PredictFunConnector extends BaseConnector {
         return true;
       })
       .map(m => this.normalizeMarket(m));
+  }
+
+  /**
+   * Fetch ALL markets in a specific category with pagination.
+   * Uses `category` query param where supported, plus client-side filtering
+   * by `categorySlug` and `marketVariant` for sports markets.
+   */
+  private async fetchMarketsByCategory(
+    category: string,
+    options?: FetchMarketsOptions,
+  ): Promise<NormalizedMarket[]> {
+    const categorySlugs = PREDICTFUN_CATEGORY_SLUGS[category] || [category];
+    const isBroadSports = category === 'sports';
+    const allMarkets: NormalizedMarket[] = [];
+    const pageSize = 100;
+    let cursor: string | null = null;
+    const maxPages = 20; // Safety limit: 2000 markets max
+
+    this.log.info('Fetching predict.fun markets by category', {
+      category,
+      categorySlugs,
+      isBroadSports,
+    });
+
+    for (let page = 0; page < maxPages; page++) {
+      const params = new URLSearchParams();
+      params.set('first', String(pageSize));
+      if (cursor) params.set('after', cursor);
+      if (options?.activeOnly !== false) params.set('status', 'OPEN');
+
+      // Try server-side category filter if it's a specific slug
+      if (categorySlugs.length === 1) {
+        params.set('category', categorySlugs[0]);
+      }
+
+      const url = `${this.apiUrl}/v1/markets?${params.toString()}`;
+      const response = await this.httpGet<PredictFunMarketsResponse>(url, this.getAuthHeaders());
+
+      const markets = response.data || [];
+      if (!markets || markets.length === 0) break;
+
+      // Client-side filter: binary + open + category match
+      const filtered = markets.filter(m => {
+        if ((m.outcomes || []).length !== 2) return false;
+        if (m.tradingStatus !== 'OPEN') return false;
+
+        // Category filtering
+        if (isBroadSports) {
+          // "sports" = any market with a sports variant OR a sports-related category slug
+          return SPORTS_VARIANTS.has(m.marketVariant) ||
+            Object.values(PREDICTFUN_CATEGORY_SLUGS).flat().includes(m.categorySlug);
+        }
+        // Specific sport: match by categorySlug
+        return categorySlugs.includes(m.categorySlug);
+      });
+
+      allMarkets.push(...filtered.map(m => this.normalizeMarket(m)));
+
+      // Use cursor-based pagination
+      cursor = response.cursor || null;
+      if (!cursor || markets.length < pageSize) break;
+    }
+
+    this.log.info('predict.fun category fetch complete', {
+      category,
+      totalMarkets: allMarkets.length,
+    });
+
+    return allMarkets;
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {

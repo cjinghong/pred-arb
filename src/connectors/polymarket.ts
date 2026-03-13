@@ -139,6 +139,32 @@ interface PolymarketRawOrderBook {
   hash?: string;
 }
 
+// ─── Category → Polymarket Tag Mapping ───────────────────────────────────
+// Polymarket Gamma API supports `tag` (slug name) for filtering.
+// These are the known tag slugs for sports categories.
+const POLYMARKET_CATEGORY_TAGS: Record<string, string> = {
+  sports: 'sports',
+  basketball: 'basketball',
+  nba: 'nba',
+  ncaa: 'ncaa-basketball',
+  football: 'football',
+  nfl: 'nfl',
+  soccer: 'soccer',
+  baseball: 'baseball',
+  mlb: 'mlb',
+  hockey: 'hockey',
+  nhl: 'nhl',
+  mma: 'mma',
+  ufc: 'ufc',
+  tennis: 'tennis',
+  golf: 'golf',
+  motorsports: 'motorsports',
+  f1: 'formula-1',
+  boxing: 'boxing',
+  cricket: 'cricket',
+  esports: 'esports',
+};
+
 // ─── Connector Implementation ────────────────────────────────────────────
 
 export class PolymarketConnector extends BaseConnector {
@@ -316,6 +342,11 @@ export class PolymarketConnector extends BaseConnector {
   // ─── Market Data ───────────────────────────────────────────────────────
 
   async fetchMarkets(options?: FetchMarketsOptions): Promise<NormalizedMarket[]> {
+    // If a category is specified, use paginated fetching to get ALL markets in that category
+    if (options?.category) {
+      return this.fetchMarketsByCategory(options.category, options);
+    }
+
     const params = new URLSearchParams();
     params.set('limit', String(options?.limit ?? 100));
     if (options?.offset) params.set('offset', String(options.offset));
@@ -358,6 +389,71 @@ export class PolymarketConnector extends BaseConnector {
         }
       })
       .map(m => this.normalizeMarket(m));
+  }
+
+  /**
+   * Fetch ALL markets in a specific category using Polymarket's `tag` param.
+   * Paginates through all results (100 per page) to get every market.
+   */
+  private async fetchMarketsByCategory(
+    category: string,
+    options?: FetchMarketsOptions,
+  ): Promise<NormalizedMarket[]> {
+    // Map the user-facing category to a Polymarket tag slug
+    const tag = POLYMARKET_CATEGORY_TAGS[category] || category;
+    const allMarkets: NormalizedMarket[] = [];
+    const pageSize = 100;
+    let offset = 0;
+    const maxPages = 20; // Safety limit: 2000 markets max
+
+    this.log.info('Fetching Polymarket markets by category', { category, tag });
+
+    for (let page = 0; page < maxPages; page++) {
+      const params = new URLSearchParams();
+      params.set('limit', String(pageSize));
+      params.set('offset', String(offset));
+      params.set('tag', tag);
+      if (options?.activeOnly !== false) params.set('active', 'true');
+      params.set('closed', 'false');
+      if (options?.minLiquidity) params.set('liquidity_num_min', String(options.minLiquidity));
+      if (options?.sortBy) {
+        const sortFieldMap: Record<string, string> = {
+          liquidity: 'liquidity', volume: 'volume', updatedAt: 'updatedAt',
+        };
+        params.set('order', sortFieldMap[options.sortBy] || options.sortBy);
+        params.set('ascending', String(options.sortDirection === 'asc'));
+      }
+
+      const raw = await this.httpGet<PolymarketRawMarket[]>(
+        `${this.gammaUrl}/markets?${params.toString()}`
+      );
+
+      if (!raw || raw.length === 0) break;
+
+      const binaryMarkets = raw.filter(m => {
+        try {
+          const outcomes = JSON.parse(m.outcomes || '[]');
+          return outcomes.length === 2;
+        } catch {
+          return false;
+        }
+      });
+
+      allMarkets.push(...binaryMarkets.map(m => this.normalizeMarket(m)));
+      offset += raw.length;
+
+      // If we got fewer than pageSize, we've reached the end
+      if (raw.length < pageSize) break;
+    }
+
+    this.log.info('Polymarket category fetch complete', {
+      category,
+      tag,
+      totalMarkets: allMarkets.length,
+      pages: Math.ceil(offset / pageSize),
+    });
+
+    return allMarkets;
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {

@@ -619,10 +619,21 @@ export class CrossPlatformArbStrategy implements Strategy {
       return;
     }
 
-    const baseOpts = { activeOnly: true, limit: 200, sortBy: 'volume' as const, sortDirection: 'desc' as const };
+    const category = config.bot.marketCategory || undefined;
+    const isCategoryFiltered = !!category;
+
+    // When filtering by category, fetch ALL markets (pagination handles it).
+    // Without category, fetch top-200 by volume as before.
+    const baseOpts = {
+      activeOnly: true,
+      limit: isCategoryFiltered ? 100 : 200,  // page size when paginating; cap when not
+      sortBy: 'volume' as const,
+      sortDirection: 'desc' as const,
+      category,
+    };
 
     const [marketsA, marketsB] = await Promise.all([
-      connA.fetchMarkets({ ...baseOpts, minLiquidity: 100 }),
+      connA.fetchMarkets({ ...baseOpts, minLiquidity: isCategoryFiltered ? 0 : 100 }),
       connB.fetchMarkets(baseOpts),
     ]);
 
