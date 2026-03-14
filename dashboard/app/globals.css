@@ -429,6 +429,7 @@ html, body {
 }
 .platform-polymarket { background: rgba(102, 51, 255, 0.15); color: #aa88ff; border: 1px solid rgba(102, 51, 255, 0.3); }
 .platform-predictfun { background: rgba(0, 212, 255, 0.1); color: var(--accent-cyan); border: 1px solid rgba(0, 212, 255, 0.2); }
+.platform-kalshi { background: rgba(255, 165, 0, 0.12); color: #ffb347; border: 1px solid rgba(255, 165, 0, 0.3); }
 
 .row-question { flex: 1; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-outcome {

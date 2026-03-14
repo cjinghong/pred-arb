@@ -19,6 +19,7 @@ const buckets = new Map<string, Bucket>();
 const DEFAULT_LIMITS: Record<Platform, number> = {
   polymarket: 8,   // Polymarket CLOB: ~10 req/s, be conservative
   predictfun: 5,   // predict.fun: ~8 req/s, be conservative
+  kalshi: 10,      // Kalshi: ~10 req/s
 };
 
 /**

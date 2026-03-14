@@ -25,6 +25,7 @@ import { MarketConnector } from '../types/connector';
 import { MarketMatcher, MarketPair, PairStatus } from '../matcher/market-matcher';
 import { LLMVerifier } from '../matcher/llm-verifier';
 import { PredictFunConnector } from '../connectors/predictfun';
+import { KalshiConnector } from '../connectors/kalshi';
 import { upsertMarketPair, getAllMarketPairs, updatePairStatus as dbUpdatePairStatus } from '../db/database';
 import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
@@ -37,7 +38,7 @@ export class CrossPlatformArbStrategy implements Strategy {
   readonly name = 'Cross-Platform Arbitrage';
   readonly description =
     'Finds equivalent markets across platforms and exploits price discrepancies in order books';
-  readonly platforms: Platform[] = ['polymarket', 'predictfun'];
+  readonly platforms: Platform[] = ['polymarket', 'predictfun', 'kalshi'];
 
   private _state: StrategyState = 'IDLE';
   private connectors = new Map<Platform, MarketConnector>();
@@ -355,6 +356,9 @@ export class CrossPlatformArbStrategy implements Strategy {
     if (platform === 'predictfun') {
       return PredictFunConnector.calculateTakerFee(price, shares);
     }
+    if (platform === 'kalshi') {
+      return KalshiConnector.calculateTakerFee(price, shares);
+    }
     // Polymarket has no fees
     return 0;
   }
@@ -637,42 +641,69 @@ export class CrossPlatformArbStrategy implements Strategy {
 
     log.info('Refreshing market pairs...');
 
-    const connA = this.connectors.get('polymarket');
-    const connB = this.connectors.get('predictfun');
-    if (!connA || !connB) {
-      log.warn('Missing connectors — cannot refresh pairs');
+    // Get all connected platforms
+    const activePlatforms: Platform[] = [];
+    for (const [platform, conn] of this.connectors) {
+      if (conn.isConnected) activePlatforms.push(platform);
+    }
+
+    if (activePlatforms.length < 2) {
+      log.warn('Need at least 2 connected platforms for arbitrage', { activePlatforms });
       return;
     }
 
     const category = this.getCategory() || undefined;
     const isCategoryFiltered = !!category;
 
-    // When filtering by category, fetch ALL markets (pagination handles it).
-    // Without category, fetch top-200 by volume as before.
+    // Fetch markets from ALL active platforms in parallel
     const baseOpts = {
       activeOnly: true,
-      limit: isCategoryFiltered ? 100 : 200,  // page size when paginating; cap when not
+      limit: isCategoryFiltered ? 100 : 200,
       sortBy: 'volume' as const,
       sortDirection: 'desc' as const,
       category,
     };
 
-    const [marketsA, marketsB] = await Promise.all([
-      connA.fetchMarkets({ ...baseOpts, minLiquidity: isCategoryFiltered ? 0 : 100 }),
-      connB.fetchMarkets(baseOpts),
-    ]);
-
-    // Cache for dashboard visibility
-    this.lastFetchedMarkets.set('polymarket', marketsA);
-    this.lastFetchedMarkets.set('predictfun', marketsB);
-
-    log.info('Markets fetched', {
-      polymarket: marketsA.length,
-      predictfun: marketsB.length,
+    const fetchPromises = activePlatforms.map(async (platform) => {
+      const conn = this.connectors.get(platform)!;
+      const opts = platform === 'polymarket'
+        ? { ...baseOpts, minLiquidity: isCategoryFiltered ? 0 : 100 }
+        : baseOpts;
+      const markets = await conn.fetchMarkets(opts);
+      return { platform, markets };
     });
 
+    const fetchResults = await Promise.all(fetchPromises);
+
+    // Cache for dashboard visibility
+    const platformMarkets = new Map<Platform, NormalizedMarket[]>();
+    for (const { platform, markets } of fetchResults) {
+      this.lastFetchedMarkets.set(platform, markets);
+      platformMarkets.set(platform, markets);
+      log.info(`Markets fetched from ${platform}`, { count: markets.length });
+    }
+
+    // Pairwise matching: for N platforms, run matching on each unique pair combo
+    // e.g., for 3 platforms: (PM, PRED), (PM, KAL), (PRED, KAL)
     const oldPairIds = new Set(this.cachedPairs.map(p => `${p.marketA.id}:${p.marketB.id}`));
-    this.cachedPairs = await this.matcher.findPairs(marketsA, marketsB);
+    const allPairs: MarketPair[] = [];
+
+    for (let i = 0; i < activePlatforms.length; i++) {
+      for (let j = i + 1; j < activePlatforms.length; j++) {
+        const platA = activePlatforms[i];
+        const platB = activePlatforms[j];
+        const marketsA = platformMarkets.get(platA) || [];
+        const marketsB = platformMarkets.get(platB) || [];
+
+        if (marketsA.length === 0 || marketsB.length === 0) continue;
+
+        log.info(`Matching ${platA} (${marketsA.length}) ↔ ${platB} (${marketsB.length})`);
+        const pairs = await this.matcher.findPairs(marketsA, marketsB);
+        allPairs.push(...pairs);
+      }
+    }
+
+    this.cachedPairs = allPairs;
     this.lastPairRefresh = Date.now();
 
     // Rebuild the reverse index: marketId → pairs
@@ -702,7 +733,7 @@ export class CrossPlatformArbStrategy implements Strategy {
     }
 
     // Subscribe to WebSocket order book updates for newly matched pairs
-    this.subscribeToMatchedPairs(connA, connB, oldPairIds);
+    this.subscribeToMatchedPairsMultiPlatform(oldPairIds);
   }
 
   /**
@@ -731,38 +762,37 @@ export class CrossPlatformArbStrategy implements Strategy {
 
   /**
    * Subscribe connectors to WebSocket order book feeds for all matched pairs.
+   * Groups new markets by platform and subscribes each connector.
    */
-  private subscribeToMatchedPairs(
-    connA: MarketConnector,
-    connB: MarketConnector,
-    oldPairIds: Set<string>,
-  ): void {
-    const newMarketsA: NormalizedMarket[] = [];
-    const newMarketsB: NormalizedMarket[] = [];
+  private subscribeToMatchedPairsMultiPlatform(oldPairIds: Set<string>): void {
+    // Group new markets by platform
+    const newMarketsByPlatform = new Map<Platform, NormalizedMarket[]>();
 
     for (const pair of this.cachedPairs) {
       const pairId = `${pair.marketA.id}:${pair.marketB.id}`;
       if (!oldPairIds.has(pairId)) {
-        newMarketsA.push(pair.marketA);
-        newMarketsB.push(pair.marketB);
+        // Add market A
+        const listA = newMarketsByPlatform.get(pair.marketA.platform) ?? [];
+        listA.push(pair.marketA);
+        newMarketsByPlatform.set(pair.marketA.platform, listA);
+
+        // Add market B
+        const listB = newMarketsByPlatform.get(pair.marketB.platform) ?? [];
+        listB.push(pair.marketB);
+        newMarketsByPlatform.set(pair.marketB.platform, listB);
       }
     }
 
-    if (newMarketsA.length > 0) {
-      try {
-        connA.subscribeOrderBooks(newMarketsA);
-        log.info(`Subscribed ${newMarketsA.length} new markets on ${connA.platform} for WS books`);
-      } catch (err) {
-        log.warn('Failed to subscribe WS books on platform A', { error: (err as Error).message });
-      }
-    }
+    for (const [platform, markets] of newMarketsByPlatform) {
+      if (markets.length === 0) continue;
+      const conn = this.connectors.get(platform);
+      if (!conn) continue;
 
-    if (newMarketsB.length > 0) {
       try {
-        connB.subscribeOrderBooks(newMarketsB);
-        log.info(`Subscribed ${newMarketsB.length} new markets on ${connB.platform} for WS books`);
+        conn.subscribeOrderBooks(markets);
+        log.info(`Subscribed ${markets.length} new markets on ${platform} for WS books`);
       } catch (err) {
-        log.warn('Failed to subscribe WS books on platform B', { error: (err as Error).message });
+        log.warn(`Failed to subscribe WS books on ${platform}`, { error: (err as Error).message });
       }
     }
   }

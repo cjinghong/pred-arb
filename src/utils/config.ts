@@ -72,6 +72,19 @@ export const config = {
     path: env('DB_PATH', './data/pred-arb.db'),
   },
 
+  kalshi: {
+    apiKeyId: process.env.KALSHI_API_KEY_ID || '',
+    // RSA private key — either inline (newlines as \n) or path to PEM file
+    privateKey: process.env.KALSHI_PRIVATE_KEY || '',
+    privateKeyPath: process.env.KALSHI_PRIVATE_KEY_PATH || '',
+    apiUrl: 'https://api.elections.kalshi.com/trade-api/v2',
+    wsUrl: 'wss://api.elections.kalshi.com/trade-api/ws/v2',
+    // Demo/sandbox mode: use demo API endpoints
+    useDemo: process.env.KALSHI_USE_DEMO === 'true',
+    demoApiUrl: 'https://demo-api.kalshi.co/trade-api/v2',
+    demoWsUrl: 'wss://demo-api.kalshi.co/trade-api/ws/v2',
+  },
+
   anthropic: {
     apiKey: process.env.ANTHROPIC_API_KEY || '',
   },

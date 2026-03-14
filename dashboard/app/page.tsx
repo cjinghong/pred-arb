@@ -119,6 +119,7 @@ function getPlatformMarketUrl(platform: string, slug: string, marketId: string, 
     return `https://polymarket.com/event/${marketId}`;
   }
   if (platform === 'predictfun') return slug ? `https://predict.fun/market/${slug}` : `https://predict.fun/market/${marketId}`;
+  if (platform === 'kalshi') return `https://kalshi.com/markets/${marketId.toLowerCase()}`;
   return '#';
 }
 

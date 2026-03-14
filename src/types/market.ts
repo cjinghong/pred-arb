@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** Supported prediction market platforms */
-export type Platform = 'polymarket' | 'predictfun';
+export type Platform = 'polymarket' | 'predictfun' | 'kalshi';
 
 /** Outcome side in a binary market */
 export type OutcomeSide = 'YES' | 'NO';

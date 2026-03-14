@@ -285,36 +285,86 @@ export class MarketMatcher {
       }
     }
 
-    // ─── Pass 1: Cross-reference via polymarketConditionIds ─────────────
-    // predict.fun markets have polymarketConditionIds[] that map to Polymarket conditionIds
-    const polyConditionMap = new Map<string, NormalizedMarket>();
-    for (const a of marketsA) {
-      if (usedA.has(a.id)) continue;
-      const raw = a.raw as { conditionId?: string } | undefined;
-      if (raw?.conditionId) {
-        polyConditionMap.set(raw.conditionId.toLowerCase(), a);
+    // ─── Pass 1: Cross-reference matching ──────────────────────────────
+    // Supports multiple cross-reference fields:
+    //   - predict.fun → Polymarket: polymarketConditionIds[] ↔ conditionId
+    //   - predict.fun → Kalshi:     kalshiMarketTicker ↔ ticker
+    //   - Polymarket  → Kalshi:     conditionId (if Kalshi provides it)
+    //
+    // We build lookup maps from both sides and check all known cross-ref fields.
+
+    // Build condition/ticker lookup maps from BOTH sides
+    const polyConditionMap = new Map<string, NormalizedMarket>(); // conditionId → market
+    const kalshiTickerMap = new Map<string, NormalizedMarket>();   // ticker → market
+
+    for (const m of [...marketsA, ...marketsB]) {
+      if (usedA.has(m.id) || usedB.has(m.id)) continue;
+      const raw = m.raw as Record<string, unknown> | undefined;
+      if (!raw) continue;
+
+      // Polymarket markets have conditionId
+      if (raw.conditionId && typeof raw.conditionId === 'string') {
+        polyConditionMap.set(raw.conditionId.toLowerCase(), m);
+      }
+      // Kalshi markets are keyed by ticker (= market.id for Kalshi)
+      if (m.platform === 'kalshi') {
+        kalshiTickerMap.set(m.id.toLowerCase(), m);
       }
     }
 
-    for (const b of marketsB) {
-      if (usedB.has(b.id)) continue;
-      const raw = b.raw as { polymarketConditionIds?: string[] } | undefined;
-      const polyIds = raw?.polymarketConditionIds || [];
-      for (const condId of polyIds) {
-        const match = polyConditionMap.get(condId.toLowerCase());
-        if (match && !usedA.has(match.id)) {
-          const pairId = MarketMatcher.pairId(match.id, b.id);
-          pairs.push({
-            pairId,
-            marketA: match,
-            marketB: b,
-            confidence: 1.0,
-            matchMethod: 'cross_reference',
-            status: this.pairStatuses.get(pairId) || 'approved',
-          });
-          usedA.add(match.id);
-          usedB.add(b.id);
-          break;
+    // Check cross-references from both marketsA and marketsB
+    const allMarketsList = [
+      { markets: marketsA, usedSet: usedA, otherUsed: usedB },
+      { markets: marketsB, usedSet: usedB, otherUsed: usedA },
+    ];
+
+    for (const { markets, usedSet, otherUsed } of allMarketsList) {
+      for (const m of markets) {
+        if (usedSet.has(m.id)) continue;
+        const raw = m.raw as Record<string, unknown> | undefined;
+        if (!raw) continue;
+
+        // predict.fun → Polymarket cross-reference
+        const polyIds = raw.polymarketConditionIds as string[] | undefined;
+        if (polyIds && Array.isArray(polyIds)) {
+          for (const condId of polyIds) {
+            const match = polyConditionMap.get(condId.toLowerCase());
+            if (match && match.id !== m.id && !otherUsed.has(match.id) && !usedSet.has(match.id)) {
+              const pairId = MarketMatcher.pairId(m.id, match.id);
+              pairs.push({
+                pairId,
+                marketA: match, // Polymarket side
+                marketB: m,     // predict.fun side
+                confidence: 1.0,
+                matchMethod: 'cross_reference',
+                status: this.pairStatuses.get(pairId) || 'approved',
+              });
+              usedSet.add(m.id);
+              otherUsed.add(match.id);
+              break;
+            }
+          }
+        }
+
+        if (usedSet.has(m.id)) continue;
+
+        // predict.fun → Kalshi cross-reference via kalshiMarketTicker
+        const kalshiTicker = raw.kalshiMarketTicker as string | null | undefined;
+        if (kalshiTicker && typeof kalshiTicker === 'string') {
+          const match = kalshiTickerMap.get(kalshiTicker.toLowerCase());
+          if (match && match.id !== m.id && !otherUsed.has(match.id) && !usedSet.has(match.id)) {
+            const pairId = MarketMatcher.pairId(m.id, match.id);
+            pairs.push({
+              pairId,
+              marketA: m,     // predict.fun side
+              marketB: match, // Kalshi side
+              confidence: 1.0,
+              matchMethod: 'cross_reference',
+              status: this.pairStatuses.get(pairId) || 'approved',
+            });
+            usedSet.add(m.id);
+            otherUsed.add(match.id);
+          }
         }
       }
     }
@@ -583,10 +633,10 @@ export class MarketMatcher {
 
 Two markets are "the same" if they would resolve identically — same event, same resolution criteria, same timeframe. Be careful with similar-but-different questions (e.g., "by end of 2026" vs "by March 2026" are NOT the same).
 
-LIST A (Platform: Polymarket):
+LIST A:
 ${listA}
 
-LIST B (Platform: predict.fun):
+LIST B:
 ${listB}
 
 Return ONLY a JSON array of matched pairs. If a market has no match, omit it. For each match include your confidence (0.0-1.0) and brief reasoning:
@@ -696,22 +746,40 @@ Only include matches you're confident about (>= 0.85). Return [] if no matches f
       }
     }
 
-    // Cross-reference
-    const polyConditionMap = new Map<string, NormalizedMarket>();
-    for (const a of marketsA) {
-      if (usedA.has(a.id)) continue;
-      const raw = a.raw as { conditionId?: string } | undefined;
-      if (raw?.conditionId) polyConditionMap.set(raw.conditionId.toLowerCase(), a);
+    // Cross-reference (polymarketConditionIds + kalshiMarketTicker)
+    const polyConditionMap2 = new Map<string, NormalizedMarket>();
+    const kalshiTickerMap2 = new Map<string, NormalizedMarket>();
+    for (const m of [...marketsA, ...marketsB]) {
+      if (usedA.has(m.id) || usedB.has(m.id)) continue;
+      const raw = m.raw as Record<string, unknown> | undefined;
+      if (raw?.conditionId && typeof raw.conditionId === 'string') polyConditionMap2.set(raw.conditionId.toLowerCase(), m);
+      if (m.platform === 'kalshi') kalshiTickerMap2.set(m.id.toLowerCase(), m);
     }
-    for (const b of marketsB) {
-      if (usedB.has(b.id)) continue;
-      const raw = b.raw as { polymarketConditionIds?: string[] } | undefined;
-      for (const condId of (raw?.polymarketConditionIds || [])) {
-        const match = polyConditionMap.get(condId.toLowerCase());
-        if (match && !usedA.has(match.id)) {
-          const pairId = MarketMatcher.pairId(match.id, b.id);
-          pairs.push({ pairId, marketA: match, marketB: b, confidence: 1.0, matchMethod: 'cross_reference', status: this.pairStatuses.get(pairId) || 'approved' });
-          usedA.add(match.id); usedB.add(b.id); break;
+    for (const m of [...marketsA, ...marketsB]) {
+      if (usedA.has(m.id) || usedB.has(m.id)) continue;
+      const raw = m.raw as Record<string, unknown> | undefined;
+      if (!raw) continue;
+      // polymarketConditionIds cross-ref
+      const polyIds = raw.polymarketConditionIds as string[] | undefined;
+      if (polyIds && Array.isArray(polyIds)) {
+        for (const condId of polyIds) {
+          const match = polyConditionMap2.get(condId.toLowerCase());
+          if (match && match.id !== m.id && !usedA.has(match.id) && !usedB.has(match.id)) {
+            const pairId = MarketMatcher.pairId(m.id, match.id);
+            pairs.push({ pairId, marketA: match, marketB: m, confidence: 1.0, matchMethod: 'cross_reference', status: this.pairStatuses.get(pairId) || 'approved' });
+            usedA.add(match.id); usedB.add(m.id); break;
+          }
+        }
+      }
+      if (usedA.has(m.id) || usedB.has(m.id)) continue;
+      // kalshiMarketTicker cross-ref
+      const kalshiTicker = raw.kalshiMarketTicker as string | null | undefined;
+      if (kalshiTicker && typeof kalshiTicker === 'string') {
+        const match = kalshiTickerMap2.get(kalshiTicker.toLowerCase());
+        if (match && match.id !== m.id && !usedA.has(match.id) && !usedB.has(match.id)) {
+          const pairId = MarketMatcher.pairId(m.id, match.id);
+          pairs.push({ pairId, marketA: m, marketB: match, confidence: 1.0, matchMethod: 'cross_reference', status: this.pairStatuses.get(pairId) || 'approved' });
+          usedA.add(m.id); usedB.add(match.id);
         }
       }
     }

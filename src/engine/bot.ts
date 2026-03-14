@@ -12,6 +12,7 @@ import { MarketConnector } from '../types/connector';
 import { Strategy } from '../types/strategy';
 import { PolymarketConnector } from '../connectors/polymarket';
 import { PredictFunConnector } from '../connectors/predictfun';
+import { KalshiConnector } from '../connectors/kalshi';
 import { CrossPlatformArbStrategy } from '../strategies/cross-platform-arb';
 import { ExecutionEngine } from './execution-engine';
 import { RiskManager } from './risk-manager';
@@ -56,18 +57,25 @@ export class Bot {
     // 2. Create and connect connectors
     const polymarket = new PolymarketConnector();
     const predictfun = new PredictFunConnector();
+    const kalshi = new KalshiConnector();
 
     this.connectors.set('polymarket', polymarket);
     this.connectors.set('predictfun', predictfun);
+    this.connectors.set('kalshi', kalshi);
 
-    // Connect to all platforms
-    const connectResults = await Promise.allSettled([
-      polymarket.connect(),
-      predictfun.connect(),
-    ]);
+    // Connect to all platforms (failures are non-fatal — bot runs with available platforms)
+    const platformConnectors: Array<{ platform: string; connector: MarketConnector }> = [
+      { platform: 'polymarket', connector: polymarket },
+      { platform: 'predictfun', connector: predictfun },
+      { platform: 'kalshi', connector: kalshi },
+    ];
+
+    const connectResults = await Promise.allSettled(
+      platformConnectors.map(({ connector }) => connector.connect())
+    );
 
     for (const [i, result] of connectResults.entries()) {
-      const platform = i === 0 ? 'polymarket' : 'predictfun';
+      const { platform } = platformConnectors[i];
       if (result.status === 'rejected') {
         log.error(`Failed to connect to ${platform}`, { error: result.reason });
       } else {
