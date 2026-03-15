@@ -41,6 +41,15 @@ export interface SportsMarketInfo {
    * Two markets with the same matchKey are the same event.
    */
   matchKey: string;
+  /**
+   * Which team outcome 0 (YES) represents on this market.
+   * Critical for cross-platform outcome alignment:
+   * - Polymarket: YES = first listed team in outcomes array (e.g., "Suns" in ["Suns", "Celtics"])
+   * - Kalshi: YES = the team in the market ticker (e.g., PHX in KXNBAGAME-26MAR16PHXBOS-PHX)
+   * - predict.fun: YES = first listed team
+   * If two matched markets have different yesTeam values, outcomes are inverted.
+   */
+  yesTeam?: string;
 }
 
 /** A market enriched with category-specific metadata */

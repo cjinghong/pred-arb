@@ -66,7 +66,7 @@ export abstract class BaseConnector implements MarketConnector {
     this.events.emit(event, event, data);
   }
 
-  /** HTTP fetch with error handling and retries */
+  /** HTTP fetch with error handling and retries (skips retries for 4xx client errors) */
   protected async httpGet<T>(url: string, headers?: Record<string, string>): Promise<T> {
     const maxRetries = 3;
     let lastError: Error | null = null;
@@ -78,17 +78,26 @@ export abstract class BaseConnector implements MarketConnector {
         });
 
         if (!res.ok) {
-          throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+          const body = await res.text();
+          const err = new Error(`HTTP ${res.status}: ${body}`);
+          // 4xx client errors are permanent — don't retry (e.g., 404 "No orderbook exists")
+          if (res.status >= 400 && res.status < 500) {
+            throw err;
+          }
+          throw err;
         }
 
         return (await res.json()) as T;
       } catch (err) {
         lastError = err as Error;
-        if (attempt < maxRetries - 1) {
-          const delay = Math.pow(2, attempt) * 500;
-          this.log.warn(`Request failed, retrying in ${delay}ms`, { url, attempt, error: (err as Error).message });
-          await new Promise(r => setTimeout(r, delay));
+        // Don't retry 4xx errors — they're permanent failures
+        const is4xx = lastError.message.startsWith('HTTP 4');
+        if (is4xx || attempt >= maxRetries - 1) {
+          break;
         }
+        const delay = Math.pow(2, attempt) * 500;
+        this.log.warn(`Request failed, retrying in ${delay}ms`, { url, attempt, error: lastError.message });
+        await new Promise(r => setTimeout(r, delay));
       }
     }
 

@@ -926,7 +926,10 @@ export class PolymarketConnector extends BaseConnector {
     try { tokenIds = JSON.parse(raw.clobTokenIds || '[]'); } catch { tokenIds = []; }
 
     // Extract event slug from nested events array (Gamma API includes it)
-    const eventSlug = raw.events?.[0]?.slug || '';
+    // The events array may include { id, slug, title, ... }; sometimes slug is missing
+    // and we get numeric IDs instead — filter those out since URLs need the text slug
+    const rawEventSlug = raw.events?.[0]?.slug || '';
+    const eventSlug = rawEventSlug && !/^\d+$/.test(String(rawEventSlug)) ? String(rawEventSlug) : '';
 
     return {
       id: raw.id || raw.conditionId,

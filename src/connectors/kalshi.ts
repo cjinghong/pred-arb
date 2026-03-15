@@ -83,7 +83,13 @@ interface KalshiMarketsResponse {
 }
 
 interface KalshiRawOrderBook {
-  orderbook: {
+  // Current Kalshi API format: orderbook_fp with dollar-string arrays
+  orderbook_fp?: {
+    yes_dollars: Array<[string, string]>;  // [price_dollars, count_fp] e.g. ["0.42", "13.00"]
+    no_dollars: Array<[string, string]>;   // [price_dollars, count_fp] e.g. ["0.38", "5.00"]
+  };
+  // Legacy format (kept for backward compatibility)
+  orderbook?: {
     yes: Array<[number, number]>;  // [price_cents, quantity]
     no: Array<[number, number]>;   // [price_cents, quantity]
   };
@@ -512,6 +518,7 @@ export class KalshiConnector extends BaseConnector {
     }
 
     const allMarkets: DiscoveredMarket[] = [];
+    const seenIds = new Set<string>();
 
     for (const { league: lg, ticker } of tickers) {
       try {
@@ -528,6 +535,19 @@ export class KalshiConnector extends BaseConnector {
 
         const markets = (response.markets || [])
           .filter(m => m.status === 'open' || m.status === 'active')
+          .filter(m => {
+            if (seenIds.has(m.ticker)) return false;
+            seenIds.add(m.ticker);
+            return true;
+          })
+          // Deduplicate by event_ticker: Kalshi creates 2 markets per game (one per team).
+          // Keep only the first (higher-volume) market per event to avoid duplicate matches.
+          .filter(m => {
+            const eventKey = m.event_ticker || m.ticker;
+            if (seenIds.has(`evt:${eventKey}`)) return false;
+            seenIds.add(`evt:${eventKey}`);
+            return true;
+          })
           .map(m => {
             const normalized = this.normalizeMarket(m);
             const discovered: DiscoveredMarket = { ...normalized };
@@ -578,7 +598,7 @@ export class KalshiConnector extends BaseConnector {
 
   async fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook> {
     const response = await this.kalshiGet<KalshiRawOrderBook>(
-      `${this.apiUrl}/markets/${marketId}/orderbook`
+      `${this.apiUrl}/markets/${marketId}/orderbook?depth=20`
     );
 
     return this.normalizeOrderBook(response, marketId, outcomeIndex);
@@ -822,12 +842,26 @@ export class KalshiConnector extends BaseConnector {
 
   // ─── Normalization ─────────────────────────────────────────────────────
 
+  /** Slugify a subtitle string for Kalshi URLs (e.g., "Professional Basketball Game" → "professional-basketball-game") */
+  private slugifySubtitle(subtitle: string): string {
+    return subtitle
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
+
   private normalizeMarket(raw: KalshiRawMarket): NormalizedMarket {
+    // Kalshi URL format: /markets/{event_ticker}/{subtitle_slug}/{market_ticker}
+    // e.g., /markets/kxnbagame/professional-basketball-game/kxnbagame-26mar16lalhou
+    const subtitleSlug = raw.subtitle ? this.slugifySubtitle(raw.subtitle) : '';
     const market: NormalizedMarket = {
       id: raw.ticker,
       platform: 'kalshi',
       question: raw.title,
-      slug: raw.ticker.toLowerCase(), // Kalshi uses tickers as URL identifiers
+      slug: subtitleSlug || raw.ticker.toLowerCase(), // subtitle slug for URL middle segment
+      eventSlug: raw.event_ticker?.toLowerCase() || '', // event_ticker for URL first segment
       category: raw.category || '',
       outcomes: ['Yes', 'No'],
       outcomeTokenIds: [`${raw.ticker}_yes`, `${raw.ticker}_no`],
@@ -853,32 +887,48 @@ export class KalshiConnector extends BaseConnector {
     outcomeIndex: number,
   ): OrderBook {
     const isYes = outcomeIndex === 0;
-    const rawBook = raw.orderbook || { yes: [], no: [] };
+
+    // Parse order book levels from either format:
+    // Current API: orderbook_fp.yes_dollars / no_dollars (string arrays: ["0.42", "13.00"])
+    // Legacy API:  orderbook.yes / no (number arrays: [42, 13] in cents)
+    let yesBids: PriceLevel[];
+    let noBids: PriceLevel[];
+
+    if (raw.orderbook_fp) {
+      // Current format: dollar strings → parse to [0..1] prices and numeric sizes
+      yesBids = (raw.orderbook_fp.yes_dollars || [])
+        .map(([priceDollars, countFp]) => ({ price: parseFloat(priceDollars), size: parseFloat(countFp) }))
+        .filter(l => !isNaN(l.price) && !isNaN(l.size) && l.size > 0);
+      noBids = (raw.orderbook_fp.no_dollars || [])
+        .map(([priceDollars, countFp]) => ({ price: parseFloat(priceDollars), size: parseFloat(countFp) }))
+        .filter(l => !isNaN(l.price) && !isNaN(l.size) && l.size > 0);
+    } else if (raw.orderbook) {
+      // Legacy format: cents → normalize to [0..1]
+      yesBids = (raw.orderbook.yes || [])
+        .map(([priceCents, qty]) => ({ price: priceCents / 100, size: qty }));
+      noBids = (raw.orderbook.no || [])
+        .map(([priceCents, qty]) => ({ price: priceCents / 100, size: qty }));
+    } else {
+      yesBids = [];
+      noBids = [];
+    }
 
     let bids: PriceLevel[];
     let asks: PriceLevel[];
 
     if (isYes) {
-      // YES bids: people wanting to buy YES
-      // YES asks: people wanting to sell YES
-      // Kalshi order book is [price_cents, quantity]
-      // For YES outcome:
-      //   YES bids = yes side bids (highest price first)
-      //   YES asks = construct from NO bids: if someone bids NO at 40c, they're offering YES at 60c
-      bids = rawBook.yes
-        .map(([priceCents, qty]) => ({ price: priceCents / 100, size: qty }))
-        .sort((a, b) => b.price - a.price);
-      asks = rawBook.no
-        .map(([priceCents, qty]) => ({ price: (100 - priceCents) / 100, size: qty }))
+      // YES bids = yes side bids (highest price first)
+      // YES asks = construct from NO bids: if someone bids NO at $0.40, they're offering YES at $0.60
+      bids = yesBids.sort((a, b) => b.price - a.price);
+      asks = noBids
+        .map(l => ({ price: 1 - l.price, size: l.size }))
         .sort((a, b) => a.price - b.price);
     } else {
-      // NO bids = no side bids
+      // NO bids = no side bids (highest price first)
       // NO asks = construct from YES bids
-      bids = rawBook.no
-        .map(([priceCents, qty]) => ({ price: priceCents / 100, size: qty }))
-        .sort((a, b) => b.price - a.price);
-      asks = rawBook.yes
-        .map(([priceCents, qty]) => ({ price: (100 - priceCents) / 100, size: qty }))
+      bids = noBids.sort((a, b) => b.price - a.price);
+      asks = yesBids
+        .map(l => ({ price: 1 - l.price, size: l.size }))
         .sort((a, b) => a.price - b.price);
     }
 

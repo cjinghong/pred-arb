@@ -143,6 +143,13 @@ export function initializeDatabase(): void {
     db.exec(`ALTER TABLE opportunities ADD COLUMN fail_reason TEXT`);
   } catch { /* column already exists */ }
 
+  // Migration: add slug + event_slug columns to market_pairs (for dashboard URLs)
+  for (const col of ['market_a_slug', 'market_a_event_slug', 'market_b_slug', 'market_b_event_slug']) {
+    try {
+      db.exec(`ALTER TABLE market_pairs ADD COLUMN ${col} TEXT DEFAULT ''`);
+    } catch { /* column already exists */ }
+  }
+
   log.info('Database schema initialized');
 }
 
@@ -305,9 +312,13 @@ export function upsertMarketPair(pair: {
   marketAId: string;
   marketAPlatform: string;
   marketAQuestion: string;
+  marketASlug?: string;
+  marketAEventSlug?: string;
   marketBId: string;
   marketBPlatform: string;
   marketBQuestion: string;
+  marketBSlug?: string;
+  marketBEventSlug?: string;
   status: string;
   confidence: number;
   matchMethod: string;
@@ -318,14 +329,20 @@ export function upsertMarketPair(pair: {
   getDb().prepare(`
     INSERT INTO market_pairs (
       pair_id, market_a_id, market_a_platform, market_a_question,
+      market_a_slug, market_a_event_slug,
       market_b_id, market_b_platform, market_b_question,
+      market_b_slug, market_b_event_slug,
       status, confidence, match_method,
       llm_is_same_market, llm_confidence, llm_reasoning
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(pair_id) DO UPDATE SET
       status = excluded.status,
       confidence = excluded.confidence,
       match_method = excluded.match_method,
+      market_a_slug = excluded.market_a_slug,
+      market_a_event_slug = excluded.market_a_event_slug,
+      market_b_slug = excluded.market_b_slug,
+      market_b_event_slug = excluded.market_b_event_slug,
       llm_is_same_market = excluded.llm_is_same_market,
       llm_confidence = excluded.llm_confidence,
       llm_reasoning = excluded.llm_reasoning,
@@ -333,7 +350,9 @@ export function upsertMarketPair(pair: {
   `).run(
     pair.pairId,
     pair.marketAId, pair.marketAPlatform, pair.marketAQuestion,
+    pair.marketASlug ?? '', pair.marketAEventSlug ?? '',
     pair.marketBId, pair.marketBPlatform, pair.marketBQuestion,
+    pair.marketBSlug ?? '', pair.marketBEventSlug ?? '',
     pair.status, pair.confidence, pair.matchMethod,
     pair.llmIsSameMarket !== undefined ? (pair.llmIsSameMarket ? 1 : 0) : null,
     pair.llmConfidence ?? null,
@@ -369,9 +388,10 @@ export function getMarketPair(pairId: string): Record<string, unknown> | undefin
 
 export function resetAllData(): void {
   const db = getDb();
+  // Delete trades BEFORE opportunities (FK: trades.opportunity_id → opportunities.id)
   db.exec(`
-    DELETE FROM opportunities;
     DELETE FROM trades;
+    DELETE FROM opportunities;
     DELETE FROM market_pairs;
     DELETE FROM market_snapshots;
     DELETE FROM bot_state;

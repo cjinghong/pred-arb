@@ -189,6 +189,17 @@ export class ExecutionEngine {
 
     const size = riskResult.adjustedSize ?? opp.maxSize;
 
+    // Step 2b: Pre-flight market status check — reject resolved/settled markets
+    const marketCheckResult = await this.checkMarketsActive(opp);
+    if (marketCheckResult) {
+      log.info('Opportunity rejected — market resolved/inactive', {
+        id: opp.id.slice(0, 8),
+        reason: marketCheckResult,
+      });
+      updateOpportunityStatus(opp.id, 'rejected', marketCheckResult);
+      return;
+    }
+
     // Step 3: Create trade record
     const trade: TradeRecord = {
       id: tradeId,
@@ -242,6 +253,45 @@ export class ExecutionEngine {
     // (safe abort). If the more-liquid leg fails after the thinner one fills,
     // recovery/unwind is easier on the deeper book.
     await this.executeLiveArbitrage(opp, trade, size);
+  }
+
+  /**
+   * Pre-flight check: verify both markets are still active/open before execution.
+   * Returns null if both are active, or an error message if either is resolved.
+   */
+  private async checkMarketsActive(opp: ArbitrageOpportunity): Promise<string | null> {
+    const checks = [
+      { platform: opp.legA.platform, marketId: opp.legA.marketId, label: 'A' },
+      { platform: opp.legB.platform, marketId: opp.legB.marketId, label: 'B' },
+    ];
+
+    for (const { platform, marketId, label } of checks) {
+      const conn = this.connectors.get(platform);
+      if (!conn) continue;
+
+      try {
+        await rateLimit(platform);
+        const market = await conn.fetchMarket(marketId);
+        if (!market) {
+          return `Leg ${label} market not found on ${platform} (${marketId})`;
+        }
+        if (!market.active) {
+          return `Leg ${label} market resolved/inactive on ${platform}: "${market.question.slice(0, 60)}"`;
+        }
+        if (market.endDate && market.endDate.getTime() < Date.now()) {
+          return `Leg ${label} market past end date on ${platform}: "${market.question.slice(0, 60)}"`;
+        }
+      } catch (err) {
+        // If we can't check, log but don't block — the platform will reject the order anyway
+        log.debug('Could not verify market status pre-trade', {
+          platform,
+          marketId,
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    return null;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

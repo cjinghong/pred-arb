@@ -113,13 +113,22 @@ type ActiveTab = 'opportunities' | 'markets' | 'trades' | 'positions';
 // ─── Platform URL helpers ────────────────────────────────────────────────
 function getPlatformMarketUrl(platform: string, slug: string, marketId: string, eventSlug?: string): string {
   if (platform === 'polymarket') {
+    // Polymarket URL: /event/{eventSlug}/{marketSlug}
+    // eventSlug comes from Gamma API events[0].slug; may be empty for some markets
     if (eventSlug && slug) return `https://polymarket.com/event/${eventSlug}/${slug}`;
     if (eventSlug) return `https://polymarket.com/event/${eventSlug}`;
+    // Fallback: use market slug (Polymarket redirects /event/{marketSlug} correctly)
     if (slug) return `https://polymarket.com/event/${slug}`;
     return `https://polymarket.com/event/${marketId}`;
   }
   if (platform === 'predictfun') return slug ? `https://predict.fun/market/${slug}` : `https://predict.fun/market/${marketId}`;
-  if (platform === 'kalshi') return `https://kalshi.com/markets/${marketId.toLowerCase()}`;
+  if (platform === 'kalshi') {
+    // Kalshi URL: /markets/{event_ticker}/{subtitle_slug}/{market_ticker}
+    // eventSlug = event_ticker, slug = subtitle slug, marketId = market ticker
+    if (eventSlug && slug) return `https://kalshi.com/markets/${eventSlug}/${slug}/${marketId.toLowerCase()}`;
+    if (eventSlug) return `https://kalshi.com/markets/${eventSlug}`;
+    return `https://kalshi.com/markets/${marketId.toLowerCase()}`;
+  }
   return '#';
 }
 

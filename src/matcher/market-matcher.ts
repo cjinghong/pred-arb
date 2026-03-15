@@ -32,6 +32,17 @@ export interface MarketPair {
   matchMethod: 'cross_reference' | 'exact_slug' | 'sports_normalized' | 'fuzzy_question' | 'combined' | 'llm_verified' | 'llm_matched' | 'manual';
   /** Current status */
   status: PairStatus;
+  /**
+   * Whether outcome 0 (YES) on marketA represents the OPPOSITE real-world outcome
+   * as outcome 0 (YES) on marketB. When true, the arb engine must invert the
+   * orderbook for marketB before comparing.
+   *
+   * Example: Polymarket "Suns vs Celtics" (YES=Suns) matched with
+   * Kalshi "KXNBAGAME-...-BOS" (YES=Celtics) → outcomes are inverted.
+   *
+   * Default: false (outcomes aligned — YES on both = same team wins)
+   */
+  outcomesInverted?: boolean;
   /** LLM verification result (if available) */
   llmVerification?: LLMVerificationResult;
 }

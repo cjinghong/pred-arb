@@ -42,6 +42,10 @@ vi.mock('../utils/event-bus', () => ({
   },
 }));
 
+vi.mock('../utils/rate-limiter', () => ({
+  rateLimit: vi.fn().mockResolvedValue(undefined),
+}));
+
 import {
   insertOpportunity,
   insertTrade,
@@ -137,7 +141,12 @@ function createMockConnector(platform: Platform): MarketConnector {
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
     fetchMarkets: vi.fn().mockResolvedValue([]),
-    fetchMarket: vi.fn().mockResolvedValue(null),
+    fetchMarket: vi.fn().mockResolvedValue({
+      id: 'market-123', platform, question: 'Test market?', slug: '', eventSlug: '',
+      category: '', outcomes: ['Yes', 'No'], outcomeTokenIds: ['t1', 't2'],
+      outcomePrices: [0.5, 0.5], volume: 1000, liquidity: 500,
+      active: true, endDate: new Date(Date.now() + 86400000), lastUpdated: new Date(), raw: {},
+    }),
     fetchOrderBook: vi.fn().mockResolvedValue(createMockOrderBook()),
     subscribeOrderBooks: vi.fn(),
     unsubscribeOrderBooks: vi.fn(),

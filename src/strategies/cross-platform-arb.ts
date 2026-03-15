@@ -212,10 +212,14 @@ export class CrossPlatformArbStrategy implements Strategy {
           });
         }
       } catch (err) {
+        const errMsg = (err as Error).message;
         log.warn('Error analyzing pair on book update', {
           pairId: pair.pairId,
-          error: (err as Error).message,
+          error: errMsg,
         });
+        // Check if the error is from an expired/dead market and clean up
+        this.checkAndRemoveExpiredMarket(pair.marketA.platform, pair.marketA.id, errMsg);
+        this.checkAndRemoveExpiredMarket(pair.marketB.platform, pair.marketB.id, errMsg);
       }
     }
   }
@@ -277,11 +281,15 @@ export class CrossPlatformArbStrategy implements Strategy {
           });
           opportunities.push(...opps);
         } catch (err) {
+          const errMsg = (err as Error).message;
           log.warn('Error analyzing pair', {
             marketA: pair.marketA.question.slice(0, 50),
             marketB: pair.marketB.question.slice(0, 50),
-            error: (err as Error).message,
+            error: errMsg,
           });
+          // Check if the error is from an expired/dead market and clean up
+          this.checkAndRemoveExpiredMarket(pair.marketA.platform, pair.marketA.id, errMsg);
+          this.checkAndRemoveExpiredMarket(pair.marketB.platform, pair.marketB.id, errMsg);
         }
       }
 
@@ -523,9 +531,13 @@ export class CrossPlatformArbStrategy implements Strategy {
         marketAId: mA.id,
         marketAPlatform: mA.platform,
         marketAQuestion: mA.question,
+        marketASlug: mA.slug,
+        marketAEventSlug: mA.eventSlug,
         marketBId: mB.id,
         marketBPlatform: mB.platform,
         marketBQuestion: mB.question,
+        marketBSlug: mB.slug,
+        marketBEventSlug: mB.eventSlug,
         status: 'approved',
         confidence: 1.0,
         matchMethod: 'manual',
@@ -536,6 +548,120 @@ export class CrossPlatformArbStrategy implements Strategy {
 
     log.info('Manual pair created', { pairId, marketA: mA.question.slice(0, 50), marketB: mB.question.slice(0, 50) });
     return pairId;
+  }
+
+  // ─── Stale Pair Cleanup ──────────────────────────────────────────────
+
+  /** Track markets already checked for expiry to avoid repeated API calls */
+  private checkedExpiredMarkets = new Set<string>();
+
+  /**
+   * When an orderbook fetch fails (e.g., 404 "No orderbook exists"), check if
+   * the market is expired/closed and remove all pairs containing it.
+   * This prevents repeated errors for dead markets.
+   */
+  private async checkAndRemoveExpiredMarket(
+    platform: Platform,
+    marketId: string,
+    errorMsg: string,
+  ): Promise<void> {
+    const key = `${platform}:${marketId}`;
+    if (this.checkedExpiredMarkets.has(key)) return; // Already handled
+    this.checkedExpiredMarkets.add(key);
+
+    const conn = this.connectors.get(platform);
+    if (!conn) return;
+
+    // Trigger on errors that suggest the market is dead/resolved
+    const isMarketError = /404|no orderbook|not found|does not exist|resolved|settled|closed|inactive|expired/i.test(errorMsg);
+    if (!isMarketError) return;
+
+    try {
+      const market = await conn.fetchMarket(marketId);
+
+      if (!market) {
+        // Market doesn't exist at all on the platform — remove pairs
+        log.info('Market not found on platform — removing stale pairs', { platform, marketId });
+        this.removePairsForMarket(platform, marketId);
+        return;
+      }
+
+      // Check if market is inactive or past its end date
+      const isExpired = !market.active ||
+        (market.endDate && market.endDate.getTime() < Date.now());
+
+      if (isExpired) {
+        log.info('Market expired/closed — removing stale pairs', {
+          platform,
+          marketId,
+          active: market.active,
+          endDate: market.endDate?.toISOString(),
+          question: market.question.slice(0, 60),
+        });
+        this.removePairsForMarket(platform, marketId);
+      } else {
+        // Market is active but has no orderbook — could be a new/illiquid market.
+        // Log but don't remove.
+        log.debug('Market active but no orderbook — keeping pair', {
+          platform,
+          marketId,
+          question: market.question.slice(0, 60),
+        });
+        // Allow re-check after some time
+        setTimeout(() => this.checkedExpiredMarkets.delete(key), 5 * 60 * 1000);
+      }
+    } catch (err) {
+      log.debug('Failed to verify market status', { platform, marketId, error: (err as Error).message });
+      // Don't remove on failure to check — might be a transient API issue
+    }
+  }
+
+  /**
+   * Remove all pairs that include a specific market. Updates DB, in-memory state,
+   * WS subscriptions, and the reverse index.
+   */
+  private removePairsForMarket(platform: Platform, marketId: string): void {
+    const pairsToRemove = this.cachedPairs.filter(
+      p => (p.marketA.platform === platform && p.marketA.id === marketId) ||
+           (p.marketB.platform === platform && p.marketB.id === marketId),
+    );
+
+    if (pairsToRemove.length === 0) return;
+
+    // Mark as rejected in DB
+    for (const pair of pairsToRemove) {
+      try {
+        dbUpdatePairStatus(pair.pairId, 'rejected');
+      } catch { /* ignore DB errors */ }
+    }
+
+    // Unsubscribe from WS updates for the removed markets
+    const removedMarketIds = new Map<Platform, string[]>();
+    for (const pair of pairsToRemove) {
+      for (const m of [pair.marketA, pair.marketB]) {
+        const list = removedMarketIds.get(m.platform) ?? [];
+        list.push(m.id);
+        removedMarketIds.set(m.platform, list);
+      }
+    }
+    for (const [plat, ids] of removedMarketIds) {
+      const conn = this.connectors.get(plat);
+      if (conn) conn.unsubscribeOrderBooks(ids);
+    }
+
+    // Remove from cachedPairs
+    const removedPairIds = new Set(pairsToRemove.map(p => p.pairId));
+    this.cachedPairs = this.cachedPairs.filter(p => !removedPairIds.has(p.pairId));
+
+    // Rebuild the reverse index
+    this.rebuildMarketIndex();
+
+    log.info('Removed stale pairs', {
+      removedCount: pairsToRemove.length,
+      remainingPairs: this.cachedPairs.length,
+      market: marketId,
+      platform,
+    });
   }
 
   /** Runtime category override (dashboard can change this without restart) */
@@ -569,6 +695,7 @@ export class CrossPlatformArbStrategy implements Strategy {
     this.lastFetchedMarkets.clear();
     this.marketToPairs.clear();
     this.lastPairAnalysis.clear();
+    this.checkedExpiredMarkets.clear();
     this.matcher.reset();
     this.sportsMatcher.reset();
     log.info('Strategy state reset');
@@ -596,7 +723,8 @@ export class CrossPlatformArbStrategy implements Strategy {
           id: row.market_a_id as string,
           platform: row.market_a_platform as Platform,
           question: row.market_a_question as string,
-          slug: '',
+          slug: (row.market_a_slug as string) || '',
+          eventSlug: (row.market_a_event_slug as string) || undefined,
           category: '',
           outcomes: ['Yes', 'No'],
           outcomeTokenIds: [],
@@ -613,7 +741,8 @@ export class CrossPlatformArbStrategy implements Strategy {
           id: row.market_b_id as string,
           platform: row.market_b_platform as Platform,
           question: row.market_b_question as string,
-          slug: '',
+          slug: (row.market_b_slug as string) || '',
+          eventSlug: (row.market_b_event_slug as string) || undefined,
           category: '',
           outcomes: ['Yes', 'No'],
           outcomeTokenIds: [],
@@ -981,6 +1110,26 @@ export class CrossPlatformArbStrategy implements Strategy {
   }
 
   /**
+   * Detect whether two discovered markets have inverted outcomes (YES on A ≠ YES on B).
+   * Uses sportsInfo.yesTeam when available. Returns undefined if we can't determine.
+   */
+  private detectOutcomesInverted(marketA: DiscoveredMarket, marketB: DiscoveredMarket): boolean | undefined {
+    const yesTeamA = marketA.sportsInfo?.yesTeam;
+    const yesTeamB = marketB.sportsInfo?.yesTeam;
+    if (yesTeamA && yesTeamB) {
+      const inverted = yesTeamA !== yesTeamB;
+      if (inverted) {
+        log.info('Cross-ref match: detected inverted outcomes', {
+          marketA: { id: marketA.id, platform: marketA.platform, yesTeam: yesTeamA },
+          marketB: { id: marketB.id, platform: marketB.platform, yesTeam: yesTeamB },
+        });
+      }
+      return inverted;
+    }
+    return undefined;
+  }
+
+  /**
    * Apply cross-reference matches from predict.fun's built-in fields.
    * predict.fun markets often have `polymarketConditionIds` and `kalshiMarketTicker`
    * which provide guaranteed 1:1 matches regardless of question text parsing.
@@ -1030,6 +1179,9 @@ export class CrossPlatformArbStrategy implements Strategy {
         const pairId = MarketMatcher.pairId(pmMarket.id, pfMarket.id);
         if (newPairIds.has(pairId)) continue; // Already matched by sports matcher
 
+        // Detect outcome inversion via yesTeam on sportsInfo
+        const outcomesInverted = this.detectOutcomesInverted(pmMarket, pfMarket);
+
         newPairs.push({
           pairId,
           marketA: pmMarket,
@@ -1037,6 +1189,7 @@ export class CrossPlatformArbStrategy implements Strategy {
           confidence: 1.0,
           matchMethod: 'cross_reference',
           status: 'approved',
+          outcomesInverted,
         });
         newPairIds.add(pairId);
         crossRefMatches++;
@@ -1052,6 +1205,9 @@ export class CrossPlatformArbStrategy implements Strategy {
           const pairId = MarketMatcher.pairId(kalshiMarket.id, pfMarket.id);
           if (newPairIds.has(pairId)) continue;
 
+          // Detect outcome inversion via yesTeam on sportsInfo
+          const outcomesInverted = this.detectOutcomesInverted(kalshiMarket, pfMarket);
+
           newPairs.push({
             pairId,
             marketA: kalshiMarket,
@@ -1059,6 +1215,7 @@ export class CrossPlatformArbStrategy implements Strategy {
             confidence: 1.0,
             matchMethod: 'cross_reference',
             status: 'approved',
+            outcomesInverted,
           });
           newPairIds.add(pairId);
           crossRefMatches++;
@@ -1093,9 +1250,13 @@ export class CrossPlatformArbStrategy implements Strategy {
           marketAId: pair.marketA.id,
           marketAPlatform: pair.marketA.platform,
           marketAQuestion: pair.marketA.question,
+          marketASlug: pair.marketA.slug,
+          marketAEventSlug: pair.marketA.eventSlug,
           marketBId: pair.marketB.id,
           marketBPlatform: pair.marketB.platform,
           marketBQuestion: pair.marketB.question,
+          marketBSlug: pair.marketB.slug,
+          marketBEventSlug: pair.marketB.eventSlug,
           status: pair.status,
           confidence: pair.confidence,
           matchMethod: pair.matchMethod,
@@ -1194,16 +1355,85 @@ export class CrossPlatformArbStrategy implements Strategy {
     const connB = this.connectors.get(pair.marketB.platform);
     if (!connA || !connB) return [];
 
-    const [bookAYes, bookBYes] = await Promise.all([
+    // Pre-check: if either market is past its cached endDate, verify and clean up
+    for (const market of [pair.marketA, pair.marketB]) {
+      if (market.endDate && market.endDate.getTime() < Date.now()) {
+        const conn = this.connectors.get(market.platform);
+        if (conn) {
+          try {
+            const fresh = await conn.fetchMarket(market.id);
+            if (!fresh || !fresh.active || (fresh.endDate && fresh.endDate.getTime() < Date.now())) {
+              log.info('Market resolved — removing pair before analysis', {
+                platform: market.platform,
+                marketId: market.id,
+                question: market.question.slice(0, 60),
+              });
+              this.removePairsForMarket(market.platform, market.id);
+              return [];
+            }
+          } catch { /* ignore — will fail at orderbook fetch below */ }
+        }
+      }
+    }
+
+    const [bookAYes, bookBRaw] = await Promise.all([
       connA.fetchOrderBook(pair.marketA.id, 0),
       connB.fetchOrderBook(pair.marketB.id, 0),
     ]);
+
+    // ── Outcome alignment ───────────────────────────────────────────────────
+    // When outcomes are inverted (e.g., Polymarket YES=Suns matched with Kalshi YES=Celtics),
+    // B's YES book represents the OPPOSITE outcome from A's YES. We "flip" B's book so that
+    // from A's perspective, bookBYes.bids/asks align with the same real-world outcome as A's YES.
+    //
+    // Flip = swap bids↔asks and invert prices (bid at P becomes ask at 1-P, and vice versa).
+    // After flipping, the standard arb logic (buy YES on A + NO on B = hedge) works correctly.
+    let bookBYes: OrderBook;
+    if (pair.outcomesInverted) {
+      log.debug('Inverting B orderbook for outcome alignment', {
+        pairId: pair.pairId,
+        marketB: pair.marketB.id,
+        platformB: pair.marketB.platform,
+      });
+      // B's asks (offers to sell YES) become "bids to buy NO" from A's perspective → invert to bids
+      const flippedBids: PriceLevel[] = bookBRaw.asks
+        .map(a => ({ price: 1 - a.price, size: a.size }))
+        .sort((a, b) => b.price - a.price); // bids: highest first
+      // B's bids (offers to buy YES) become "asks to sell NO" from A's perspective → invert to asks
+      const flippedAsks: PriceLevel[] = bookBRaw.bids
+        .map(b => ({ price: 1 - b.price, size: b.size }))
+        .sort((a, b) => a.price - b.price); // asks: lowest first
+
+      const bestBidFlipped = flippedBids.length > 0 ? flippedBids[0].price : null;
+      const bestAskFlipped = flippedAsks.length > 0 ? flippedAsks[0].price : null;
+      bookBYes = {
+        platform: bookBRaw.platform,
+        marketId: bookBRaw.marketId,
+        outcomeIndex: bookBRaw.outcomeIndex,
+        bids: flippedBids,
+        asks: flippedAsks,
+        minOrderSize: bookBRaw.minOrderSize,
+        tickSize: bookBRaw.tickSize,
+        bestBid: bestBidFlipped,
+        bestAsk: bestAskFlipped,
+        midPrice: (bestBidFlipped !== null && bestAskFlipped !== null)
+          ? (bestBidFlipped + bestAskFlipped) / 2
+          : null,
+        spread: (bestAskFlipped !== null && bestBidFlipped !== null)
+          ? bestAskFlipped - bestBidFlipped
+          : null,
+        timestamp: bookBRaw.timestamp,
+      };
+    } else {
+      bookBYes = bookBRaw;
+    }
 
     // Log book state for debugging empty-book issues
     if (bookAYes.bestAsk === null || bookAYes.bestBid === null ||
         bookBYes.bestAsk === null || bookBYes.bestBid === null) {
       log.debug('Order book prices for pair', {
         pairId: pair.pairId,
+        outcomesInverted: pair.outcomesInverted || false,
         [`${pair.marketA.platform}_bestBid`]: bookAYes.bestBid,
         [`${pair.marketA.platform}_bestAsk`]: bookAYes.bestAsk,
         [`${pair.marketA.platform}_bids`]: bookAYes.bids.length,
@@ -1218,7 +1448,14 @@ export class CrossPlatformArbStrategy implements Strategy {
     const opportunities: ArbitrageOpportunity[] = [];
     const minDepthUsd = this.config.params.minDepthUsd as number;
 
-    // Direction 1: Buy YES on A, Buy NO on B
+    // When outcomes are inverted, buying "YES on B" (in B's native framing) is actually
+    // buying the OPPOSITE outcome from A's YES. So for execution:
+    // - Direction 1 (buy A YES, buy B NO): if inverted, actually buy B YES (native)
+    // - Direction 2 (buy A NO, buy B YES): if inverted, actually buy B NO (native)
+    const bOutcomeForYes = pair.outcomesInverted ? 'NO' : 'YES';
+    const bOutcomeForNo = pair.outcomesInverted ? 'YES' : 'NO';
+
+    // Direction 1: Buy YES on A, Buy NO on B (from A's perspective)
     // To buy NO on B, we use B's YES bids inverted: cost_NO = 1 - bid_price
     if (bookAYes.bestAsk !== null && bookBYes.bestBid !== null) {
       // Invert B's bids into "NO ask levels": price = 1 - bid, size = bid size
@@ -1252,7 +1489,7 @@ export class CrossPlatformArbStrategy implements Strategy {
           opportunities.push(this.createOpportunity(
             pair,
             'YES', walkResult.avgPriceA, bookAYes, walkResult.size,
-            'NO', walkResult.avgPriceB, bookBYes, walkResult.size,
+            bOutcomeForNo, walkResult.avgPriceB, bookBYes, walkResult.size,
             walkResult.profitPerShare * walkResult.size, walkResult.profitBps, walkResult.size,
           ));
         } else {
@@ -1268,7 +1505,7 @@ export class CrossPlatformArbStrategy implements Strategy {
       onSkip('null_book');
     }
 
-    // Direction 2: Buy NO on A, Buy YES on B
+    // Direction 2: Buy NO on A, Buy YES on B (from A's perspective)
     // To buy NO on A, we use A's YES bids inverted: cost_NO = 1 - bid_price
     if (bookAYes.bestBid !== null && bookBYes.bestAsk !== null) {
       // Invert A's bids into "NO ask levels"
@@ -1300,7 +1537,7 @@ export class CrossPlatformArbStrategy implements Strategy {
           opportunities.push(this.createOpportunity(
             pair,
             'NO', walkResult.avgPriceA, bookAYes, walkResult.size,
-            'YES', walkResult.avgPriceB, bookBYes, walkResult.size,
+            bOutcomeForYes, walkResult.avgPriceB, bookBYes, walkResult.size,
             walkResult.profitPerShare * walkResult.size, walkResult.profitBps, walkResult.size,
           ));
         } else {

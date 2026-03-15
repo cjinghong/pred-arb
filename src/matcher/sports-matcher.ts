@@ -28,8 +28,10 @@ const TEAM_ALIASES: Record<string, string> = {
   'philadelphia 76ers': '76ers',
   'la lakers': 'lakers',
   'los angeles lakers': 'lakers',
+  'los angeles l': 'lakers',       // Kalshi disambiguation initial
   'la clippers': 'clippers',
   'los angeles clippers': 'clippers',
+  'los angeles c': 'clippers',     // Kalshi disambiguation initial
   'golden state': 'warriors',
   'golden state warriors': 'warriors',
   'san antonio': 'spurs',
@@ -37,37 +39,56 @@ const TEAM_ALIASES: Record<string, string> = {
   'oklahoma city': 'thunder',
   'oklahoma city thunder': 'thunder',
   'new york knicks': 'knicks',
+  'new york k': 'knicks',          // Kalshi disambiguation initial
   'new york': 'knicks',
   'brooklyn nets': 'nets',
   'brooklyn': 'nets',
   'boston celtics': 'celtics',
   'boston': 'celtics',
   'miami heat': 'heat',
+  'miami': 'heat',
   'milwaukee bucks': 'bucks',
+  'milwaukee': 'bucks',
   'dallas mavericks': 'mavericks',
   'dallas mavs': 'mavericks',
+  'dallas': 'mavericks',
   'denver nuggets': 'nuggets',
+  'denver': 'nuggets',
   'phoenix suns': 'suns',
+  'phoenix': 'suns',
   'minnesota timberwolves': 'timberwolves',
   'minnesota': 'timberwolves',
   'indiana pacers': 'pacers',
+  'indiana': 'pacers',
   'cleveland cavaliers': 'cavaliers',
   'cleveland cavs': 'cavaliers',
+  'cleveland': 'cavaliers',
   'sacramento kings': 'kings',
+  'sacramento': 'kings',
   'memphis grizzlies': 'grizzlies',
+  'memphis': 'grizzlies',
   'houston rockets': 'rockets',
+  'houston': 'rockets',
   'atlanta hawks': 'hawks',
+  'atlanta': 'hawks',
   'chicago bulls': 'bulls',
+  'chicago': 'bulls',
   'toronto raptors': 'raptors',
+  'toronto': 'raptors',
   'detroit pistons': 'pistons',
+  'detroit': 'pistons',
   'orlando magic': 'magic',
+  'orlando': 'magic',
   'charlotte hornets': 'hornets',
+  'charlotte': 'hornets',
   'portland trail blazers': 'trail blazers',
   'portland': 'trail blazers',
   'new orleans pelicans': 'pelicans',
   'new orleans': 'pelicans',
   'utah jazz': 'jazz',
+  'utah': 'jazz',
   'washington wizards': 'wizards',
+  'washington': 'wizards',
 
   // NFL
   'new england patriots': 'patriots',
@@ -87,40 +108,66 @@ const TEAM_ALIASES: Record<string, string> = {
   'carolina panthers': 'panthers',
   'arizona cardinals': 'cardinals',
   'new york giants': 'giants',
+  'new york g': 'giants',           // Kalshi disambiguation initial
   'new york jets': 'jets',
+  'new york j': 'jets',             // Kalshi disambiguation initial
   'pittsburgh steelers': 'steelers',
+  'pittsburgh': 'steelers',
   'baltimore ravens': 'ravens',
+  'baltimore': 'ravens',
   'cincinnati bengals': 'bengals',
+  'cincinnati': 'bengals',
   'tennessee titans': 'titans',
+  'tennessee': 'titans',
   'indianapolis colts': 'colts',
+  'indianapolis': 'colts',
   'seattle seahawks': 'seahawks',
+  'seattle': 'seahawks',
   'buffalo bills': 'bills',
+  'buffalo': 'bills',
   'denver broncos': 'broncos',
   'minnesota vikings': 'vikings',
+  'jacksonville': 'jaguars',
+  'carolina': 'panthers',
+  'arizona': 'cardinals',
 
   // MLB
   'new york yankees': 'yankees',
+  'new york y': 'yankees',          // Kalshi disambiguation initial
   'new york mets': 'mets',
+  'new york m': 'mets',             // Kalshi disambiguation initial
   'boston red sox': 'red sox',
   'chicago cubs': 'cubs',
+  'chicago c': 'cubs',              // Kalshi disambiguation initial
   'chicago white sox': 'white sox',
+  'chicago w': 'white sox',         // Kalshi disambiguation initial
   'los angeles dodgers': 'dodgers',
+  'los angeles d': 'dodgers',       // Kalshi disambiguation initial
   'los angeles angels': 'angels',
+  'los angeles a': 'angels',        // Kalshi disambiguation initial
   'san francisco giants': 'sf giants',
   'st louis cardinals': 'stl cardinals',
   'st. louis cardinals': 'stl cardinals',
+  'st louis': 'stl cardinals',
 
   // NHL
   'new york rangers': 'rangers',
+  'new york r': 'rangers',          // Kalshi disambiguation initial
   'new york islanders': 'islanders',
+  'new york i': 'islanders',        // Kalshi disambiguation initial
   'toronto maple leafs': 'maple leafs',
   'tampa bay lightning': 'lightning',
   'vegas golden knights': 'golden knights',
+  'vegas': 'golden knights',
   'los angeles kings': 'la kings',
   'san jose sharks': 'sharks',
+  'san jose': 'sharks',
   'new jersey devils': 'devils',
+  'new jersey': 'devils',
   'columbus blue jackets': 'blue jackets',
+  'columbus': 'blue jackets',
   'colorado avalanche': 'avalanche',
+  'colorado': 'avalanche',
   'st louis blues': 'blues',
   'st. louis blues': 'blues',
 };
@@ -140,6 +187,13 @@ export function normalizeTeamName(name: string): string {
     .replace(/^the\s+/i, '')
     .replace(/[''`.]/g, '')
     .replace(/\s+/g, ' ')
+    .trim();
+
+  // Strip common Kalshi suffixes: "Winner", "Winning", etc.
+  normalized = normalized
+    .replace(/\s+winner$/i, '')
+    .replace(/\s+winning$/i, '')
+    .replace(/\s+win$/i, '')
     .trim();
 
   // Check alias table
@@ -276,6 +330,23 @@ const LEAGUE_PATTERNS: Array<[RegExp, SportsLeague]> = [
   [/\bFormula\s*1\b|\bF1\b/i, 'F1'],
   [/\bboxing\b/i, 'BOXING'],
   [/\bcricket\b/i, 'CRICKET'],
+  // Kalshi series ticker patterns (e.g., KXNBAGAME in ticker/slug/id)
+  [/NBAGAME/i, 'NBA'],
+  [/NFLGAME/i, 'NFL'],
+  [/MLBGAME/i, 'MLB'],
+  [/NHLGAME/i, 'NHL'],
+  [/MLSGAME/i, 'MLS'],
+  [/UFCFIGHT/i, 'UFC'],
+  // Polymarket slug prefixes (e.g., "nba-lal-hou-2026-03-16")
+  [/^nba-/i, 'NBA'],
+  [/^nfl-/i, 'NFL'],
+  [/^mlb-/i, 'MLB'],
+  [/^nhl-/i, 'NHL'],
+  [/^mls-/i, 'MLS'],
+  [/^ufc-/i, 'UFC'],
+  [/^ncaab-/i, 'NCAAB'],
+  [/^ncaaf-/i, 'NCAAF'],
+  [/^epl-/i, 'EPL'],
   // Generic patterns for context clues
   [/\bbasketball\b/i, 'NBA'],
   [/\bfootball\b/i, 'NFL'],
@@ -284,11 +355,21 @@ const LEAGUE_PATTERNS: Array<[RegExp, SportsLeague]> = [
   [/\bsoccer\b/i, 'MLS'],
 ];
 
-/** Detect sports league from text (question + category + slug) */
-export function detectLeague(question: string, category: string, slug: string): SportsLeague {
-  const combined = `${question} ${category} ${slug}`;
+/**
+ * Detect sports league from text (question + category + slug + optional market ID).
+ * Checks question, category, slug, and market ID for league indicators.
+ * Kalshi tickers embed the league (e.g., KXNBAGAME-26MAR16PHXBOS-PHX)
+ * Polymarket slugs start with the league (e.g., nba-phx-bos-2026-03-16)
+ */
+export function detectLeague(question: string, category: string, slug: string, marketId?: string): SportsLeague {
+  // Check each source individually to handle patterns that need start-of-string matching (like ^nba-)
+  const sources = [question, category, slug];
+  if (marketId) sources.push(marketId);
+
   for (const [pattern, league] of LEAGUE_PATTERNS) {
-    if (pattern.test(combined)) return league;
+    for (const source of sources) {
+      if (pattern.test(source)) return league;
+    }
   }
   return 'UNKNOWN';
 }
@@ -326,15 +407,212 @@ const KALSHI_TEAM_ABBREVS: Record<string, string> = {
   CBJ: 'blue jackets', FLA: 'panthers',
 };
 
-/** Extract team pair from a Kalshi ticker */
+/**
+ * Short team ID → canonical team name.
+ * Used for Polymarket slug parsing (e.g., "nba-cle-det-2025-10-27" → cle → cavaliers).
+ * These are lowercase abbreviations commonly found in slugs/URLs.
+ */
+const TEAM_ID_TO_NAME: Record<string, string> = {
+  // NBA
+  atl: 'hawks', bos: 'celtics', bkn: 'nets', cha: 'hornets',
+  chi: 'bulls', cle: 'cavaliers', dal: 'mavericks', den: 'nuggets',
+  det: 'pistons', gsw: 'warriors', gs: 'warriors', hou: 'rockets',
+  ind: 'pacers', lac: 'clippers', lal: 'lakers', mem: 'grizzlies',
+  mia: 'heat', mil: 'bucks', min: 'timberwolves', nop: 'pelicans',
+  no: 'pelicans', nyk: 'knicks', ny: 'knicks', okc: 'thunder',
+  orl: 'magic', phi: '76ers', phx: 'suns', por: 'trail blazers',
+  sac: 'kings', sas: 'spurs', sa: 'spurs', tor: 'raptors',
+  uta: 'jazz', was: 'wizards',
+  // NFL
+  ari: 'cardinals', bal: 'ravens', buf: 'bills', car: 'panthers',
+  cin: 'bengals', gb: 'packers', hou_nfl: 'texans', jax: 'jaguars',
+  kc: 'chiefs', lv: 'raiders', lar: 'rams', ne: 'patriots',
+  nyg: 'giants', nyj: 'jets', pit: 'steelers', sea: 'seahawks',
+  sf: '49ers', tb: 'buccaneers', ten: 'titans',
+  // MLB
+  stl: 'stl cardinals', sd: 'padres', tex: 'rangers', col: 'rockies',
+  cws: 'white sox', oak: 'athletics',
+  // NHL
+  vgk: 'golden knights', van: 'canucks', wpg: 'jets',
+  cbj: 'blue jackets', fla: 'panthers',
+};
+
+/** All known Kalshi team abbreviation strings (uppercase), sorted longest first for greedy matching */
+const KALSHI_TEAM_ABBREV_LIST: string[] = Object.keys(KALSHI_TEAM_ABBREVS).sort(
+  (a, b) => b.length - a.length,
+);
+
+/**
+ * Extract team pair from a Kalshi ticker using the concatenated format.
+ *
+ * Kalshi tickers look like: KXNBAGAME-25OCT28LACGSW-LAC
+ *   - Parts split by '-': [KXNBAGAME, 25OCT28LACGSW, LAC]
+ *   - Middle segment: first 7 chars = date (YYMMMDD), rest = concatenated team abbrevs
+ *   - Last segment = team_a abbreviation
+ *   - team_b = strip team_a from the concatenated portion
+ *
+ * Also handles the simpler dash-separated format: KXNBAGAME-26MAR14-BOS-LAL
+ */
 function extractTeamsFromKalshiTicker(ticker: string): [string, string] | null {
-  const match = ticker.match(KALSHI_TICKER_TEAMS);
-  if (match) {
-    const teamA = KALSHI_TEAM_ABBREVS[match[1].toUpperCase()] || match[1].toLowerCase();
-    const teamB = KALSHI_TEAM_ABBREVS[match[2].toUpperCase()] || match[2].toLowerCase();
-    return [teamA, teamB];
+  const parts = ticker.split('-');
+  if (parts.length < 2) return null;
+
+  // Try simpler dash-separated format first: PREFIX-DATE-TEAM1-TEAM2
+  if (parts.length >= 4) {
+    const maybeTeamA = parts[parts.length - 2].toUpperCase();
+    const maybeTeamB = parts[parts.length - 1].toUpperCase();
+    if (KALSHI_TEAM_ABBREVS[maybeTeamA] && KALSHI_TEAM_ABBREVS[maybeTeamB]) {
+      return [KALSHI_TEAM_ABBREVS[maybeTeamA], KALSHI_TEAM_ABBREVS[maybeTeamB]];
+    }
+  }
+
+  // Concatenated format with hint: KXNBAGAME-25OCT28LACGSW-LAC (3+ parts)
+  // Last segment = team_a hint, middle segment = date + concatenated teams
+  if (parts.length >= 3) {
+    const lastSegment = parts[parts.length - 1].toUpperCase();
+    const middleSegment = parts[parts.length - 2].toUpperCase();
+
+    // Last segment is team_a
+    const teamAName = KALSHI_TEAM_ABBREVS[lastSegment];
+    if (teamAName) {
+      // Middle segment: first 7 chars are date (YYMMMDD), rest is concatenated teams
+      if (middleSegment.length > 7) {
+        const teamsConcat = middleSegment.slice(7);
+
+        // Strip team_a abbreviation from the concatenated portion to get team_b
+        if (teamsConcat.startsWith(lastSegment)) {
+          const teamBAbbrStr = teamsConcat.slice(lastSegment.length);
+          const teamBName = KALSHI_TEAM_ABBREVS[teamBAbbrStr];
+          if (teamBName) return [teamAName, teamBName];
+        }
+        if (teamsConcat.endsWith(lastSegment)) {
+          const teamBAbbrStr = teamsConcat.slice(0, teamsConcat.length - lastSegment.length);
+          const teamBName = KALSHI_TEAM_ABBREVS[teamBAbbrStr];
+          if (teamBName) return [teamAName, teamBName];
+        }
+        // Brute-force: try all known abbreviation combos
+        const foundTeams = findTeamsInConcat(teamsConcat, lastSegment);
+        if (foundTeams) return foundTeams;
+      }
+    }
+  }
+
+  // 2-part format (no hint): KXNBAGAME-26MAR16LALHOU
+  // Second part = date (7 chars) + concatenated teams (no trailing hint segment)
+  if (parts.length >= 2) {
+    const segment = parts[parts.length - 1].toUpperCase();
+    if (segment.length > 7) {
+      const teamsConcat = segment.slice(7); // e.g., "LALHOU" from "26MAR16LALHOU"
+      const found = splitConcatTeams(teamsConcat);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Try to find two team abbreviations in a concatenated string when one team is known.
+ * Uses greedy longest-match against known Kalshi abbreviations.
+ */
+function findTeamsInConcat(concat: string, knownTeam: string): [string, string] | null {
+  const knownName = KALSHI_TEAM_ABBREVS[knownTeam];
+  if (!knownName) return null;
+
+  // Try each known abbreviation as the other team
+  for (const abbrev of KALSHI_TEAM_ABBREV_LIST) {
+    if (abbrev === knownTeam) continue;
+    if (concat === knownTeam + abbrev || concat === abbrev + knownTeam) {
+      const otherName = KALSHI_TEAM_ABBREVS[abbrev];
+      if (otherName) return [knownName, otherName];
+    }
   }
   return null;
+}
+
+/**
+ * Split a concatenated team string into two teams with no hint.
+ * Tries all possible split points against known abbreviations (longest-first).
+ * e.g., "LALHOU" → LAL + HOU → [lakers, rockets]
+ */
+function splitConcatTeams(concat: string): [string, string] | null {
+  // Try each known abbreviation as team A (prefix)
+  for (const abbrA of KALSHI_TEAM_ABBREV_LIST) {
+    if (!concat.startsWith(abbrA)) continue;
+    const remainder = concat.slice(abbrA.length);
+    const teamBName = KALSHI_TEAM_ABBREVS[remainder];
+    if (teamBName) {
+      return [KALSHI_TEAM_ABBREVS[abbrA], teamBName];
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract team pair + date from a Polymarket slug.
+ *
+ * Polymarket sports slugs follow the pattern:
+ *   {league}-{team1}-{team2}-{year}-{month}-{day}
+ * e.g., "nba-cle-det-2025-10-27" → teams: cle, det, date: 2025-10-27
+ *
+ * Returns { teams, date } or null if the slug doesn't match.
+ */
+function extractFromPolymarketSlug(slug: string): { teams: [string, string]; date: string | null } | null {
+  if (!slug) return null;
+  const parts = slug.toLowerCase().split('-');
+
+  // Minimum: league + team1 + team2 = 3 parts
+  if (parts.length < 3) return null;
+
+  // Check if the first part is a known league prefix
+  const leaguePrefixes = new Set([
+    'nba', 'nfl', 'mlb', 'nhl', 'mls', 'ncaab', 'ncaaf',
+    'epl', 'liga', 'bundesliga', 'seriea', 'ucl', 'ufc',
+  ]);
+
+  if (!leaguePrefixes.has(parts[0])) return null;
+
+  // Try to extract date from the tail: check if last 3 parts form YYYY-MM-DD
+  // Also handles trailing suffixes like "nba-phx-bos-2026-03-16-phx" or "nba-por-bkn-2026-03-16-draw"
+  let date: string | null = null;
+  let teamEndIdx = parts.length;
+
+  // Try date at different positions (handles trailing team/type suffixes)
+  for (let offset = 0; offset <= 2 && parts.length >= 6 + offset; offset++) {
+    const yearIdx = parts.length - 3 - offset;
+    const yearCandidate = parts[yearIdx];
+    const monthCandidate = parts[yearIdx + 1];
+    const dayCandidate = parts[yearIdx + 2];
+
+    if (
+      /^\d{4}$/.test(yearCandidate) &&
+      /^\d{1,2}$/.test(monthCandidate) &&
+      /^\d{1,2}$/.test(dayCandidate)
+    ) {
+      const m = parseInt(monthCandidate);
+      const d = parseInt(dayCandidate);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        date = `${yearCandidate}-${monthCandidate.padStart(2, '0')}-${dayCandidate.padStart(2, '0')}`;
+        teamEndIdx = yearIdx;
+        break;
+      }
+    }
+  }
+
+  // Teams are parts[1] through teamEndIdx-1
+  // Most common: exactly 2 team ID parts (parts[1] and parts[2])
+  // But some team IDs might be multi-part (e.g., "golden-state" — unlikely in slug IDs but handle gracefully)
+  if (teamEndIdx < 3) return null;
+
+  // For now, assume team IDs are single parts (validated by reference Rust code)
+  const teamIdA = parts[1];
+  const teamIdB = parts[2];
+
+  // Look up canonical names
+  const teamNameA = TEAM_ID_TO_NAME[teamIdA] || normalizeTeamName(teamIdA);
+  const teamNameB = TEAM_ID_TO_NAME[teamIdB] || normalizeTeamName(teamIdB);
+
+  return { teams: [teamNameA, teamNameB], date };
 }
 
 /** Extract team pair from a question/title string */
@@ -380,6 +658,7 @@ function detectMarketType(question: string): SportsMarketType {
 export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | null {
   let teams: [string, string] | null = null;
   let gameDate: string | null = null;
+  let yesTeam: string | undefined; // Which team outcome 0 (YES) represents
 
   // ── Platform-specific extraction ──────────────────────────────────────
 
@@ -390,6 +669,55 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     // Try ticker-based extraction first (most reliable for Kalshi)
     teams = extractTeamsFromKalshiTicker(ticker);
     gameDate = extractDateFromKalshiTicker(ticker);
+
+    // Kalshi per-team markets: the last segment of the ticker is the YES team.
+    // e.g., KXNBAGAME-26MAR16PHXBOS-PHX → YES = PHX (suns)
+    // Also check yes_sub_title from raw data as a fallback.
+    const tickerParts = ticker.split('-');
+    if (tickerParts.length >= 3) {
+      const lastAbbrev = tickerParts[tickerParts.length - 1].toUpperCase();
+      const yesTeamFromTicker = KALSHI_TEAM_ABBREVS[lastAbbrev];
+      if (yesTeamFromTicker) {
+        yesTeam = yesTeamFromTicker;
+      }
+    }
+    // Fallback: use yes_sub_title from raw data (e.g., "Phoenix")
+    if (!yesTeam) {
+      const yesSubTitle = raw?.yes_sub_title as string | undefined;
+      if (yesSubTitle) {
+        yesTeam = normalizeTeamName(yesSubTitle);
+      }
+    }
+  }
+
+  if (market.platform === 'polymarket') {
+    // Try slug-based extraction first (most reliable for Polymarket)
+    // Slugs like "nba-cle-det-2025-10-27" give us team IDs + date directly
+    const slugResult = extractFromPolymarketSlug(market.slug);
+    if (slugResult) {
+      teams = slugResult.teams;
+      if (slugResult.date) gameDate = slugResult.date;
+    }
+
+    // Polymarket binary: outcomes[0] is the YES team.
+    // e.g., outcomes: ["Suns", "Celtics"] → YES = Suns
+    if (market.outcomes && market.outcomes.length >= 2) {
+      const outcomeName = market.outcomes[0];
+      // Only set yesTeam if the outcome name looks like a team (not "Yes"/"No")
+      if (outcomeName && !/^(yes|no)$/i.test(outcomeName)) {
+        yesTeam = normalizeTeamName(outcomeName);
+      }
+    }
+  }
+
+  if (market.platform === 'predictfun') {
+    // predict.fun: outcomes[0] is the YES team
+    if (market.outcomes && market.outcomes.length >= 2) {
+      const outcomeName = market.outcomes[0];
+      if (outcomeName && !/^(yes|no)$/i.test(outcomeName)) {
+        yesTeam = normalizeTeamName(outcomeName);
+      }
+    }
   }
 
   // ── Generic extraction from question text ─────────────────────────────
@@ -408,7 +736,7 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     return null;
   }
 
-  const league = detectLeague(market.question, market.category, market.slug);
+  const league = detectLeague(market.question, market.category, market.slug, market.id);
   const marketType = detectMarketType(market.question);
 
   // Sort teams alphabetically so "A vs B" == "B vs A"
@@ -427,6 +755,7 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     league,
     marketType,
     matchKey,
+    yesTeam,
   };
 }
 
@@ -602,12 +931,29 @@ export class SportsMatcher {
     infoB: SportsMarketInfo,
   ): MarketPair {
     const pairId = this.pairId(marketA.id, marketB.id);
+
+    // ── Detect outcome inversion ──────────────────────────────────────────
+    // If both markets have yesTeam set, check if YES on A means the same team as YES on B.
+    // Example: Polymarket "Suns vs Celtics" (YES=suns) matched with Kalshi "PHX" market (YES=suns) → aligned
+    // Example: Polymarket "Suns vs Celtics" (YES=suns) matched with Kalshi "BOS" market (YES=celtics) → inverted!
+    let outcomesInverted = false;
+    if (infoA.yesTeam && infoB.yesTeam) {
+      outcomesInverted = infoA.yesTeam !== infoB.yesTeam;
+      if (outcomesInverted) {
+        log.info('Detected inverted outcomes between platforms', {
+          marketA: { id: marketA.id, platform: marketA.platform, yesTeam: infoA.yesTeam },
+          marketB: { id: marketB.id, platform: marketB.platform, yesTeam: infoB.yesTeam },
+        });
+      }
+    }
+
     return {
       pairId,
       marketA,
       marketB,
       confidence,
       matchMethod: 'sports_normalized',
+      outcomesInverted,
       status: this.pairStatuses.get(pairId) || 'approved', // Sports matches are auto-approved
     };
   }
