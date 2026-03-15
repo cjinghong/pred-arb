@@ -372,13 +372,21 @@ export class MarketMatcher {
     const crossRefCount = pairs.length;
     log.info(`Pass 0+1: ${crossRefCount} pairs from cross-reference + manual`);
 
-    // ─── Pass 2: Exact slug matching ───────────────────────────────────
+    // ─── Pass 2: Exact slug matching (Map-based O(n+m)) ────────────────
+    const slugBIndex = new Map<string, NormalizedMarket>();
+    for (const b of marketsB) {
+      if (usedB.has(b.id) || !b.slug) continue;
+      const normSlug = this.normalizeSlug(b.slug);
+      if (normSlug && !slugBIndex.has(normSlug)) {
+        slugBIndex.set(normSlug, b);
+      }
+    }
     for (const a of marketsA) {
-      if (usedA.has(a.id)) continue;
-      const slugMatch = marketsB.find(
-        b => !usedB.has(b.id) && this.slugsMatch(a.slug, b.slug)
-      );
-      if (slugMatch) {
+      if (usedA.has(a.id) || !a.slug) continue;
+      const normSlug = this.normalizeSlug(a.slug);
+      if (!normSlug) continue;
+      const slugMatch = slugBIndex.get(normSlug);
+      if (slugMatch && !usedB.has(slugMatch.id)) {
         const pairId = MarketMatcher.pairId(a.id, slugMatch.id);
         pairs.push({
           pairId,
@@ -784,11 +792,19 @@ Only include matches you're confident about (>= 0.85). Return [] if no matches f
       }
     }
 
-    // Slug match
+    // Slug match (Map-based O(n+m))
+    const slugBIndex2 = new Map<string, NormalizedMarket>();
+    for (const b of marketsB) {
+      if (usedB.has(b.id) || !b.slug) continue;
+      const ns = this.normalizeSlug(b.slug);
+      if (ns && !slugBIndex2.has(ns)) slugBIndex2.set(ns, b);
+    }
     for (const a of marketsA) {
-      if (usedA.has(a.id)) continue;
-      const slugMatch = marketsB.find(b => !usedB.has(b.id) && this.slugsMatch(a.slug, b.slug));
-      if (slugMatch) {
+      if (usedA.has(a.id) || !a.slug) continue;
+      const ns = this.normalizeSlug(a.slug);
+      if (!ns) continue;
+      const slugMatch = slugBIndex2.get(ns);
+      if (slugMatch && !usedB.has(slugMatch.id)) {
         const pairId = MarketMatcher.pairId(a.id, slugMatch.id);
         pairs.push({ pairId, marketA: a, marketB: slugMatch, confidence: 0.95, matchMethod: 'exact_slug', status: this.pairStatuses.get(pairId) || 'approved' });
         usedA.add(a.id); usedB.add(slugMatch.id);
@@ -850,6 +866,14 @@ Only include matches you're confident about (>= 0.85). Return [] if no matches f
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────
+
+  private normalizeSlug(s: string): string {
+    if (!s) return '';
+    return s.toLowerCase()
+      .replace(/[^a-z0-9]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
 
   private slugsMatch(slugA: string, slugB: string): boolean {
     if (!slugA || !slugB) return false;

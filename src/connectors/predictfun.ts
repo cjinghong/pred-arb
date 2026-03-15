@@ -15,6 +15,12 @@ import {
   Position,
   PriceLevel,
 } from '../types';
+import {
+  DiscoveredMarket,
+  SportsFetchOptions,
+  PREDICTFUN_SPORTS_SLUGS,
+} from '../discovery/types';
+import { parseSportsMarket } from '../matcher/sports-matcher';
 import { config } from '../utils/config';
 import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
 import { Wallet } from 'ethers';
@@ -90,7 +96,7 @@ interface PredictFunRawCategory {
   endsAt: string | null;
   status: string;
   isVisible: boolean;
-  tags: unknown[];
+  tags: Array<{ id: string; level: number | null; name: string }>;
 }
 
 interface PredictFunCategoriesResponse {
@@ -116,13 +122,16 @@ interface PredictFunAuthMessage {
 // ─── Category → predict.fun Mapping ──────────────────────────────────────
 // predict.fun uses `categorySlug` on raw markets and supports `category` query param.
 // We also filter by `marketVariant` for sports-specific types.
-const PREDICTFUN_CATEGORY_SLUGS: Record<string, string[]> = {
-  sports: [], // empty = match any sports variant
+// Maps user-facing category names → predict.fun tag names (case-insensitive match on cat.tags[].name)
+// The tags array on the parent category/event object contains sport classification, NOT the market's categorySlug
+// (which is event-specific like "ucl-bay1-ata1-2026-03-18").
+const PREDICTFUN_CATEGORY_TAGS: Record<string, string[]> = {
+  sports: [],                // empty = match any sports variant (no tag filtering needed)
   basketball: ['basketball'],
-  nba: ['basketball'],       // NBA is under basketball slug
+  nba: ['basketball'],       // NBA falls under Basketball tag
   football: ['football'],
   nfl: ['football'],
-  soccer: ['soccer'],
+  soccer: ['soccer', 'football'],  // predict.fun uses both "Soccer" and "Football" tags for soccer
   baseball: ['baseball'],
   mlb: ['baseball'],
   hockey: ['hockey'],
@@ -140,6 +149,20 @@ const PREDICTFUN_CATEGORY_SLUGS: Record<string, string[]> = {
 
 /** Market variants that indicate sports markets */
 const SPORTS_VARIANTS = new Set(['SPORTS_MATCH', 'SPORTS_TEAM_MATCH']);
+
+/**
+ * Check if a parent category's tags match the desired tag names.
+ * predict.fun's tags live on the category (event), not on individual markets.
+ * Market `categorySlug` is event-specific (e.g., "ucl-bay1-ata1-2026-03-18"), not useful for sport filtering.
+ */
+function categoryMatchesTags(
+  catTags: Array<{ id: string; level: number | null; name: string }>,
+  desiredTagNames: string[],
+): boolean {
+  if (desiredTagNames.length === 0) return true; // no filter = match all
+  const lowerDesired = desiredTagNames.map(t => t.toLowerCase());
+  return catTags.some(tag => lowerDesired.includes(tag.name.toLowerCase()));
+}
 
 // ─── Connector Implementation ────────────────────────────────────────────
 
@@ -448,32 +471,30 @@ export class PredictFunConnector extends BaseConnector {
    * predict.fun API supports:
    *   - `marketVariant` param: SPORTS_MATCH, SPORTS_TEAM_MATCH, etc. (server-side)
    *   - `tagIds` param: comma-separated tag IDs (server-side, via GET /v1/tags)
-   *   - Client-side: filter by `categorySlug` on each raw market
+   *   - Client-side: filter by parent category's `tags[]` array (NOT market's `categorySlug`,
+   *     which is event-specific like "ucl-bay1-ata1-2026-03-18")
    *
    * For broad "sports" we use marketVariant=SPORTS_MATCH (two requests for both variants).
-   * For specific sports (basketball, football, etc.) we filter by categorySlug client-side
-   * plus use SPORTS_MATCH/SPORTS_TEAM_MATCH variant filters to narrow server results.
+   * For specific sports (basketball, football, etc.) we filter by the parent category's tags.
    */
   private async fetchMarketsByCategory(
     category: string,
     options?: FetchMarketsOptions,
   ): Promise<NormalizedMarket[]> {
-    const categorySlugs = PREDICTFUN_CATEGORY_SLUGS[category] || [category];
+    const categoryTagNames = PREDICTFUN_CATEGORY_TAGS[category] || [category];
     const isBroadSports = category === 'sports';
     const allMarkets: NormalizedMarket[] = [];
     const seenIds = new Set<number>();
 
     this.log.info('Fetching predict.fun markets by category', {
       category,
-      categorySlugs,
+      categoryTagNames,
       isBroadSports,
     });
 
     // Fetch for each sports variant (SPORTS_MATCH and SPORTS_TEAM_MATCH)
     // to get server-side filtering on market type
-    const variants = isBroadSports
-      ? ['SPORTS_MATCH', 'SPORTS_TEAM_MATCH']
-      : ['SPORTS_MATCH', 'SPORTS_TEAM_MATCH'];
+    const variants = ['SPORTS_MATCH', 'SPORTS_TEAM_MATCH'];
 
     for (const variant of variants) {
       let cursor: string | null = null;
@@ -487,23 +508,22 @@ export class PredictFunConnector extends BaseConnector {
         if (options?.activeOnly !== false) params.set('status', 'OPEN');
         params.set('marketVariant', variant);
 
-        // Use /v1/categories to get the category slug (needed for frontend URLs)
+        // Use /v1/categories to get the parent category with tags (needed for sport filtering)
         const url = `${this.apiUrl}/v1/categories?${params.toString()}`;
         const response = await this.httpGet<PredictFunCategoriesResponse>(url, this.getAuthHeaders());
 
         const categories = response.data || [];
         if (!categories || categories.length === 0) break;
 
-        // Each category contains nested markets; extract with parent slug
+        // Each category (event) contains nested markets; filter by parent category's tags
         for (const cat of categories) {
+          // Filter by sport using parent category's tags (not market's categorySlug)
+          if (!isBroadSports && !categoryMatchesTags(cat.tags, categoryTagNames)) continue;
+
           for (const m of (cat.markets || [])) {
             if (seenIds.has(m.id)) continue;
             if ((m.outcomes || []).length !== 2) continue;
             if (m.tradingStatus !== 'OPEN') continue;
-
-            // For broad sports: accept all sports variants
-            // For specific sport: match by categorySlug on the market
-            if (!isBroadSports && !categorySlugs.includes(m.categorySlug)) continue;
 
             seenIds.add(m.id);
             allMarkets.push(this.normalizeMarket(m, cat.slug));
@@ -521,6 +541,84 @@ export class PredictFunConnector extends BaseConnector {
     });
 
     return allMarkets;
+  }
+
+  // ─── Sports-Specific Discovery ──────────────────────────────────────────
+
+  /**
+   * Fetch sports markets using predict.fun's marketVariant filtering.
+   * Uses SPORTS_MATCH and SPORTS_TEAM_MATCH variants with optional
+   * league-level filtering via parent category tags.
+   *
+   * predict.fun also has cross-reference fields (polymarketConditionIds,
+   * kalshiMarketTicker) that the matcher can use for direct matching.
+   */
+  async fetchSportsMarkets(options?: SportsFetchOptions): Promise<DiscoveredMarket[]> {
+    const maxResults = options?.maxResults ?? 1000;
+    const league = options?.league;
+
+    // Determine tag name filters for specific league (from parent category tags, NOT market categorySlug)
+    const leagueTagNames = league
+      ? (PREDICTFUN_SPORTS_SLUGS[league] || [])
+      : [];
+    const filterByTags = leagueTagNames.length > 0;
+
+    const allMarkets: DiscoveredMarket[] = [];
+    const seenIds = new Set<number>();
+    const variants = ['SPORTS_MATCH', 'SPORTS_TEAM_MATCH'];
+
+    this.log.info('Fetching predict.fun sports markets', { league, leagueTagNames });
+
+    for (const variant of variants) {
+      let cursor: string | null = null;
+      const pageSize = 100;
+      const maxPages = 20;
+
+      for (let page = 0; page < maxPages; page++) {
+        const params = new URLSearchParams();
+        params.set('first', String(pageSize));
+        if (cursor) params.set('after', cursor);
+        params.set('status', 'OPEN');
+        params.set('marketVariant', variant);
+
+        const url = `${this.apiUrl}/v1/categories?${params.toString()}`;
+        const response = await this.httpGet<PredictFunCategoriesResponse>(url, this.getAuthHeaders());
+
+        const categories = response.data || [];
+        if (!categories || categories.length === 0) break;
+
+        for (const cat of categories) {
+          // Filter by league using parent category's tags (not market's categorySlug)
+          if (filterByTags && !categoryMatchesTags(cat.tags, leagueTagNames)) continue;
+
+          for (const m of (cat.markets || [])) {
+            if (seenIds.has(m.id)) continue;
+            if ((m.outcomes || []).length !== 2) continue;
+            if (m.tradingStatus !== 'OPEN') continue;
+
+            seenIds.add(m.id);
+            const normalized = this.normalizeMarket(m, cat.slug);
+            const discovered: DiscoveredMarket = {
+              ...normalized,
+              // Preserve cross-reference data from raw market
+              raw: m,
+            };
+            discovered.sportsInfo = parseSportsMarket(discovered) || undefined;
+            allMarkets.push(discovered);
+          }
+        }
+
+        cursor = response.cursor || null;
+        if (!cursor || categories.length < pageSize) break;
+      }
+    }
+
+    this.log.info('predict.fun sports discovery complete', {
+      totalFound: allMarkets.length,
+      withSportsInfo: allMarkets.filter(m => m.sportsInfo).length,
+    });
+
+    return allMarkets.slice(0, maxResults);
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {

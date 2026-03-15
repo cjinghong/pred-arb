@@ -18,6 +18,12 @@ import {
   Position,
   PriceLevel,
 } from '../types';
+import {
+  DiscoveredMarket,
+  SportsFetchOptions,
+  KALSHI_SERIES_TICKERS,
+} from '../discovery/types';
+import { parseSportsMarket } from '../matcher/sports-matcher';
 import { config } from '../utils/config';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -37,7 +43,7 @@ interface KalshiRawMarket {
   close_time: string;
   expiration_time: string;
   settlement_time: string;
-  status: 'open' | 'closed' | 'settled' | string;
+  status: 'open' | 'active' | 'closed' | 'settled' | 'determined' | string;
   response_price_units: string;
   notional_value: number;
   tick_size: number;
@@ -168,6 +174,18 @@ interface KalshiEventResponse {
   };
 }
 
+interface KalshiEventsResponse {
+  events: Array<{
+    event_ticker: string;
+    series_ticker: string;
+    title: string;
+    mutually_exclusive: boolean;
+    category: string;
+    markets: KalshiRawMarket[];
+  }>;
+  cursor: string | null;
+}
+
 // ─── Category Mapping ─────────────────────────────────────────────────────
 
 const KALSHI_CATEGORY_MAP: Record<string, string> = {
@@ -273,13 +291,15 @@ export class KalshiConnector extends BaseConnector {
     if (!this.rsaPrivateKey || !this.apiKeyId) return null;
 
     const timestampMs = Date.now().toString();
-    // Build the message: timestamp + \n + METHOD + \n + /trade-api/v2/...path
-    const message = `${timestampMs}\n${method.toUpperCase()}\n${urlPath}`;
+    // Strip query parameters — Kalshi signs path only (no query string)
+    const pathWithoutQuery = urlPath.split('?')[0];
+    // Build the message: timestamp + METHOD + path (NO separators/newlines)
+    const message = `${timestampMs}${method.toUpperCase()}${pathWithoutQuery}`;
 
     const signature = crypto.sign('sha256', Buffer.from(message), {
       key: this.rsaPrivateKey,
       padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-      saltLength: crypto.constants.RSA_PSS_SALTLEN_MAX_SIGN,
+      saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
     });
 
     return {
@@ -390,58 +410,157 @@ export class KalshiConnector extends BaseConnector {
     );
 
     return (response.markets || [])
-      .filter(m => m.status === 'open')
+      .filter(m => m.status === 'open' || m.status === 'active')
       .map(m => this.normalizeMarket(m));
   }
 
   /**
-   * Fetch ALL markets in a specific category with pagination.
+   * Fetch markets in a specific category using the events API.
+   *
+   * Kalshi's GET /markets endpoint returns empty `category` on individual markets.
+   * The GET /events endpoint supports server-side `category` filtering and returns
+   * nested markets per event — much more efficient for category-based fetching.
+   *
+   * Returns up to MAX_CATEGORY_MARKETS markets, sorted by volume (most liquid first).
    */
   private async fetchMarketsByCategory(
     category: string,
-    options?: FetchMarketsOptions,
+    _options?: FetchMarketsOptions,
   ): Promise<NormalizedMarket[]> {
     const kalshiCategory = KALSHI_CATEGORY_MAP[category] || category;
     const allMarkets: NormalizedMarket[] = [];
     let cursor: string | null = null;
     const pageSize = 200;
-    const maxPages = 10; // Safety: 2000 markets max
+    const maxPages = 20;
+    const MAX_CATEGORY_MARKETS = 2000; // Cap to avoid huge payloads
 
-    this.log.info('Fetching Kalshi markets by category', { category, kalshiCategory });
+    this.log.info('Fetching Kalshi events by category', { category, kalshiCategory });
 
     for (let page = 0; page < maxPages; page++) {
       const params = new URLSearchParams();
       params.set('limit', String(pageSize));
       params.set('status', 'open');
-      // Note: Kalshi API uses `event_ticker` filter, not `category` directly.
-      // We'll fetch all open markets and filter client-side by category.
+      params.set('with_nested_markets', 'true');
+      // Server-side category filter on events endpoint
+      params.set('category', kalshiCategory);
       if (cursor) params.set('cursor', cursor);
 
-      const response = await this.kalshiGet<KalshiMarketsResponse>(
-        `${this.apiUrl}/markets?${params.toString()}`
+      const response = await this.kalshiGet<KalshiEventsResponse>(
+        `${this.apiUrl}/events?${params.toString()}`
       );
 
-      const markets = response.markets || [];
-      if (markets.length === 0) break;
+      const events = response.events || [];
+      if (events.length === 0) break;
 
-      for (const m of markets) {
-        if (m.status !== 'open') continue;
-        // Client-side category filter
-        if (kalshiCategory && m.category !== kalshiCategory) continue;
-        allMarkets.push(this.normalizeMarket(m));
+      for (const event of events) {
+        const markets = event.markets || [];
+        for (const m of markets) {
+          if (m.status !== 'open' && m.status !== 'active') continue;
+          // Inherit category from the event since market.category is empty
+          if (!m.category && event.category) {
+            m.category = event.category;
+          }
+          allMarkets.push(this.normalizeMarket(m));
+        }
       }
 
       cursor = response.cursor || null;
-      if (!cursor || markets.length < pageSize) break;
+      if (!cursor || events.length < pageSize) break;
     }
+
+    // Sort by volume (most liquid first) and cap at MAX_CATEGORY_MARKETS
+    allMarkets.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    const capped = allMarkets.slice(0, MAX_CATEGORY_MARKETS);
 
     this.log.info('Kalshi category fetch complete', {
       category,
       kalshiCategory,
-      totalMarkets: allMarkets.length,
+      totalFound: allMarkets.length,
+      kept: capped.length,
     });
 
-    return allMarkets;
+    return capped;
+  }
+
+  // ─── Sports-Specific Discovery ──────────────────────────────────────────
+
+  /**
+   * Fetch sports markets using Kalshi's series_ticker-based querying.
+   * Much more targeted than the generic events API — fetches only markets
+   * from a specific sports league with time bounds.
+   *
+   * Uses: GET /markets?series_ticker=KXNBAGAME&status=open&min_end_timestamp=...&max_end_timestamp=...
+   */
+  async fetchSportsMarkets(options?: SportsFetchOptions): Promise<DiscoveredMarket[]> {
+    const lookAheadDays = options?.lookAheadDays ?? 3;
+    const maxResults = options?.maxResults ?? 1000;
+    const league = options?.league;
+
+    const now = Date.now();
+    const minTimestamp = Math.floor(now / 1000);
+    const maxTimestamp = Math.floor((now + lookAheadDays * 24 * 60 * 60 * 1000) / 1000);
+
+    // Determine which series tickers to query
+    const tickers: Array<{ league: string; ticker: string }> = [];
+    if (league && KALSHI_SERIES_TICKERS[league]) {
+      tickers.push({ league, ticker: KALSHI_SERIES_TICKERS[league] });
+    } else {
+      // Query all known sports series
+      for (const [lg, tk] of Object.entries(KALSHI_SERIES_TICKERS)) {
+        tickers.push({ league: lg, ticker: tk });
+      }
+    }
+
+    const allMarkets: DiscoveredMarket[] = [];
+
+    for (const { league: lg, ticker } of tickers) {
+      try {
+        const params = new URLSearchParams();
+        params.set('series_ticker', ticker);
+        params.set('status', 'open');
+        params.set('min_end_timestamp', String(minTimestamp));
+        params.set('max_end_timestamp', String(maxTimestamp));
+        params.set('limit', String(Math.min(maxResults, 1000)));
+
+        const response = await this.kalshiGet<KalshiMarketsResponse>(
+          `${this.apiUrl}/markets?${params.toString()}`
+        );
+
+        const markets = (response.markets || [])
+          .filter(m => m.status === 'open' || m.status === 'active')
+          .map(m => {
+            const normalized = this.normalizeMarket(m);
+            const discovered: DiscoveredMarket = { ...normalized };
+            discovered.sportsInfo = parseSportsMarket(discovered) || undefined;
+            return discovered;
+          });
+
+        allMarkets.push(...markets);
+
+        this.log.info(`Kalshi sports fetch: ${lg}`, {
+          seriesTicker: ticker,
+          found: markets.length,
+          withSportsInfo: markets.filter(m => m.sportsInfo).length,
+        });
+      } catch (err) {
+        this.log.warn(`Failed to fetch Kalshi sports for ${lg}`, {
+          ticker,
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    // Sort by volume, cap results
+    allMarkets.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    const capped = allMarkets.slice(0, maxResults);
+
+    this.log.info('Kalshi sports discovery complete', {
+      totalFound: allMarkets.length,
+      kept: capped.length,
+      withSportsInfo: capped.filter(m => m.sportsInfo).length,
+    });
+
+    return capped;
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {
@@ -718,7 +837,7 @@ export class KalshiConnector extends BaseConnector {
       ],
       volume: raw.volume || 0,
       liquidity: raw.liquidity || 0,
-      active: raw.status === 'open',
+      active: raw.status === 'open' || raw.status === 'active',
       endDate: raw.close_time ? new Date(raw.close_time) : null,
       lastUpdated: new Date(),
       raw,

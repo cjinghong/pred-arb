@@ -11,6 +11,7 @@ import {
   Platform,
   Position,
 } from './market';
+import { SportsFetchOptions, DiscoveredMarket } from '../discovery/types';
 
 /** Event types emitted by connectors */
 export type ConnectorEvent =
@@ -92,6 +93,15 @@ export interface MarketConnector {
 
   /** Get account balance in USD */
   getBalance(): Promise<number>;
+
+  // ─── Category-Specific Discovery ─────────────────────────────────────
+
+  /**
+   * Fetch sports markets using platform-specific optimized queries.
+   * Returns markets enriched with parsed sports metadata (teams, date, league).
+   * Optional — platforms that don't support targeted sports queries can skip this.
+   */
+  fetchSportsMarkets?(options?: SportsFetchOptions): Promise<DiscoveredMarket[]>;
 
   // ─── Events ──────────────────────────────────────────────────────────
 

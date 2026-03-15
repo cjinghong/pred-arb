@@ -15,6 +15,12 @@ import {
   Position,
   PriceLevel,
 } from '../types';
+import {
+  DiscoveredMarket,
+  SportsFetchOptions,
+  POLYMARKET_SPORTS_TAGS,
+} from '../discovery/types';
+import { parseSportsMarket } from '../matcher/sports-matcher';
 import { config } from '../utils/config';
 import { WsOrderBookManager, ParsedBookUpdate } from './ws-orderbook-manager';
 import { Wallet } from 'ethers';
@@ -454,6 +460,87 @@ export class PolymarketConnector extends BaseConnector {
     });
 
     return allMarkets;
+  }
+
+  // ─── Sports-Specific Discovery ──────────────────────────────────────────
+
+  /**
+   * Fetch sports markets using Polymarket's sports-optimized query params.
+   * Uses `sports_market_types=moneyline` for targeted sports queries
+   * with date filtering (end_date_min/end_date_max).
+   *
+   * Much more targeted than generic category fetch — only moneyline markets
+   * within the time window, which are the ones we can actually arb.
+   */
+  async fetchSportsMarkets(options?: SportsFetchOptions): Promise<DiscoveredMarket[]> {
+    const lookAheadDays = options?.lookAheadDays ?? 3;
+    const maxResults = options?.maxResults ?? 1000;
+    const league = options?.league;
+
+    const now = new Date();
+    const maxDate = new Date(now.getTime() + lookAheadDays * 24 * 60 * 60 * 1000);
+    const endDateMin = now.toISOString().replace(/\.\d+Z$/, 'Z');
+    const endDateMax = maxDate.toISOString().replace(/\.\d+Z$/, 'Z');
+
+    // Determine tag
+    const tag = league
+      ? (POLYMARKET_SPORTS_TAGS[league] || POLYMARKET_SPORTS_TAGS.ALL)
+      : POLYMARKET_SPORTS_TAGS.ALL;
+
+    const allMarkets: DiscoveredMarket[] = [];
+    const pageSize = 100;
+    let offset = 0;
+    const maxPages = Math.ceil(maxResults / pageSize);
+
+    this.log.info('Fetching Polymarket sports markets', { tag, endDateMin, endDateMax, league });
+
+    for (let page = 0; page < maxPages; page++) {
+      const params = new URLSearchParams();
+      params.set('limit', String(pageSize));
+      params.set('offset', String(offset));
+      params.set('tag', tag);
+      params.set('active', 'true');
+      params.set('closed', 'false');
+      // Sports-specific params from Polymarket Gamma API
+      params.set('sports_market_types', 'moneyline');
+      params.set('end_date_min', endDateMin);
+      params.set('end_date_max', endDateMax);
+      params.set('order', 'volume');
+      params.set('ascending', 'false');
+
+      const raw = await this.httpGet<PolymarketRawMarket[]>(
+        `${this.gammaUrl}/markets?${params.toString()}`
+      );
+
+      if (!raw || raw.length === 0) break;
+
+      const binaryMarkets = raw.filter(m => {
+        try {
+          const outcomes = JSON.parse(m.outcomes || '[]');
+          return outcomes.length === 2;
+        } catch {
+          return false;
+        }
+      });
+
+      for (const m of binaryMarkets) {
+        const normalized = this.normalizeMarket(m);
+        const discovered: DiscoveredMarket = { ...normalized };
+        discovered.sportsInfo = parseSportsMarket(discovered) || undefined;
+        allMarkets.push(discovered);
+      }
+
+      offset += raw.length;
+      if (raw.length < pageSize) break;
+    }
+
+    this.log.info('Polymarket sports discovery complete', {
+      tag,
+      totalFound: allMarkets.length,
+      withSportsInfo: allMarkets.filter(m => m.sportsInfo).length,
+    });
+
+    return allMarkets.slice(0, maxResults);
   }
 
   async fetchMarket(marketId: string): Promise<NormalizedMarket | null> {

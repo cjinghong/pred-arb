@@ -23,7 +23,10 @@ import {
 } from '../types';
 import { MarketConnector } from '../types/connector';
 import { MarketMatcher, MarketPair, PairStatus } from '../matcher/market-matcher';
+import { SportsMatcher } from '../matcher/sports-matcher';
 import { LLMVerifier } from '../matcher/llm-verifier';
+import { SportsDiscovery } from '../discovery/sports-discovery';
+import { DiscoveredMarket, MarketCategory, SportsLeague } from '../discovery/types';
 import { PredictFunConnector } from '../connectors/predictfun';
 import { KalshiConnector } from '../connectors/kalshi';
 import { upsertMarketPair, getAllMarketPairs, updatePairStatus as dbUpdatePairStatus } from '../db/database';
@@ -44,6 +47,8 @@ export class CrossPlatformArbStrategy implements Strategy {
   private connectors = new Map<Platform, MarketConnector>();
   private llmVerifier = new LLMVerifier();
   private matcher = new MarketMatcher(this.llmVerifier);
+  private sportsMatcher = new SportsMatcher();
+  private sportsDiscovery = new SportsDiscovery();
   private cachedPairs: MarketPair[] = [];
   private lastPairRefresh = 0;
   private pairRefreshIntervalMs = config.bot.pairRefreshIntervalMs;
@@ -565,18 +570,97 @@ export class CrossPlatformArbStrategy implements Strategy {
     this.marketToPairs.clear();
     this.lastPairAnalysis.clear();
     this.matcher.reset();
+    this.sportsMatcher.reset();
     log.info('Strategy state reset');
   }
 
-  /** Load persisted pair statuses from DB at startup */
+  /** Load persisted pairs from DB at startup.
+   *  Reconstructs full MarketPair objects so that previously matched pairs
+   *  don't need to be re-matched. Also loads statuses into the matcher. */
   loadPersistedPairs(): void {
     try {
       const rows = getAllMarketPairs();
       const statuses = new Map<string, PairStatus>();
+      const loadedPairs: MarketPair[] = [];
+
       for (const row of rows) {
-        statuses.set(row.pair_id as string, row.status as PairStatus);
+        const pairId = row.pair_id as string;
+        const status = row.status as PairStatus;
+        statuses.set(pairId, status);
+
+        // Skip rejected pairs — they won't be used for scanning
+        if (status === 'rejected') continue;
+
+        // Reconstruct a lightweight MarketPair from DB columns
+        const marketA: NormalizedMarket = {
+          id: row.market_a_id as string,
+          platform: row.market_a_platform as Platform,
+          question: row.market_a_question as string,
+          slug: '',
+          category: '',
+          outcomes: ['Yes', 'No'],
+          outcomeTokenIds: [],
+          outcomePrices: [0, 0],
+          volume: 0,
+          liquidity: 0,
+          active: true,
+          endDate: null,
+          lastUpdated: new Date(),
+          raw: {},
+        };
+
+        const marketB: NormalizedMarket = {
+          id: row.market_b_id as string,
+          platform: row.market_b_platform as Platform,
+          question: row.market_b_question as string,
+          slug: '',
+          category: '',
+          outcomes: ['Yes', 'No'],
+          outcomeTokenIds: [],
+          outcomePrices: [0, 0],
+          volume: 0,
+          liquidity: 0,
+          active: true,
+          endDate: null,
+          lastUpdated: new Date(),
+          raw: {},
+        };
+
+        const pair: MarketPair = {
+          pairId,
+          marketA,
+          marketB,
+          confidence: row.confidence as number,
+          matchMethod: row.match_method as MarketPair['matchMethod'],
+          status,
+        };
+
+        // Attach LLM verification if present
+        if (row.llm_reasoning) {
+          pair.llmVerification = {
+            marketA: { id: marketA.id, platform: marketA.platform, question: marketA.question },
+            marketB: { id: marketB.id, platform: marketB.platform, question: marketB.question },
+            isSameMarket: (row.llm_is_same_market as number) === 1,
+            confidence: (row.llm_confidence as number) || 0,
+            reasoning: row.llm_reasoning as string,
+          };
+        }
+
+        loadedPairs.push(pair);
       }
+
       this.matcher.loadPairStatuses(statuses);
+      this.sportsMatcher.loadPairStatuses(statuses);
+
+      if (loadedPairs.length > 0) {
+        this.cachedPairs = loadedPairs;
+        this.rebuildMarketIndex();
+        log.info('Loaded persisted pairs from DB', {
+          total: loadedPairs.length,
+          approved: loadedPairs.filter(p => p.status === 'approved').length,
+          pending: loadedPairs.filter(p => p.status === 'pending').length,
+        });
+      }
     } catch (err) {
       log.warn('Failed to load persisted pairs', { error: (err as Error).message });
     }
@@ -653,6 +737,152 @@ export class CrossPlatformArbStrategy implements Strategy {
     }
 
     const category = this.getCategory() || undefined;
+
+    // ── Route to category-specific discovery + matching ────────────────────
+    // Each category (sports, politics, crypto) has its own optimized
+    // discovery and matching pipeline for higher quality results.
+    const isSportsCategory = this.isSportsCategory(category);
+
+    if (isSportsCategory) {
+      await this.refreshSportsPairs(activePlatforms, category);
+    } else {
+      await this.refreshGenericPairs(activePlatforms, category);
+    }
+  }
+
+  /**
+   * Check if a category string maps to the sports category.
+   * Handles all sports sub-categories (nba, nfl, etc.).
+   */
+  private isSportsCategory(category?: string): boolean {
+    if (!category) return false;
+    const sportsCats = [
+      'sports', 'nba', 'nfl', 'mlb', 'nhl', 'mls', 'mma', 'ufc',
+      'basketball', 'football', 'baseball', 'hockey', 'soccer',
+      'tennis', 'golf', 'motorsports', 'f1', 'boxing', 'cricket',
+      'ncaa', 'ncaab', 'ncaaf', 'epl',
+    ];
+    return sportsCats.includes(category.toLowerCase());
+  }
+
+  /**
+   * Sports-specific refresh: uses SportsDiscovery + SportsMatcher.
+   * - Fetches from each platform using optimized sports APIs
+   *   (series_ticker for Kalshi, sports_market_types for Polymarket, etc.)
+   * - Matches deterministically by team names + game date (no LLM needed)
+   * - Time-bounded: only looks at upcoming events (default 3 days)
+   */
+  private async refreshSportsPairs(activePlatforms: Platform[], category?: string): Promise<void> {
+    log.info('Using sports-specific discovery + matching pipeline', { category });
+
+    // Map category to a sports league hint
+    const leagueMap: Record<string, string> = {
+      nba: 'NBA', basketball: 'NBA',
+      nfl: 'NFL', football: 'NFL',
+      mlb: 'MLB', baseball: 'MLB',
+      nhl: 'NHL', hockey: 'NHL',
+      mls: 'MLS', soccer: 'MLS',
+      ufc: 'UFC', mma: 'UFC',
+      ncaa: 'NCAAB', ncaab: 'NCAAB', ncaaf: 'NCAAF',
+      tennis: 'TENNIS', golf: 'GOLF',
+      f1: 'F1', motorsports: 'F1',
+      boxing: 'BOXING', cricket: 'CRICKET',
+    };
+    const league = category ? leagueMap[category.toLowerCase()] : undefined;
+
+    // ── Step 1: Sports-specific discovery ──────────────────────────────────
+    const result = await this.sportsDiscovery.discover(this.connectors, {
+      league: league as SportsLeague | undefined,
+      lookAheadDays: 3,
+      maxResults: 1000,
+    });
+
+    // Cache for dashboard visibility
+    const platformMarkets = new Map<Platform, NormalizedMarket[]>();
+    for (const [platform, markets] of result.markets) {
+      this.lastFetchedMarkets.set(platform, markets);
+      platformMarkets.set(platform, markets);
+    }
+
+    // ── Step 2: Incremental matching ──────────────────────────────────────
+    const existingMatchedIds = new Set<string>();
+    for (const pair of this.cachedPairs) {
+      existingMatchedIds.add(pair.marketA.id);
+      existingMatchedIds.add(pair.marketB.id);
+    }
+
+    // Update existing pairs' market data with fresh fetched data
+    const freshMarketIndex = new Map<string, NormalizedMarket>();
+    for (const markets of platformMarkets.values()) {
+      for (const m of markets) freshMarketIndex.set(m.id, m);
+    }
+    for (const pair of this.cachedPairs) {
+      const freshA = freshMarketIndex.get(pair.marketA.id);
+      if (freshA) pair.marketA = freshA;
+      const freshB = freshMarketIndex.get(pair.marketB.id);
+      if (freshB) pair.marketB = freshB;
+    }
+
+    // ── Step 3: Sports-specific matching (deterministic, O(n+m)) ─────────
+    const oldPairIds = new Set(this.cachedPairs.map(p => `${p.marketA.id}:${p.marketB.id}`));
+    const newPairs: MarketPair[] = [];
+
+    for (let i = 0; i < activePlatforms.length; i++) {
+      for (let j = i + 1; j < activePlatforms.length; j++) {
+        const platA = activePlatforms[i];
+        const platB = activePlatforms[j];
+        const allMarketsA = (result.markets.get(platA) || []) as DiscoveredMarket[];
+        const allMarketsB = (result.markets.get(platB) || []) as DiscoveredMarket[];
+
+        const unmatchedA = allMarketsA.filter(m => !existingMatchedIds.has(m.id));
+        const unmatchedB = allMarketsB.filter(m => !existingMatchedIds.has(m.id));
+
+        if (unmatchedA.length === 0 && unmatchedB.length === 0) {
+          log.info(`Skipping ${platA} ↔ ${platB}: no new unmatched sports markets`);
+          continue;
+        }
+
+        // Sports matcher: deterministic team+date matching
+        const pairsSeen = new Set<string>();
+
+        if (unmatchedA.length > 0) {
+          log.info(`Sports matching NEW ${platA} (${unmatchedA.length}) ↔ ${platB} (${allMarketsB.length})`);
+          const pairs = this.sportsMatcher.match(unmatchedA, allMarketsB);
+          for (const p of pairs) {
+            if (!pairsSeen.has(p.pairId)) {
+              pairsSeen.add(p.pairId);
+              newPairs.push(p);
+            }
+          }
+        }
+
+        if (unmatchedB.length > 0) {
+          log.info(`Sports matching ${platA} (${allMarketsA.length}) ↔ NEW ${platB} (${unmatchedB.length})`);
+          const pairs = this.sportsMatcher.match(allMarketsA, unmatchedB);
+          for (const p of pairs) {
+            if (!pairsSeen.has(p.pairId)) {
+              pairsSeen.add(p.pairId);
+              newPairs.push(p);
+            }
+          }
+        }
+      }
+    }
+
+    // ── Step 4: Also try cross-reference matching from predict.fun ────────
+    // predict.fun markets often have polymarketConditionIds and kalshiMarketTicker
+    // which give us guaranteed matches regardless of question text parsing.
+    this.applyCrossReferenceMatches(result.markets, existingMatchedIds, newPairs);
+
+    // ── Finalize ──────────────────────────────────────────────────────────
+    this.finalizeRefresh(newPairs, oldPairIds);
+  }
+
+  /**
+   * Generic refresh: uses the original generic MarketMatcher pipeline.
+   * Used for non-sports categories or when no category is set.
+   */
+  private async refreshGenericPairs(activePlatforms: Platform[], category?: string): Promise<void> {
     const isCategoryFiltered = !!category;
 
     // Fetch markets from ALL active platforms in parallel
@@ -683,34 +913,180 @@ export class CrossPlatformArbStrategy implements Strategy {
       log.info(`Markets fetched from ${platform}`, { count: markets.length });
     }
 
-    // Pairwise matching: for N platforms, run matching on each unique pair combo
-    // e.g., for 3 platforms: (PM, PRED), (PM, KAL), (PRED, KAL)
+    // ── Incremental matching ──────────────────────────────────────────────
+    const existingMatchedIds = new Set<string>();
+    for (const pair of this.cachedPairs) {
+      existingMatchedIds.add(pair.marketA.id);
+      existingMatchedIds.add(pair.marketB.id);
+    }
+
+    // Update existing pairs' market data with fresh fetched data
+    const freshMarketIndex = new Map<string, NormalizedMarket>();
+    for (const markets of platformMarkets.values()) {
+      for (const m of markets) freshMarketIndex.set(m.id, m);
+    }
+    for (const pair of this.cachedPairs) {
+      const freshA = freshMarketIndex.get(pair.marketA.id);
+      if (freshA) pair.marketA = freshA;
+      const freshB = freshMarketIndex.get(pair.marketB.id);
+      if (freshB) pair.marketB = freshB;
+    }
+
+    // Pairwise matching using generic 5-pass pipeline
     const oldPairIds = new Set(this.cachedPairs.map(p => `${p.marketA.id}:${p.marketB.id}`));
-    const allPairs: MarketPair[] = [];
+    const newPairs: MarketPair[] = [];
 
     for (let i = 0; i < activePlatforms.length; i++) {
       for (let j = i + 1; j < activePlatforms.length; j++) {
         const platA = activePlatforms[i];
         const platB = activePlatforms[j];
-        const marketsA = platformMarkets.get(platA) || [];
-        const marketsB = platformMarkets.get(platB) || [];
+        const allMarketsA = platformMarkets.get(platA) || [];
+        const allMarketsB = platformMarkets.get(platB) || [];
 
-        if (marketsA.length === 0 || marketsB.length === 0) continue;
+        const unmatchedA = allMarketsA.filter(m => !existingMatchedIds.has(m.id));
+        const unmatchedB = allMarketsB.filter(m => !existingMatchedIds.has(m.id));
 
-        log.info(`Matching ${platA} (${marketsA.length}) ↔ ${platB} (${marketsB.length})`);
-        const pairs = await this.matcher.findPairs(marketsA, marketsB);
-        allPairs.push(...pairs);
+        if (unmatchedA.length === 0 && unmatchedB.length === 0) {
+          log.info(`Skipping ${platA} ↔ ${platB}: no new unmatched markets`);
+          continue;
+        }
+
+        const pairsSeen = new Set<string>();
+
+        if (unmatchedA.length > 0) {
+          log.info(`Matching NEW ${platA} (${unmatchedA.length}) ↔ ${platB} (${allMarketsB.length})`);
+          const pairs = await this.matcher.findPairs(unmatchedA, allMarketsB);
+          for (const p of pairs) {
+            if (!pairsSeen.has(p.pairId)) {
+              pairsSeen.add(p.pairId);
+              newPairs.push(p);
+            }
+          }
+        }
+
+        if (unmatchedB.length > 0) {
+          log.info(`Matching ${platA} (${allMarketsA.length}) ↔ NEW ${platB} (${unmatchedB.length})`);
+          const pairs = await this.matcher.findPairs(allMarketsA, unmatchedB);
+          for (const p of pairs) {
+            if (!pairsSeen.has(p.pairId)) {
+              pairsSeen.add(p.pairId);
+              newPairs.push(p);
+            }
+          }
+        }
       }
     }
 
-    this.cachedPairs = allPairs;
-    this.lastPairRefresh = Date.now();
+    this.finalizeRefresh(newPairs, oldPairIds);
+  }
 
-    // Rebuild the reverse index: marketId → pairs
+  /**
+   * Apply cross-reference matches from predict.fun's built-in fields.
+   * predict.fun markets often have `polymarketConditionIds` and `kalshiMarketTicker`
+   * which provide guaranteed 1:1 matches regardless of question text parsing.
+   */
+  private applyCrossReferenceMatches(
+    discoveredMarkets: Map<Platform, DiscoveredMarket[]>,
+    existingMatchedIds: Set<string>,
+    newPairs: MarketPair[],
+  ): void {
+    const predictFunMarkets = discoveredMarkets.get('predictfun') || [];
+    if (predictFunMarkets.length === 0) return;
+
+    const newPairIds = new Set(newPairs.map(p => p.pairId));
+
+    // Build indexes for Polymarket and Kalshi markets by their IDs
+    const polymarketById = new Map<string, DiscoveredMarket>();
+    for (const m of (discoveredMarkets.get('polymarket') || [])) {
+      polymarketById.set(m.id, m);
+    }
+    const kalshiById = new Map<string, DiscoveredMarket>();
+    for (const m of (discoveredMarkets.get('kalshi') || [])) {
+      kalshiById.set(m.id, m);
+    }
+
+    // Also index Polymarket by conditionId for cross-reference matching
+    const polymarketByConditionId = new Map<string, DiscoveredMarket>();
+    for (const m of (discoveredMarkets.get('polymarket') || [])) {
+      const raw = m.raw as Record<string, unknown> | undefined;
+      const conditionId = raw?.conditionId as string;
+      if (conditionId) polymarketByConditionId.set(conditionId, m);
+    }
+
+    let crossRefMatches = 0;
+
+    for (const pfMarket of predictFunMarkets) {
+      const raw = pfMarket.raw as Record<string, unknown> | undefined;
+      if (!raw) continue;
+
+      // predict.fun → Polymarket via polymarketConditionIds
+      const pmConditionIds = (raw.polymarketConditionIds as string[]) || [];
+      for (const condId of pmConditionIds) {
+        if (!condId) continue;
+        const pmMarket = polymarketByConditionId.get(condId);
+        if (!pmMarket) continue;
+        if (existingMatchedIds.has(pfMarket.id) && existingMatchedIds.has(pmMarket.id)) continue;
+
+        const pairId = MarketMatcher.pairId(pmMarket.id, pfMarket.id);
+        if (newPairIds.has(pairId)) continue; // Already matched by sports matcher
+
+        newPairs.push({
+          pairId,
+          marketA: pmMarket,
+          marketB: pfMarket,
+          confidence: 1.0,
+          matchMethod: 'cross_reference',
+          status: 'approved',
+        });
+        newPairIds.add(pairId);
+        crossRefMatches++;
+      }
+
+      // predict.fun → Kalshi via kalshiMarketTicker
+      const kalshiTicker = raw.kalshiMarketTicker as string;
+      if (kalshiTicker) {
+        const kalshiMarket = kalshiById.get(kalshiTicker);
+        if (kalshiMarket) {
+          if (existingMatchedIds.has(pfMarket.id) && existingMatchedIds.has(kalshiMarket.id)) continue;
+
+          const pairId = MarketMatcher.pairId(kalshiMarket.id, pfMarket.id);
+          if (newPairIds.has(pairId)) continue;
+
+          newPairs.push({
+            pairId,
+            marketA: kalshiMarket,
+            marketB: pfMarket,
+            confidence: 1.0,
+            matchMethod: 'cross_reference',
+            status: 'approved',
+          });
+          newPairIds.add(pairId);
+          crossRefMatches++;
+        }
+      }
+    }
+
+    if (crossRefMatches > 0) {
+      log.info('Cross-reference matches found', { count: crossRefMatches });
+    }
+  }
+
+  /**
+   * Shared finalization: merge new pairs, persist, rebuild index, subscribe WS.
+   */
+  private finalizeRefresh(newPairs: MarketPair[], oldPairIds: Set<string>): void {
+    if (newPairs.length > 0) {
+      log.info('New pairs discovered', { count: newPairs.length });
+      this.cachedPairs.push(...newPairs);
+    } else {
+      log.info('No new pairs found');
+    }
+
+    this.lastPairRefresh = Date.now();
     this.rebuildMarketIndex();
 
-    // Persist pairs to DB
-    for (const pair of this.cachedPairs) {
+    // Persist only NEW pairs to DB
+    for (const pair of newPairs) {
       try {
         upsertMarketPair({
           pairId: pair.pairId,
