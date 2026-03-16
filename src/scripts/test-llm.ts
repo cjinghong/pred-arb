@@ -9,20 +9,20 @@
 // Commands:
 //   ping        — Check if the LLM API is reachable and responds
 //   verify      — Test pair verification with sample prediction markets
-//   batch-match — Test batch matching with two lists of markets
+//   bucket      — Test bucket-match with realistic market lists (the real pipeline)
 //   full-test   — Run all tests
 //
 // Configuration (via .env):
-//   LLM_PROVIDER=ollama           # or 'anthropic', 'openai'
-//   LLM_BASE_URL=http://localhost:11434/v1
-//   LLM_MODEL=llama3.1
-//   # Or: ANTHROPIC_API_KEY=sk-...
+//   LLM_PROVIDER=anthropic         # or 'ollama', 'openai'
+//   ANTHROPIC_API_KEY=sk-...
+//   # Or: LLM_BASE_URL=http://localhost:11434/v1  LLM_MODEL=llama3.1
 // ═══════════════════════════════════════════════════════════════════════════
 
 import dotenv from 'dotenv';
 dotenv.config();
 
 import { LLMVerifier } from '../matcher/llm-verifier';
+import { MarketMatcher } from '../matcher/market-matcher';
 import { config } from '../utils/config';
 import { NormalizedMarket, Platform } from '../types';
 
@@ -54,6 +54,7 @@ function printConfig() {
     const key = process.env.ANTHROPIC_API_KEY || '';
     console.log(`   API Key:   ${key ? key.slice(0, 10) + '...' : '(not set)'}`);
     console.log(`   Model:     claude-sonnet-4-20250514`);
+    console.log(`   Mode:      tool_use (forced JSON)`);
   } else {
     console.log(`   Base URL:  ${config.llm.baseUrl}`);
     console.log(`   Model:     ${config.llm.model}`);
@@ -103,7 +104,7 @@ async function testPing() {
 // ─── Test: Pair Verification ────────────────────────────────────────────
 
 async function testVerify() {
-  console.log('\n🔍 Verify — testing pair verification with sample markets...');
+  console.log('\n🔍 Verify — testing pair verification (tool_use for Anthropic)...');
 
   const candidates = [
     {
@@ -193,91 +194,152 @@ async function testVerify() {
   }
 }
 
-// ─── Test: Batch Match ──────────────────────────────────────────────────
+// ─── Test: Bucket Match (realistic pipeline) ───────────────────────────
+// This test mirrors the real pipeline: lots of markets on each side,
+// fuzzy pre-grouping into buckets, then LLM verification per bucket.
 
-async function testBatchMatch() {
-  console.log('\n📋 Batch Match — testing market list matching...');
+async function testBucketMatch() {
+  console.log('\n📋 Bucket Match — testing fuzzy pre-group → LLM verify pipeline...');
+  console.log('   This uses the REAL matching pipeline with realistic market counts.\n');
 
-  const prompt = `You are a prediction market analyst. Below are two lists of prediction markets from different platforms. Your job is to identify which markets from LIST A are THE SAME MARKET as a market in LIST B.
+  // Simulate Polymarket politics markets (list A)
+  const marketsA: NormalizedMarket[] = [
+    makeMarket({ id: 'poly-trump-2028', platform: 'polymarket', question: 'Will Donald Trump win the 2028 presidential election?', category: 'Politics', endDate: new Date('2028-11-10') }),
+    makeMarket({ id: 'poly-dem-house-2026', platform: 'polymarket', question: 'Will Democrats win control of the House in 2026 midterms?', category: 'Politics', endDate: new Date('2026-11-03') }),
+    makeMarket({ id: 'poly-ukraine-ceasefire', platform: 'polymarket', question: 'Will there be a ceasefire in the Russia-Ukraine war by end of 2026?', category: 'Politics', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'poly-fed-rate-june', platform: 'polymarket', question: 'Will the Federal Reserve cut interest rates in June 2026?', category: 'Economics', endDate: new Date('2026-06-30') }),
+    makeMarket({ id: 'poly-btc-100k-eoy', platform: 'polymarket', question: 'Will Bitcoin reach $100,000 by end of 2026?', category: 'Crypto', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'poly-tiktok-ban', platform: 'polymarket', question: 'Will TikTok be banned in the US by end of 2026?', category: 'Tech', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'poly-scotus-term', platform: 'polymarket', question: 'Will a Supreme Court justice retire in 2026?', category: 'Politics', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'poly-iran-deal', platform: 'polymarket', question: 'Will the US reach a nuclear deal with Iran by 2027?', category: 'Politics', endDate: new Date('2027-01-01') }),
+    makeMarket({ id: 'poly-newsom-pres', platform: 'polymarket', question: 'Will Gavin Newsom run for president in 2028?', category: 'Politics', endDate: new Date('2028-06-30') }),
+    makeMarket({ id: 'poly-debt-ceiling', platform: 'polymarket', question: 'Will the US hit the debt ceiling in 2026?', category: 'Economics', endDate: new Date('2026-12-31') }),
+    // Noise / no-match markets
+    makeMarket({ id: 'poly-ca-quake', platform: 'polymarket', question: 'Will California experience a magnitude 7+ earthquake in 2026?', category: 'Science', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'poly-ai-consciousness', platform: 'polymarket', question: 'Will an AI system pass the Turing test by 2027?', category: 'Tech', endDate: new Date('2027-01-01') }),
+    makeMarket({ id: 'poly-mars-mission', platform: 'polymarket', question: 'Will SpaceX launch a crewed Mars mission by 2030?', category: 'Science', endDate: new Date('2030-12-31') }),
+    makeMarket({ id: 'poly-etf-approval', platform: 'polymarket', question: 'Will an Ethereum spot ETF be approved in 2026?', category: 'Crypto', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'poly-recession-2026', platform: 'polymarket', question: 'Will the US enter a recession in 2026?', category: 'Economics', endDate: new Date('2026-12-31') }),
+  ];
 
-Two markets are "the same" if they would resolve identically — same event, same resolution criteria, same timeframe. Be careful with similar-but-different questions (e.g., "by end of 2026" vs "by March 2026" are NOT the same).
+  // Simulate Kalshi politics markets (list B) — some match, some don't
+  const marketsB: NormalizedMarket[] = [
+    makeMarket({ id: 'kal-trump-2028', platform: 'kalshi', question: 'Trump to win the 2028 US presidential election?', category: 'Politics', endDate: new Date('2028-11-10') }),
+    makeMarket({ id: 'kal-house-2026', platform: 'kalshi', question: 'Democrats to win the House of Representatives in 2026?', category: 'Politics', endDate: new Date('2026-11-05') }),
+    makeMarket({ id: 'kal-ukraine-ceasefire', platform: 'kalshi', question: 'Russia-Ukraine ceasefire before January 1, 2027?', category: 'Politics', endDate: new Date('2027-01-01') }),
+    makeMarket({ id: 'kal-fed-rate-june', platform: 'kalshi', question: 'Federal Reserve rate cut at June 2026 FOMC?', category: 'Economics', endDate: new Date('2026-06-20') }),
+    makeMarket({ id: 'kal-btc-100k-eoy', platform: 'kalshi', question: 'Bitcoin above $100,000 at end of 2026?', category: 'Crypto', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'kal-tiktok-ban', platform: 'kalshi', question: 'TikTok banned in the United States by December 31, 2026?', category: 'Tech', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'kal-recession-2026', platform: 'kalshi', question: 'US recession in 2026?', category: 'Economics', endDate: new Date('2026-12-31') }),
+    // Markets that DON'T match anything in A
+    makeMarket({ id: 'kal-btc-60k-mar', platform: 'kalshi', question: 'Bitcoin above $60,000 on March 19, 2026?', category: 'Crypto', endDate: new Date('2026-03-19') }),
+    makeMarket({ id: 'kal-eth-4k', platform: 'kalshi', question: 'Ethereum above $4,000 on March 21, 2026?', category: 'Crypto', endDate: new Date('2026-03-21') }),
+    makeMarket({ id: 'kal-fed-rate-sept', platform: 'kalshi', question: 'Federal Reserve rate cut at September 2026 FOMC?', category: 'Economics', endDate: new Date('2026-09-20') }),
+    makeMarket({ id: 'kal-china-taiwan', platform: 'kalshi', question: 'Will China invade Taiwan by 2027?', category: 'Politics', endDate: new Date('2027-01-01') }),
+    makeMarket({ id: 'kal-elon-ceo', platform: 'kalshi', question: 'Will Elon Musk step down as Tesla CEO in 2026?', category: 'Tech', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'kal-housing-crash', platform: 'kalshi', question: 'US housing prices to drop 10%+ in 2026?', category: 'Economics', endDate: new Date('2026-12-31') }),
+    makeMarket({ id: 'kal-dem-senate-2026', platform: 'kalshi', question: 'Democrats to win the Senate in 2026?', category: 'Politics', endDate: new Date('2026-11-05') }),
+    makeMarket({ id: 'kal-world-cup', platform: 'kalshi', question: 'USA to win the 2026 FIFA World Cup?', category: 'Sports', endDate: new Date('2026-07-19') }),
+  ];
 
-LIST A:
-  A1. "Will the Democrats win the 2026 midterm elections?" [Politics] [ends: 2026-11-03] (id: poly-midterm-2026)
-  A2. "Will there be a ceasefire in the Russia-Ukraine war by end of 2026?" [Politics] [ends: 2026-12-31] (id: poly-ukraine-ceasefire)
-  A3. "Will Ethereum reach $10,000 by December 2026?" [Crypto] [ends: 2026-12-31] (id: poly-eth-10k)
-  A4. "Will California experience a magnitude 7+ earthquake in 2026?" [Science] [ends: 2026-12-31] (id: poly-ca-earthquake)
+  // Expected matches (by question similarity):
+  // poly-trump-2028 ↔ kal-trump-2028 (Trump 2028)
+  // poly-dem-house-2026 ↔ kal-house-2026 (Dems House 2026)
+  // poly-ukraine-ceasefire ↔ kal-ukraine-ceasefire (Ukraine ceasefire)
+  // poly-fed-rate-june ↔ kal-fed-rate-june (Fed rate June)
+  // poly-btc-100k-eoy ↔ kal-btc-100k-eoy (BTC $100k EOY)
+  // poly-tiktok-ban ↔ kal-tiktok-ban (TikTok ban)
+  // poly-recession-2026 ↔ kal-recession-2026 (US recession)
+  //
+  // Expected NON-matches:
+  // poly-btc-100k-eoy should NOT match kal-btc-60k-mar (different price + date)
+  // poly-fed-rate-june should NOT match kal-fed-rate-sept (different FOMC meeting)
+  // poly-dem-house-2026 should NOT match kal-dem-senate-2026 (House ≠ Senate)
 
-LIST B:
-  B1. "Ethereum to hit $10,000 by year-end 2026?" [Crypto] [ends: 2026-12-31] (id: kalshi-eth-10k)
-  B2. "Democrats to win control of Congress in 2026 midterms?" [Politics] [ends: 2026-11-05] (id: kalshi-midterm-2026)
-  B3. "Russia-Ukraine ceasefire before January 1, 2027?" [Politics] [ends: 2027-01-01] (id: kalshi-ukraine-ceasefire)
-  B4. "Will TikTok be banned in the US by end of 2026?" [Tech] [ends: 2026-12-31] (id: kalshi-tiktok-ban)
+  const expectedMatches = [
+    { a: 'poly-trump-2028', b: 'kal-trump-2028', label: 'Trump 2028' },
+    { a: 'poly-dem-house-2026', b: 'kal-house-2026', label: 'Dems House 2026' },
+    { a: 'poly-ukraine-ceasefire', b: 'kal-ukraine-ceasefire', label: 'Ukraine ceasefire' },
+    { a: 'poly-fed-rate-june', b: 'kal-fed-rate-june', label: 'Fed rate June' },
+    { a: 'poly-btc-100k-eoy', b: 'kal-btc-100k-eoy', label: 'BTC $100k EOY' },
+    { a: 'poly-tiktok-ban', b: 'kal-tiktok-ban', label: 'TikTok ban' },
+    { a: 'poly-recession-2026', b: 'kal-recession-2026', label: 'US recession' },
+  ];
 
-Return ONLY a JSON array of matched pairs. If a market has no match, omit it. For each match include your confidence (0.0-1.0) and brief reasoning:
-[
-  { "a": "A1", "b": "B3", "confidence": 0.98, "reasoning": "Both ask about the same event" },
-  ...
-]
+  const expectedNonMatches = [
+    { a: 'poly-btc-100k-eoy', b: 'kal-btc-60k-mar', label: 'BTC $100k ≠ $60k Mar' },
+    { a: 'poly-fed-rate-june', b: 'kal-fed-rate-sept', label: 'Fed June ≠ Sept' },
+    { a: 'poly-dem-house-2026', b: 'kal-dem-senate-2026', label: 'House ≠ Senate' },
+  ];
 
-Only include matches you're confident about (>= 0.85). Return [] if no matches found.`;
+  console.log(`   Markets: ${marketsA.length} A × ${marketsB.length} B`);
+  console.log(`   Expected: ${expectedMatches.length} matches, ${expectedNonMatches.length} non-matches\n`);
 
   const startMs = Date.now();
+
   try {
-    let text = await verifier.callLLM(prompt, 2048);
+    // Use the REAL pipeline: MarketMatcher.findPairs() runs all 5 passes
+    const matcher = new MarketMatcher();
+    const pairs = await matcher.findPairs(marketsA, marketsB);
     const elapsed = Date.now() - startMs;
 
-    console.log(`\n   Raw response (${elapsed}ms):`);
-    console.log(`   ${text.trim().slice(0, 500)}`);
+    console.log(`\n   Pipeline complete (${elapsed}ms): ${pairs.length} pairs found\n`);
 
-    // Parse
-    if (text.trim().startsWith('```')) {
-      text = text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    // Show all found pairs
+    for (const p of pairs) {
+      const icon = p.matchMethod === 'llm_matched' ? '🤖' : p.matchMethod === 'llm_verified' ? '🔍' : '⚡';
+      console.log(`   ${icon} [${p.matchMethod}] (conf: ${p.confidence.toFixed(2)}, status: ${p.status})`);
+      console.log(`      A: "${p.marketA.question.slice(0, 60)}..."`);
+      console.log(`      B: "${p.marketB.question.slice(0, 60)}..."\n`);
     }
 
-    try {
-      const parsed = JSON.parse(text.trim()) as Array<{ a: string; b: string; confidence: number; reasoning: string }>;
-      console.log(`\n   Parsed ${parsed.length} matches:`);
-      for (const m of parsed) {
-        console.log(`     ${m.a} ↔ ${m.b} (confidence: ${m.confidence}) — ${m.reasoning}`);
-      }
-
-      // Check expected: A1↔B2 (midterms), A2↔B3 (Ukraine), A3↔B1 (ETH)
-      const expectedPairs = [
-        { a: 'A1', b: 'B2', label: 'Midterms' },
-        { a: 'A2', b: 'B3', label: 'Ukraine ceasefire' },
-        { a: 'A3', b: 'B1', label: 'ETH $10k' },
-      ];
-
-      let score = 0;
-      for (const exp of expectedPairs) {
-        const found = parsed.find(p =>
-          p.a.toUpperCase() === exp.a && p.b.toUpperCase() === exp.b
-        );
-        if (found && found.confidence >= 0.85) {
-          score++;
-          console.log(`   ✅ ${exp.label}: matched (${found.confidence})`);
-        } else {
-          console.log(`   ⚠️  ${exp.label}: expected ${exp.a}↔${exp.b} match`);
-        }
-      }
-
-      // A4 (earthquake) and B4 (TikTok) should NOT match anything
-      const falseMatch = parsed.find(p => p.a === 'A4' || p.b === 'B4');
-      if (!falseMatch) {
-        score++;
-        console.log('   ✅ No false matches (earthquake/TikTok correctly excluded)');
+    // Score: check expected matches
+    let correctMatches = 0;
+    for (const exp of expectedMatches) {
+      const found = pairs.find(p =>
+        (p.marketA.id === exp.a && p.marketB.id === exp.b) ||
+        (p.marketA.id === exp.b && p.marketB.id === exp.a)
+      );
+      if (found) {
+        correctMatches++;
+        console.log(`   ✅ ${exp.label}: matched (${found.matchMethod}, conf: ${found.confidence.toFixed(2)})`);
       } else {
-        console.log(`   ⚠️  Unexpected match: ${falseMatch.a}↔${falseMatch.b}`);
+        console.log(`   ⚠️  ${exp.label}: MISSED — expected ${exp.a} ↔ ${exp.b}`);
       }
-
-      console.log(`\n   Score: ${score}/4 correct`);
-    } catch {
-      console.log('\n   ❌ Failed to parse response as JSON');
-      console.log('   💡 Your model may need more guidance for JSON output. Try a larger model.');
     }
+
+    // Score: check expected non-matches
+    let correctNonMatches = 0;
+    for (const exp of expectedNonMatches) {
+      const found = pairs.find(p =>
+        (p.marketA.id === exp.a && p.marketB.id === exp.b) ||
+        (p.marketA.id === exp.b && p.marketB.id === exp.a)
+      );
+      if (!found) {
+        correctNonMatches++;
+        console.log(`   ✅ ${exp.label}: correctly NOT matched`);
+      } else {
+        console.log(`   ❌ ${exp.label}: FALSE MATCH — ${exp.a} ↔ ${exp.b} should NOT match`);
+      }
+    }
+
+    const total = expectedMatches.length + expectedNonMatches.length;
+    const correct = correctMatches + correctNonMatches;
+    console.log(`\n   Score: ${correct}/${total} correct (${correctMatches}/${expectedMatches.length} matches, ${correctNonMatches}/${expectedNonMatches.length} non-matches)`);
+
+    // Pipeline breakdown
+    const byMethod = new Map<string, number>();
+    for (const p of pairs) {
+      byMethod.set(p.matchMethod, (byMethod.get(p.matchMethod) || 0) + 1);
+    }
+    console.log('\n   Pipeline breakdown:');
+    for (const [method, count] of byMethod) {
+      console.log(`     ${method}: ${count} pairs`);
+    }
+
   } catch (err) {
     console.log(`   ❌ Failed: ${(err as Error).message}`);
+    console.error(err);
   }
 }
 
@@ -306,17 +368,18 @@ async function main() {
     case 'verify':
       await testVerify();
       break;
+    case 'bucket':
     case 'batch-match':
-      await testBatchMatch();
+      await testBucketMatch();
       break;
     case 'full-test':
       await testPing();
       await testVerify();
-      await testBatchMatch();
+      await testBucketMatch();
       break;
     default:
       console.log(`Unknown command: ${command}`);
-      console.log('Commands: ping, verify, batch-match, full-test');
+      console.log('Commands: ping, verify, bucket, full-test');
       process.exit(1);
   }
 

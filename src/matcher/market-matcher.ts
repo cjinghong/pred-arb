@@ -588,27 +588,16 @@ export class MarketMatcher {
 
     eventBus.emit('discovery:match_pass', { pass: 'fuzzy', pairs: fuzzyCandidates.length, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
 
-    // ─── Pass 5: LLM batch-match for remaining unmatched ────────────────
+    // ─── Pass 5: LLM bucket-match for remaining unmatched ───────────────
+    // Instead of dumping 50 random markets into the LLM, we:
+    // 1. Use Fuse.js to find top fuzzy candidates for each A market
+    // 2. Group into buckets: { marketA, candidates: [top B matches] }
+    // 3. Send buckets to LLM for verification (much more targeted)
     const remainingA = marketsA.filter(a => !usedA.has(a.id));
     const remainingB = marketsB.filter(b => !usedB.has(b.id));
 
     if (this.llmVerifier.isEnabled && remainingA.length > 0 && remainingB.length > 0) {
-      // Cap each side to top 50 by volume to prevent LLM timeout on huge market sets
-      const MAX_LLM_MARKETS = 50;
-      const capA = remainingA.length > MAX_LLM_MARKETS
-        ? remainingA.sort((a, b) => (b.volume || 0) - (a.volume || 0)).slice(0, MAX_LLM_MARKETS)
-        : remainingA;
-      const capB = remainingB.length > MAX_LLM_MARKETS
-        ? remainingB.sort((a, b) => (b.volume || 0) - (a.volume || 0)).slice(0, MAX_LLM_MARKETS)
-        : remainingB;
-
-      if (remainingA.length > MAX_LLM_MARKETS || remainingB.length > MAX_LLM_MARKETS) {
-        log.info(`LLM batch-match capped: ${remainingA.length}→${capA.length} A, ${remainingB.length}→${capB.length} B`);
-      }
-
-      eventBus.emit('discovery:match_pass', { pass: 'llm-start', pairs: 0, remaining: capA.length + capB.length });
-
-      const llmPairs = await this.llmBatchMatch(capA, capB);
+      const llmPairs = await this.llmBucketMatch(remainingA, remainingB, usedA, usedB);
       for (const lp of llmPairs) {
         const pairId = MarketMatcher.pairId(lp.marketA.id, lp.marketB.id);
         const savedStatus = this.pairStatuses.get(pairId);
@@ -619,14 +608,13 @@ export class MarketMatcher {
           confidence: lp.confidence,
           matchMethod: 'llm_matched',
           // LLM matches always start as 'pending' — require manual approval.
-          // Local LLMs can hallucinate high confidence on wrong matches.
           status: savedStatus || 'pending',
           llmVerification: lp.llmResult,
         });
         usedA.add(lp.marketA.id);
         usedB.add(lp.marketB.id);
       }
-      log.info(`Pass 5: ${llmPairs.length} pairs from LLM batch-match`);
+      log.info(`Pass 5: ${llmPairs.length} pairs from LLM bucket-match`);
       eventBus.emit('discovery:match_pass', { pass: 'llm-done', pairs: llmPairs.length, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
     } else if (!this.llmVerifier.isEnabled) {
       eventBus.emit('discovery:match_pass', { pass: 'llm-skip', pairs: 0, remaining: remainingA.length + remainingB.length });
@@ -725,24 +713,83 @@ export class MarketMatcher {
    *
    * Optimized for minimal LLM calls by batching.
    */
-  private async llmBatchMatch(
+  /**
+   * LLM bucket-match: fuzzy pre-grouping → candidate buckets → LLM verify.
+   *
+   * Instead of randomly dumping markets into the LLM, we:
+   * 1. Use Fuse.js to find top-3 fuzzy candidates for each A market in B
+   * 2. Filter to only buckets with a reasonable fuzzy score (>= 0.3)
+   * 3. Sort buckets by best fuzzy score (most likely matches first)
+   * 4. Send top N buckets to LLM for verification
+   *
+   * This is much more targeted: the LLM only sees plausible candidate pairs.
+   */
+  private async llmBucketMatch(
     marketsA: NormalizedMarket[],
     marketsB: NormalizedMarket[],
+    usedA: Set<string>,
+    usedB: Set<string>,
   ): Promise<Array<{
     marketA: NormalizedMarket;
     marketB: NormalizedMarket;
     confidence: number;
     llmResult: LLMVerificationResult;
   }>> {
-    // Cap the number of markets sent to the LLM to control cost
-    const MAX_PER_SIDE = 50;
-    const subsetA = marketsA.slice(0, MAX_PER_SIDE);
-    const subsetB = marketsB.slice(0, MAX_PER_SIDE);
+    const MAX_BUCKETS = 20; // Max buckets per LLM call
+    const CANDIDATES_PER_BUCKET = 3; // Top fuzzy candidates per A market
+    const MIN_FUZZY_SCORE = 0.3; // Minimum fuzzy score to even bother with LLM
 
-    if (subsetA.length === 0 || subsetB.length === 0) return [];
+    if (marketsA.length === 0 || marketsB.length === 0) return [];
 
-    log.info(`LLM batch-match: ${subsetA.length} from A, ${subsetB.length} from B`);
+    // ── Step 1: Fuzzy pre-grouping ────────────────────────────────────────
+    // For each A market, find its top fuzzy candidates in B
+    const bucketFuse = new Fuse(marketsB, {
+      keys: ['question'],
+      threshold: 0.7,
+      includeScore: true,
+    });
 
+    const buckets: Array<{
+      marketA: NormalizedMarket;
+      candidates: NormalizedMarket[];
+      bestScore: number;
+    }> = [];
+
+    for (const a of marketsA) {
+      if (usedA.has(a.id)) continue;
+      const results = bucketFuse.search(a.question);
+
+      const topCandidates: NormalizedMarket[] = [];
+      let bestScore = 0;
+
+      for (const r of results.slice(0, CANDIDATES_PER_BUCKET)) {
+        if (usedB.has(r.item.id)) continue;
+        const score = 1 - (r.score ?? 1);
+        if (score >= MIN_FUZZY_SCORE) {
+          topCandidates.push(r.item);
+          bestScore = Math.max(bestScore, score);
+        }
+      }
+
+      if (topCandidates.length > 0) {
+        buckets.push({ marketA: a, candidates: topCandidates, bestScore });
+      }
+    }
+
+    // Sort by best fuzzy score descending — prioritize most likely matches
+    buckets.sort((a, b) => b.bestScore - a.bestScore);
+    const selectedBuckets = buckets.slice(0, MAX_BUCKETS);
+
+    log.info(`LLM bucket-match: ${marketsA.length} A × ${marketsB.length} B → ${buckets.length} buckets → ${selectedBuckets.length} sent to LLM`);
+
+    if (selectedBuckets.length === 0) {
+      eventBus.emit('discovery:match_pass', { pass: 'llm-skip', pairs: 0, remaining: marketsA.length + marketsB.length });
+      return [];
+    }
+
+    eventBus.emit('discovery:match_pass', { pass: 'llm-start', pairs: 0, remaining: selectedBuckets.length });
+
+    // ── Step 2: Send buckets to LLM ───────────────────────────────────────
     const llmPairs: Array<{
       marketA: NormalizedMarket;
       marketB: NormalizedMarket;
@@ -750,79 +797,40 @@ export class MarketMatcher {
       llmResult: LLMVerificationResult;
     }> = [];
 
-    // Build the prompt with numbered market lists
-    const listA = subsetA.map((m, i) => {
-      const cat = m.category ? ` [${m.category}]` : '';
-      const end = m.endDate ? ` [ends: ${m.endDate.toISOString().split('T')[0]}]` : '';
-      return `  A${i + 1}. "${m.question}"${cat}${end} (id: ${m.id})`;
-    }).join('\n');
-
-    const listB = subsetB.map((m, i) => {
-      const cat = m.category ? ` [${m.category}]` : '';
-      const end = m.endDate ? ` [ends: ${m.endDate.toISOString().split('T')[0]}]` : '';
-      return `  B${i + 1}. "${m.question}"${cat}${end} (id: ${m.id})`;
-    }).join('\n');
-
-    const prompt = `You are a prediction market matching engine. You must identify EXACT market matches between two platforms for cross-platform arbitrage.
-
-CRITICAL RULES — read carefully before matching:
-1. SAME ASSET/ENTITY: Both markets must reference the EXACT SAME asset, person, entity, or event. "Bitcoin" ≠ "Ethereum". "Trump" ≠ "Biden". "Lakers" ≠ "Celtics".
-2. SAME THRESHOLD/TARGET: Both must use the same price target, percentage, or metric. "$100,000" ≠ "$60,000". "above 4000" ≠ "above 60000".
-3. SAME DATE/TIMEFRAME: Both must resolve on the same date or timeframe. "by December 31, 2026" ≠ "on March 19". "end of Q1" ≠ "end of year".
-4. SAME DIRECTION: "Will X happen?" ≠ "Will X NOT happen?" unless outcomes are explicitly complementary.
-5. SAME RESOLUTION CRITERIA: Both must resolve under the same conditions. "reach" vs "close above" may differ.
-
-WRONG MATCHES (examples of what NOT to match):
-- "Will Ethereum reach $4,000 by Dec 2026?" ↔ "Will Bitcoin be above $60,000 on March 19?" → DIFFERENT ASSET + DIFFERENT PRICE + DIFFERENT DATE
-- "Will Bitcoin reach $100,000 by Dec 2026?" ↔ "Will Bitcoin be above $60,000 on March 19?" → DIFFERENT PRICE + DIFFERENT DATE
-- "Will Trump win 2028?" ↔ "Will a Republican win 2028?" → DIFFERENT ENTITY (Trump ≠ any Republican)
-- "Fed rate cut in June?" ↔ "Fed rate cut in September?" → DIFFERENT DATE
-
-CORRECT MATCHES (examples):
-- "Will Bitcoin reach $100k by end of 2026?" ↔ "Bitcoin to hit $100,000 by December 31, 2026?" → SAME asset, target, date
-- "Will Trump win the 2028 election?" ↔ "Donald Trump to win 2028 presidential election?" → SAME person, event, date
-
-LIST A:
-${listA}
-
-LIST B:
-${listB}
-
-Return ONLY a JSON array. Include ONLY matches where ALL criteria (asset, target, date, direction) are identical. If unsure, do NOT include the pair. Return [] if no exact matches found.
-[
-  { "a": "A1", "b": "B3", "confidence": 0.95, "reasoning": "Both: Bitcoin, $100k target, by end of 2026" }
-]
-
-Confidence guide: 0.99 = identical wording, 0.95 = same meaning different wording, <0.90 = do NOT include.`;
-
     try {
-      // Use the LLM verifier's callLLM() to support both Anthropic and Ollama/OpenAI providers
-      let text = await this.llmVerifier.callLLM(prompt, 4096);
+      const matches = await this.llmVerifier.batchMatchBuckets(
+        selectedBuckets.map(b => ({ marketA: b.marketA, candidates: b.candidates })),
+      );
 
-      if (text.trim().startsWith('```')) {
-        text = text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
-      }
+      // ── Step 3: Parse LLM results back to market pairs ────────────────
+      for (const match of matches) {
+        if (match.confidence < 0.90) continue;
 
-      const parsed: Array<{ a: string; b: string; confidence: number; reasoning: string }> = JSON.parse(text);
-
-      for (const match of parsed) {
-        // Parse "A1" → index 0, "B3" → index 2
+        // Parse "A1" → bucket index 0, "B1.2" → bucket 0, candidate index 1
         const aIdx = parseInt(match.a.replace(/^A/i, '')) - 1;
-        const bIdx = parseInt(match.b.replace(/^B/i, '')) - 1;
+        if (aIdx < 0 || aIdx >= selectedBuckets.length) continue;
 
-        if (aIdx < 0 || aIdx >= subsetA.length || bIdx < 0 || bIdx >= subsetB.length) continue;
-        if (match.confidence < 0.90) continue; // Raised from 0.85 → 0.90
+        const bParts = match.b.replace(/^B/i, '').split('.');
+        const bBucket = parseInt(bParts[0]) - 1;
+        const bCandIdx = parseInt(bParts[1]) - 1;
 
-        const mA = subsetA[aIdx];
-        const mB = subsetB[bIdx];
+        if (bBucket !== aIdx) {
+          log.warn('LLM returned cross-bucket match, skipping', { a: match.a, b: match.b });
+          continue;
+        }
 
-        // ── Post-LLM sanity check: catch hallucinated matches ──────────
+        const bucket = selectedBuckets[aIdx];
+        if (bCandIdx < 0 || bCandIdx >= bucket.candidates.length) continue;
+
+        const mA = bucket.marketA;
+        const mB = bucket.candidates[bCandIdx];
+
+        // Post-LLM sanity check
         if (!MarketMatcher.passesBasicSanityCheck(mA.question, mB.question)) {
           log.warn('LLM match REJECTED by sanity check', {
             a: mA.question.slice(0, 80),
             b: mB.question.slice(0, 80),
             llmConfidence: match.confidence,
-            llmReasoning: match.reasoning,
           });
           continue;
         }
@@ -838,15 +846,10 @@ Confidence guide: 0.99 = identical wording, 0.95 = same meaning different wordin
         const pairId = MarketMatcher.pairId(mA.id, mB.id);
         this.llmResults.set(pairId, llmResult);
 
-        llmPairs.push({
-          marketA: mA,
-          marketB: mB,
-          confidence: match.confidence,
-          llmResult,
-        });
+        llmPairs.push({ marketA: mA, marketB: mB, confidence: match.confidence, llmResult });
       }
     } catch (err) {
-      log.error('LLM batch-match failed', { error: (err as Error).message });
+      log.error('LLM bucket-match failed', { error: (err as Error).message });
     }
 
     return llmPairs;

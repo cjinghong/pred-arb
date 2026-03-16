@@ -4,7 +4,7 @@
 // the same market across platforms (100% correlation guarantee).
 //
 // Supports:
-// - Anthropic API (Claude) — default, uses ANTHROPIC_API_KEY
+// - Anthropic API (Claude) — default, uses ANTHROPIC_API_KEY + tool_use for forced JSON
 // - Ollama / OpenAI-compatible — set LLM_PROVIDER=ollama, LLM_BASE_URL, LLM_MODEL
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -25,7 +25,7 @@ export interface LLMVerificationResult {
   reasoning: string;
 }
 
-interface CandidatePair {
+export interface CandidatePair {
   marketA: NormalizedMarket;
   marketB: NormalizedMarket;
   fuzzyScore: number;
@@ -42,12 +42,64 @@ const PERMANENT_DISABLE_PATTERNS = [
 
 type LLMProvider = 'anthropic' | 'ollama' | 'openai';
 
+// ─── Anthropic tool_use schema ────────────────────────────────────────────
+// Forces Claude to return structured JSON via tool_use instead of freeform text.
+
+const VERIFY_PAIRS_TOOL = {
+  name: 'submit_verification_results',
+  description: 'Submit the verification results for market pairs.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      results: {
+        type: 'array' as const,
+        items: {
+          type: 'object' as const,
+          properties: {
+            pair: { type: 'number' as const, description: 'Pair number (1-indexed)' },
+            isSameMarket: { type: 'boolean' as const, description: 'Whether both markets resolve identically' },
+            confidence: { type: 'number' as const, description: 'Confidence 0.0–1.0' },
+            reasoning: { type: 'string' as const, description: 'Brief explanation' },
+          },
+          required: ['pair', 'isSameMarket', 'confidence', 'reasoning'],
+        },
+      },
+    },
+    required: ['results'],
+  },
+};
+
+const BATCH_MATCH_TOOL = {
+  name: 'submit_matches',
+  description: 'Submit the matched market pairs found between list A and list B.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {
+      matches: {
+        type: 'array' as const,
+        description: 'Array of matched pairs. Empty array if no matches found.',
+        items: {
+          type: 'object' as const,
+          properties: {
+            a: { type: 'string' as const, description: 'Market ID from list A (e.g., "A1")' },
+            b: { type: 'string' as const, description: 'Market ID from list B (e.g., "B3")' },
+            confidence: { type: 'number' as const, description: 'Confidence 0.0–1.0. Only include if >= 0.90' },
+            reasoning: { type: 'string' as const, description: 'Brief explanation of why these match' },
+          },
+          required: ['a', 'b', 'confidence', 'reasoning'],
+        },
+      },
+    },
+    required: ['matches'],
+  },
+};
+
 /**
  * LLMVerifier uses an LLM API to confirm that fuzzy-matched
  * prediction market pairs are truly equivalent.
  *
  * Supports two provider modes:
- * - 'anthropic': Anthropic Messages API (Claude)
+ * - 'anthropic': Anthropic Messages API (Claude) with tool_use for guaranteed JSON
  * - 'ollama' / 'openai': OpenAI-compatible chat completions (Ollama, vLLM, etc.)
  */
 export class LLMVerifier {
@@ -79,7 +131,7 @@ export class LLMVerifier {
       if (!this.enabled) {
         log.warn('LLM verifier disabled — no ANTHROPIC_API_KEY configured');
       } else {
-        log.info('LLM verifier using Anthropic API', { model: this.anthropicModel });
+        log.info('LLM verifier using Anthropic API (tool_use)', { model: this.anthropicModel });
       }
     } else {
       // Ollama / OpenAI-compatible — enabled if we have a base URL
@@ -133,7 +185,7 @@ export class LLMVerifier {
 
   /**
    * Send a prompt to the configured LLM and return the text response.
-   * Handles Anthropic, Ollama (native /api/generate), and OpenAI-compatible APIs.
+   * For plain text responses (e.g., ping test). Does NOT use tool_use.
    */
   async callLLM(prompt: string, maxTokens = 2048): Promise<string> {
     if (this.provider === 'anthropic') {
@@ -143,6 +195,50 @@ export class LLMVerifier {
     } else {
       return this.callOpenAICompatible(prompt, maxTokens);
     }
+  }
+
+  /**
+   * Call Anthropic with tool_use to force structured JSON output.
+   * The model MUST call the specified tool, which guarantees valid JSON.
+   */
+  async callAnthropicWithTool<T>(
+    prompt: string,
+    tool: { name: string; description: string; input_schema: Record<string, unknown> },
+    maxTokens = 2048,
+  ): Promise<T> {
+    const response = await fetch(this.anthropicApiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': this.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: this.anthropicModel,
+        max_tokens: maxTokens,
+        tools: [tool],
+        tool_choice: { type: 'tool', name: tool.name },
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      this.checkAndDisableOnPermanentError(errorText, response.status);
+      throw new Error(`Anthropic API error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json() as {
+      content: Array<{ type: string; name?: string; input?: T; text?: string }>;
+    };
+
+    // Find the tool_use content block
+    const toolBlock = data.content?.find(c => c.type === 'tool_use');
+    if (toolBlock?.input) {
+      return toolBlock.input;
+    }
+
+    throw new Error('Anthropic response missing tool_use block');
   }
 
   private async callAnthropic(prompt: string, maxTokens: number): Promise<string> {
@@ -334,23 +430,39 @@ STRICT MATCHING RULES — ALL must be true for isSameMarket=true:
 
 If ANY of these differ, isSameMarket MUST be false. When in doubt, say false.
 
-WRONG (isSameMarket must be false):
-- "Will Morgan Wallen be top Spotify artist 2026?" vs "Will Ethereum be above $1600 on March 17?" → COMPLETELY DIFFERENT topics
-- "Will Ethereum reach $4,000 by Dec 2026?" vs "Will Bitcoin be above $60,000 on March 19?" → DIFFERENT asset + price + date
-- "Will Bitcoin reach $100k by Dec 2026?" vs "Will Bitcoin be above $60k on March 19?" → DIFFERENT price + date
-
-For each pair, return ONLY a JSON array:
-[
-  { "pair": 1, "isSameMarket": false, "confidence": 0.0, "reasoning": "Different topics entirely" }
-]
-
 Here are the pairs to verify:
 
-${pairsText}`;
+${pairsText}
 
-    const text = await this.callLLM(prompt, 2048);
+Call the submit_verification_results tool with your analysis.`;
 
-    // Parse the JSON response — handle markdown code blocks
+    // ── Anthropic: use tool_use for guaranteed JSON ──────────────────────
+    if (this.provider === 'anthropic') {
+      type ToolResult = { results: Array<{ pair: number; isSameMarket: boolean; confidence: number; reasoning: string }> };
+      const toolResult = await this.callAnthropicWithTool<ToolResult>(prompt, VERIFY_PAIRS_TOOL, 2048);
+
+      return batch.map((c, i) => {
+        const llmResult = toolResult.results?.find(p => p.pair === i + 1) || {
+          isSameMarket: false, confidence: 0, reasoning: 'Missing from LLM response',
+        };
+        return {
+          marketA: { id: c.marketA.id, platform: c.marketA.platform, question: c.marketA.question },
+          marketB: { id: c.marketB.id, platform: c.marketB.platform, question: c.marketB.question },
+          isSameMarket: llmResult.isSameMarket,
+          confidence: llmResult.confidence,
+          reasoning: llmResult.reasoning,
+        };
+      });
+    }
+
+    // ── Ollama/OpenAI: text-based with JSON parsing ─────────────────────
+    const textPrompt = prompt.replace(
+      'Call the submit_verification_results tool with your analysis.',
+      `Return ONLY a JSON array:\n[\n  { "pair": 1, "isSameMarket": false, "confidence": 0.0, "reasoning": "Different topics" }\n]`,
+    );
+
+    const text = await this.callLLM(textPrompt, 2048);
+
     let jsonStr = text.trim();
     if (jsonStr.startsWith('```')) {
       jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
@@ -361,7 +473,6 @@ ${pairsText}`;
       parsed = JSON.parse(jsonStr);
     } catch {
       log.warn('Failed to parse LLM response', { text: jsonStr.slice(0, 200) });
-      // Return conservative results
       return batch.map(c => ({
         marketA: { id: c.marketA.id, platform: c.marketA.platform, question: c.marketA.question },
         marketB: { id: c.marketB.id, platform: c.marketB.platform, question: c.marketB.question },
@@ -373,11 +484,8 @@ ${pairsText}`;
 
     return batch.map((c, i) => {
       const llmResult = parsed.find(p => p.pair === i + 1) || {
-        isSameMarket: false,
-        confidence: 0,
-        reasoning: 'Missing from LLM response',
+        isSameMarket: false, confidence: 0, reasoning: 'Missing from LLM response',
       };
-
       return {
         marketA: { id: c.marketA.id, platform: c.marketA.platform, question: c.marketA.question },
         marketB: { id: c.marketB.id, platform: c.marketB.platform, question: c.marketB.question },
@@ -386,6 +494,72 @@ ${pairsText}`;
         reasoning: llmResult.reasoning,
       };
     });
+  }
+
+  // ─── Batch Match (with tool_use) ─────────────────────────────────────
+
+  /**
+   * Batch-match candidate buckets using the LLM.
+   * Each bucket = one market from A + its top fuzzy candidates from B.
+   * For Anthropic: uses tool_use for guaranteed JSON.
+   */
+  async batchMatchBuckets(
+    buckets: Array<{ marketA: NormalizedMarket; candidates: NormalizedMarket[] }>,
+  ): Promise<Array<{ a: string; b: string; confidence: number; reasoning: string }>> {
+    // Build compact prompt: for each bucket, show A market + its candidate Bs
+    const bucketsText = buckets.map((bucket, i) => {
+      const catA = bucket.marketA.category ? ` [${bucket.marketA.category}]` : '';
+      const endA = bucket.marketA.endDate ? ` [ends: ${bucket.marketA.endDate.toISOString().split('T')[0]}]` : '';
+      const candidatesText = bucket.candidates.map((c, j) => {
+        const cat = c.category ? ` [${c.category}]` : '';
+        const end = c.endDate ? ` [ends: ${c.endDate.toISOString().split('T')[0]}]` : '';
+        return `    B${i + 1}.${j + 1}. "${c.question}"${cat}${end} (id: ${c.id})`;
+      }).join('\n');
+
+      return `BUCKET ${i + 1}:
+  A${i + 1}. "${bucket.marketA.question}"${catA}${endA} (id: ${bucket.marketA.id})
+  Candidates:
+${candidatesText}`;
+    }).join('\n\n');
+
+    const prompt = `You are a prediction market matching engine. For each bucket below, determine if any candidate from B is THE EXACT SAME MARKET as the A market.
+
+STRICT RULES — ALL must be true:
+1. SAME ASSET/ENTITY: "Bitcoin" ≠ "Ethereum". "Trump" ≠ "Biden".
+2. SAME THRESHOLD: "$100,000" ≠ "$60,000". "above 4000" ≠ "above 1600".
+3. SAME DATE/TIMEFRAME: "by December 31, 2026" ≠ "on March 17".
+4. SAME DIRECTION: "Will X happen?" = "Will X happen?". "reach" ≠ "stay below".
+
+If ANY differ, do NOT match. When in doubt, do NOT match.
+
+${bucketsText}
+
+For each bucket, pick AT MOST ONE best match from its candidates (or none). Use format "A1" for the first bucket's A market, "B1.2" for the 2nd candidate in bucket 1.
+Call submit_matches with your results. Include ONLY matches with confidence >= 0.90. Return empty matches array if no exact matches found.`;
+
+    if (this.provider === 'anthropic') {
+      type ToolResult = { matches: Array<{ a: string; b: string; confidence: number; reasoning: string }> };
+      const toolResult = await this.callAnthropicWithTool<ToolResult>(prompt, BATCH_MATCH_TOOL, 4096);
+      return toolResult.matches || [];
+    }
+
+    // ── Ollama/OpenAI fallback ──────────────────────────────────────────
+    const textPrompt = prompt.replace(
+      'Call submit_matches with your results. Include ONLY matches with confidence >= 0.90. Return empty matches array if no exact matches found.',
+      `Return ONLY a JSON array of matches. Confidence >= 0.90 only. Return [] if none.\n[\n  { "a": "A1", "b": "B1.2", "confidence": 0.95, "reasoning": "Same event, same date" }\n]`,
+    );
+
+    let text = await this.callLLM(textPrompt, 4096);
+    if (text.trim().startsWith('```')) {
+      text = text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    }
+
+    try {
+      return JSON.parse(text.trim());
+    } catch {
+      log.warn('Failed to parse LLM batch-match response', { text: text.slice(0, 200) });
+      return [];
+    }
   }
 
   /** Clear the verification cache */
