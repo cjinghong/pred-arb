@@ -149,6 +149,7 @@ interface PolymarketRawOrderBook {
 // Polymarket Gamma API supports `tag` (slug name) for filtering.
 // These are the known tag slugs for sports categories.
 const POLYMARKET_CATEGORY_TAGS: Record<string, string> = {
+  // Sports
   sports: 'sports',
   basketball: 'basketball',
   nba: 'nba',
@@ -169,6 +170,18 @@ const POLYMARKET_CATEGORY_TAGS: Record<string, string> = {
   boxing: 'boxing',
   cricket: 'cricket',
   esports: 'esports',
+  // Politics
+  politics: 'politics',
+  elections: 'elections',
+  'us-politics': 'us-politics',
+  'us-elections': 'us-election',
+  // Crypto / Finance
+  crypto: 'crypto',
+  finance: 'finance',
+  // Culture / Tech / Science
+  culture: 'culture',
+  tech: 'tech',
+  science: 'science',
 };
 
 // ─── Connector Implementation ────────────────────────────────────────────

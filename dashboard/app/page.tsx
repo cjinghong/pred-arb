@@ -777,8 +777,16 @@ export default function DashboardPage() {
                         <option value="boxing">BOXING</option>
                         <option value="cricket">CRICKET</option>
                       </optgroup>
+                      <optgroup label="Politics">
+                        <option value="politics">ALL POLITICS</option>
+                        <option value="elections">ELECTIONS</option>
+                        <option value="us-politics">US POLITICS</option>
+                      </optgroup>
                       <optgroup label="Other">
+                        <option value="crypto">CRYPTO</option>
                         <option value="esports">ESPORTS</option>
+                        <option value="finance">FINANCE</option>
+                        <option value="culture">CULTURE</option>
                       </optgroup>
                     </select>
                   </div>
