@@ -147,6 +147,12 @@ export interface ArbitrageOpportunity {
   matchConfidence: number;
   /** Whether this opportunity has been acted on */
   executed: boolean;
+  /** Whether outcomes are inverted between the two markets */
+  outcomesInverted?: boolean;
+  /** Outcome labels for market A (e.g., ["Suns", "Celtics"]) */
+  outcomesA?: string[];
+  /** Outcome labels for market B (e.g., ["Celtics", "Suns"]) */
+  outcomesB?: string[];
 }
 
 export interface ArbLeg {

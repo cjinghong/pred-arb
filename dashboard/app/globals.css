@@ -891,6 +891,38 @@ html, body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* ─── Outcome Inversion / Hedge Indicators ───────────────────────────── */
+
+.outcome-team {
+  font-size: 9px;
+  color: var(--accent-blue, #66ccff);
+  font-weight: 500;
+  margin-left: 2px;
+  white-space: nowrap;
+}
+
+.hedge-badge {
+  font-size: 8px;
+  font-weight: 700;
+  color: #111;
+  background: var(--accent-green);
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+  align-self: center;
+}
+
+.inverted-badge {
+  font-size: 8px;
+  font-weight: 600;
+  color: var(--accent-amber, #ffb300);
+  background: rgba(255, 179, 0, 0.15);
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.3px;
+}
+
 /* ─── Manual Match Mode ───────────────────────────────────────────────── */
 
 .manual-match-section {

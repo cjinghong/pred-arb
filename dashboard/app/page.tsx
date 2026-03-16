@@ -50,6 +50,9 @@ interface Opportunity {
   executed: boolean;
   status?: 'open' | 'executing' | 'executed' | 'failed' | 'expired' | 'rejected';
   failReason?: string;
+  outcomesInverted?: boolean;
+  outcomesA?: string[];
+  outcomesB?: string[];
 }
 
 interface PositionItem {
@@ -81,11 +84,12 @@ interface MarketItem {
 
 interface MatchedPair {
   pairId: string;
-  marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
-  marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
+  marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string; outcomes?: string[] };
+  marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string; outcomes?: string[] };
   confidence: number;
   matchMethod: string;
   status: 'pending' | 'approved' | 'paused' | 'rejected';
+  outcomesInverted?: boolean;
   llmReasoning?: string;
 }
 
@@ -467,6 +471,27 @@ export default function DashboardPage() {
     return { label: 'OPEN', cls: 'status-pending-trade' };
   };
 
+  /**
+   * Resolve the real-world display label for an opportunity leg.
+   * When outcomesInverted is true on the B leg, raw YES/NO is misleading.
+   * Instead, show the team/outcome name the leg is betting on.
+   */
+  const getLegDisplay = (opp: Opportunity, leg: 'A' | 'B'): { label: string; isHedged: boolean; teamBetting: string | null } => {
+    const legData = leg === 'A' ? opp.legA : opp.legB;
+    const outcomes = leg === 'A' ? opp.outcomesA : opp.outcomesB;
+    const rawOutcome = legData.outcome; // YES or NO
+
+    // If no inversion or no outcome labels, show raw
+    if (!opp.outcomesInverted || !outcomes || outcomes.length < 2) {
+      return { label: rawOutcome, isHedged: false, teamBetting: null };
+    }
+
+    // For inverted pairs, show which team this leg is actually betting on
+    // YES = outcomes[0], NO = outcomes[1]
+    const teamBetting = rawOutcome === 'YES' ? outcomes[0] : outcomes[1];
+    return { label: rawOutcome, isHedged: true, teamBetting };
+  };
+
   // ─── Filtered + searched opportunities ─────────────────────────────────
   const filteredOpps = opportunities.filter(opp => {
     if (!oppSearch) return true;
@@ -640,23 +665,42 @@ export default function DashboardPage() {
                       <div className="opp-fail-reason">{opp.failReason}</div>
                     )}
                     <div className="opp-card-legs">
-                      <div className="opp-leg">
-                        <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
-                        <span className={`row-outcome ${opp.legA.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
-                          {opp.legA.outcome}
-                        </span>
-                        <span className="row-price">{opp.legA.price.toFixed(3)}</span>
-                        <span className="opp-market-q">{opp.legA.marketQuestion?.slice(0, 50) || '—'}</span>
-                      </div>
-                      <span className="opp-arrow">↔</span>
-                      <div className="opp-leg">
-                        <span className={`row-platform platform-${opp.legB.platform}`}>{opp.legB.platform.slice(0, 5)}</span>
-                        <span className={`row-outcome ${opp.legB.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
-                          {opp.legB.outcome}
-                        </span>
-                        <span className="row-price">{opp.legB.price.toFixed(3)}</span>
-                        <span className="opp-market-q">{opp.legB.marketQuestion?.slice(0, 50) || '—'}</span>
-                      </div>
+                      {(() => {
+                        const legADisplay = getLegDisplay(opp, 'A');
+                        const legBDisplay = getLegDisplay(opp, 'B');
+                        return (<>
+                          <div className="opp-leg">
+                            <span className={`row-platform platform-${opp.legA.platform}`}>{opp.legA.platform.slice(0, 5)}</span>
+                            <span className={`row-outcome ${opp.legA.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                              {opp.legA.outcome}
+                            </span>
+                            {legADisplay.teamBetting && (
+                              <span className="outcome-team" title={`Betting on: ${legADisplay.teamBetting}`}>
+                                ({legADisplay.teamBetting.slice(0, 12)})
+                              </span>
+                            )}
+                            <span className="row-price">{opp.legA.price.toFixed(3)}</span>
+                            <span className="opp-market-q">{opp.legA.marketQuestion?.slice(0, 50) || '—'}</span>
+                          </div>
+                          <span className="opp-arrow">{opp.outcomesInverted ? '⇄' : '↔'}</span>
+                          <div className="opp-leg">
+                            <span className={`row-platform platform-${opp.legB.platform}`}>{opp.legB.platform.slice(0, 5)}</span>
+                            <span className={`row-outcome ${opp.legB.outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                              {opp.legB.outcome}
+                            </span>
+                            {legBDisplay.teamBetting && (
+                              <span className="outcome-team" title={`Betting on: ${legBDisplay.teamBetting}`}>
+                                ({legBDisplay.teamBetting.slice(0, 12)})
+                              </span>
+                            )}
+                            <span className="row-price">{opp.legB.price.toFixed(3)}</span>
+                            <span className="opp-market-q">{opp.legB.marketQuestion?.slice(0, 50) || '—'}</span>
+                          </div>
+                          {opp.outcomesInverted && (
+                            <span className="hedge-badge" title="Outcomes are inverted between platforms — this is a hedged trade">HEDGED</span>
+                          )}
+                        </>);
+                      })()}
                     </div>
                   </div>
                   );
@@ -795,6 +839,9 @@ export default function DashboardPage() {
                               <span className="pair-confidence">{formatPct(pair.confidence * 100)}</span>
                               <span className={`pair-method method-${pair.matchMethod}`}>{pair.matchMethod.replace('_', ' ')}</span>
                               <span className={`pair-status-badge status-${pair.status ?? 'pending'}`}>{(pair.status ?? 'pending').toUpperCase()}</span>
+                              {pair.outcomesInverted && (
+                                <span className="inverted-badge" title="YES on one platform = NO on the other. Outcomes are inverted but correctly handled.">INVERTED</span>
+                              )}
                             </div>
                             {pair.llmReasoning && (
                               <div className="pair-reasoning">{pair.llmReasoning}</div>

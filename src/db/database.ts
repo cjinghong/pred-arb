@@ -155,6 +155,17 @@ export function initializeDatabase(): void {
     db.exec(`ALTER TABLE market_pairs ADD COLUMN outcomes_inverted INTEGER DEFAULT 0`);
   } catch { /* column already exists */ }
 
+  // Migration: add outcomes_inverted, outcomes_a, outcomes_b to opportunities
+  try {
+    db.exec(`ALTER TABLE opportunities ADD COLUMN outcomes_inverted INTEGER DEFAULT 0`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE opportunities ADD COLUMN outcomes_a TEXT`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE opportunities ADD COLUMN outcomes_b TEXT`);
+  } catch { /* column already exists */ }
+
   log.info('Database schema initialized');
 }
 
@@ -167,14 +178,18 @@ export function insertOpportunity(opp: ArbitrageOpportunity): void {
       id, strategy_id, discovered_at,
       leg_a_platform, leg_a_market_id, leg_a_question, leg_a_outcome, leg_a_price,
       leg_b_platform, leg_b_market_id, leg_b_question, leg_b_outcome, leg_b_price,
-      expected_profit_usd, expected_profit_bps, max_size, match_confidence, executed
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      expected_profit_usd, expected_profit_bps, max_size, match_confidence, executed,
+      outcomes_inverted, outcomes_a, outcomes_b
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     opp.id, opp.strategyId, opp.discoveredAt.toISOString(),
     opp.legA.platform, opp.legA.marketId, opp.legA.marketQuestion, opp.legA.outcome, opp.legA.price,
     opp.legB.platform, opp.legB.marketId, opp.legB.marketQuestion, opp.legB.outcome, opp.legB.price,
     opp.expectedProfitUsd, opp.expectedProfitBps, opp.maxSize, opp.matchConfidence,
     opp.executed ? 1 : 0,
+    opp.outcomesInverted ? 1 : 0,
+    opp.outcomesA ? JSON.stringify(opp.outcomesA) : null,
+    opp.outcomesB ? JSON.stringify(opp.outcomesB) : null,
   );
 }
 
@@ -409,6 +424,12 @@ export function resetAllData(): void {
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 function rowToOpportunity(row: Record<string, unknown>): ArbitrageOpportunity {
+  // Parse JSON-encoded outcome labels
+  let outcomesA: string[] | undefined;
+  let outcomesB: string[] | undefined;
+  try { if (row.outcomes_a) outcomesA = JSON.parse(row.outcomes_a as string); } catch { /* ignore */ }
+  try { if (row.outcomes_b) outcomesB = JSON.parse(row.outcomes_b as string); } catch { /* ignore */ }
+
   return {
     id: row.id as string,
     strategyId: row.strategy_id as string,
@@ -438,6 +459,9 @@ function rowToOpportunity(row: Record<string, unknown>): ArbitrageOpportunity {
     maxSize: row.max_size as number,
     matchConfidence: row.match_confidence as number,
     executed: (row.executed as number) === 1,
+    outcomesInverted: (row.outcomes_inverted as number) === 1,
+    outcomesA,
+    outcomesB,
     status: (row.status as string) || 'open',
     failReason: (row.fail_reason as string) || undefined,
   } as ArbitrageOpportunity & { status: string; failReason?: string };

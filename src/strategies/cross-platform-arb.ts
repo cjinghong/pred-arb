@@ -841,11 +841,12 @@ export class CrossPlatformArbStrategy implements Strategy {
     platforms: Record<string, { total: number; markets: Array<{ id: string; question: string; category: string; slug: string; eventSlug?: string; matched: boolean }> }>;
     matchedPairs: Array<{
       pairId: string;
-      marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
-      marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
+      marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string; outcomes?: string[] };
+      marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string; outcomes?: string[] };
       confidence: number;
       matchMethod: string;
       status: string;
+      outcomesInverted: boolean;
       llmReasoning?: string;
     }>;
   } {
@@ -876,11 +877,12 @@ export class CrossPlatformArbStrategy implements Strategy {
 
     const matchedPairs = this.cachedPairs.map(p => ({
       pairId: p.pairId,
-      marketA: { id: p.marketA.id, platform: p.marketA.platform, question: p.marketA.question, slug: p.marketA.slug || '', eventSlug: p.marketA.eventSlug },
-      marketB: { id: p.marketB.id, platform: p.marketB.platform, question: p.marketB.question, slug: p.marketB.slug || '', eventSlug: p.marketB.eventSlug },
+      marketA: { id: p.marketA.id, platform: p.marketA.platform, question: p.marketA.question, slug: p.marketA.slug || '', eventSlug: p.marketA.eventSlug, outcomes: p.marketA.outcomes },
+      marketB: { id: p.marketB.id, platform: p.marketB.platform, question: p.marketB.question, slug: p.marketB.slug || '', eventSlug: p.marketB.eventSlug, outcomes: p.marketB.outcomes },
       confidence: p.confidence,
       matchMethod: p.matchMethod,
       status: p.status,
+      outcomesInverted: p.outcomesInverted || false,
       llmReasoning: p.llmVerification?.reasoning,
     }));
 
@@ -1804,6 +1806,9 @@ export class CrossPlatformArbStrategy implements Strategy {
       maxSize,
       matchConfidence: pair.confidence,
       executed: false,
+      outcomesInverted: pair.outcomesInverted || false,
+      outcomesA: pair.marketA.outcomes,
+      outcomesB: pair.marketB.outcomes,
     };
   }
 }
