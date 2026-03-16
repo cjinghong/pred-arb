@@ -667,36 +667,9 @@ Return ONLY a JSON array of matched pairs. If a market has no match, omit it. Fo
 Only include matches you're confident about (>= 0.85). Return [] if no matches found.`;
 
     try {
-      const apiKey = this.llmVerifier['apiKey'] || process.env.ANTHROPIC_API_KEY || '';
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
+      // Use the LLM verifier's callLLM() to support both Anthropic and Ollama/OpenAI providers
+      let text = await this.llmVerifier.callLLM(prompt, 4096);
 
-      if (!response.ok) {
-        const errText = await response.text();
-        // Disable the verifier permanently on billing/quota errors
-        const disabled = this.llmVerifier.checkAndDisableOnPermanentError(errText, response.status);
-        if (!disabled) {
-          log.error('LLM batch-match API error', { status: response.status, error: errText.slice(0, 200) });
-        }
-        return [];
-      }
-
-      const data = await response.json() as {
-        content: Array<{ type: string; text: string }>;
-      };
-
-      let text = data.content?.[0]?.text || '[]';
       if (text.trim().startsWith('```')) {
         text = text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
       }

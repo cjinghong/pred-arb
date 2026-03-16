@@ -97,6 +97,17 @@ export const config = {
     apiKey: process.env.ANTHROPIC_API_KEY || '',
   },
 
+  llm: {
+    /** 'anthropic' (default), 'ollama' (native /api/generate), or 'openai' for OpenAI-compatible APIs */
+    provider: (process.env.LLM_PROVIDER || 'anthropic') as 'anthropic' | 'ollama' | 'openai',
+    /** Base URL for LLM API (Ollama default: http://localhost:11434) */
+    baseUrl: process.env.LLM_BASE_URL || 'http://localhost:11434',
+    /** Model name (e.g., 'llama3.1', 'mistral', 'qwen2.5') */
+    model: process.env.LLM_MODEL || 'llama3.1',
+    /** API key for OpenAI-compatible provider (not needed for Ollama) */
+    apiKey: process.env.LLM_API_KEY || '',
+  },
+
   logging: {
     level: env('LOG_LEVEL', 'info'),
   },

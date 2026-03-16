@@ -1,10 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // PRED-ARB :: LLM Market Match Verifier
-// Uses Claude API to verify that fuzzy-matched market pairs are truly
-// the same market across platforms (100% correlation guarantee)
+// Uses an LLM to verify that fuzzy-matched market pairs are truly
+// the same market across platforms (100% correlation guarantee).
+//
+// Supports:
+// - Anthropic API (Claude) — default, uses ANTHROPIC_API_KEY
+// - Ollama / OpenAI-compatible — set LLM_PROVIDER=ollama, LLM_BASE_URL, LLM_MODEL
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { NormalizedMarket } from '../types';
+import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
 
 const log = createChildLogger('llm-verifier');
@@ -26,18 +31,6 @@ interface CandidatePair {
   fuzzyScore: number;
 }
 
-/**
- * LLMVerifier uses the Anthropic API to confirm that fuzzy-matched
- * prediction market pairs are truly equivalent.
- *
- * Approach:
- * 1. Batch multiple candidate pairs into a single prompt
- * 2. Ask Claude to analyze each pair and determine if they resolve identically
- * 3. Return structured verification results
- *
- * This is a critical safety layer — incorrect matches would mean we're
- * taking two unhedged positions instead of an arb.
- */
 /** Errors that warrant permanently disabling the LLM verifier for the session */
 const PERMANENT_DISABLE_PATTERNS = [
   'credit balance is too low',
@@ -47,10 +40,24 @@ const PERMANENT_DISABLE_PATTERNS = [
   'payment',
 ];
 
+type LLMProvider = 'anthropic' | 'ollama' | 'openai';
+
+/**
+ * LLMVerifier uses an LLM API to confirm that fuzzy-matched
+ * prediction market pairs are truly equivalent.
+ *
+ * Supports two provider modes:
+ * - 'anthropic': Anthropic Messages API (Claude)
+ * - 'ollama' / 'openai': OpenAI-compatible chat completions (Ollama, vLLM, etc.)
+ */
 export class LLMVerifier {
   private apiKey: string;
-  private apiUrl = 'https://api.anthropic.com/v1/messages';
-  private model = 'claude-sonnet-4-20250514';
+  private provider: LLMProvider;
+  private anthropicApiUrl = 'https://api.anthropic.com/v1/messages';
+  private anthropicModel = 'claude-sonnet-4-20250514';
+  private ollamaBaseUrl: string;
+  private ollamaModel: string;
+  private ollamaApiKey: string;
   private maxBatchSize = 15; // pairs per LLM call
   private enabled: boolean;
   private disableReason: string | null = null;
@@ -59,10 +66,33 @@ export class LLMVerifier {
   private cache = new Map<string, LLMVerificationResult>();
 
   constructor(apiKey?: string) {
+    this.provider = config.llm.provider;
+    this.ollamaBaseUrl = config.llm.baseUrl;
+    this.ollamaModel = config.llm.model;
+    this.ollamaApiKey = config.llm.apiKey;
+
+    // For backward compat: if provider is anthropic, use ANTHROPIC_API_KEY
     this.apiKey = apiKey || process.env.ANTHROPIC_API_KEY || '';
-    this.enabled = !!this.apiKey;
-    if (!this.enabled) {
-      log.warn('LLM verifier disabled — no ANTHROPIC_API_KEY configured');
+
+    if (this.provider === 'anthropic') {
+      this.enabled = !!this.apiKey;
+      if (!this.enabled) {
+        log.warn('LLM verifier disabled — no ANTHROPIC_API_KEY configured');
+      } else {
+        log.info('LLM verifier using Anthropic API', { model: this.anthropicModel });
+      }
+    } else {
+      // Ollama / OpenAI-compatible — enabled if we have a base URL
+      this.enabled = !!this.ollamaBaseUrl;
+      if (this.enabled) {
+        log.info('LLM verifier using OpenAI-compatible API', {
+          provider: this.provider,
+          baseUrl: this.ollamaBaseUrl,
+          model: this.ollamaModel,
+        });
+      } else {
+        log.warn(`LLM verifier disabled — no LLM_BASE_URL configured for ${this.provider}`);
+      }
     }
   }
 
@@ -98,6 +128,124 @@ export class LLMVerifier {
     }
     return false;
   }
+
+  // ─── Core LLM Call ─────────────────────────────────────────────────────
+
+  /**
+   * Send a prompt to the configured LLM and return the text response.
+   * Handles Anthropic, Ollama (native /api/generate), and OpenAI-compatible APIs.
+   */
+  async callLLM(prompt: string, maxTokens = 2048): Promise<string> {
+    if (this.provider === 'anthropic') {
+      return this.callAnthropic(prompt, maxTokens);
+    } else if (this.provider === 'ollama') {
+      return this.callOllama(prompt, maxTokens);
+    } else {
+      return this.callOpenAICompatible(prompt, maxTokens);
+    }
+  }
+
+  private async callAnthropic(prompt: string, maxTokens: number): Promise<string> {
+    const response = await fetch(this.anthropicApiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': this.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: this.anthropicModel,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      this.checkAndDisableOnPermanentError(errorText, response.status);
+      throw new Error(`Anthropic API error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json() as {
+      content: Array<{ type: string; text: string }>;
+    };
+
+    return data.content?.[0]?.text || '[]';
+  }
+
+  private async callOllama(prompt: string, maxTokens: number): Promise<string> {
+    const url = `${this.ollamaBaseUrl}/api/generate`;
+
+    const systemPrefix = 'You are a prediction market analyst. Always respond with valid JSON only, no markdown formatting or extra text.\n\n';
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: this.ollamaModel,
+        prompt: systemPrefix + prompt,
+        stream: false,
+        options: {
+          temperature: 0.1, // Low temperature for structured JSON output
+          num_predict: maxTokens,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Ollama API error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json() as {
+      response: string;
+      done: boolean;
+    };
+
+    return data.response || '[]';
+  }
+
+  private async callOpenAICompatible(prompt: string, maxTokens: number): Promise<string> {
+    const url = `${this.ollamaBaseUrl}/chat/completions`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.ollamaApiKey) {
+      headers['Authorization'] = `Bearer ${this.ollamaApiKey}`;
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: this.ollamaModel,
+        max_tokens: maxTokens,
+        temperature: 0.1, // Low temperature for structured JSON output
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a prediction market analyst. Always respond with valid JSON only, no markdown formatting or extra text.',
+          },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`${this.provider} API error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json() as {
+      choices: Array<{ message: { content: string } }>;
+    };
+
+    return data.choices?.[0]?.message?.content || '[]';
+  }
+
+  // ─── Pair Verification ────────────────────────────────────────────────
 
   /**
    * Verify a batch of candidate pairs.
@@ -201,32 +349,7 @@ Here are the pairs to verify:
 
 ${pairsText}`;
 
-    const response = await fetch(this.apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': this.apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: this.model,
-        max_tokens: 2048,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      // Check for permanent errors (billing, quota) and self-disable
-      this.checkAndDisableOnPermanentError(errorText, response.status);
-      throw new Error(`Anthropic API error ${response.status}: ${errorText}`);
-    }
-
-    const data = await response.json() as {
-      content: Array<{ type: string; text: string }>;
-    };
-
-    const text = data.content?.[0]?.text || '[]';
+    const text = await this.callLLM(prompt, 2048);
 
     // Parse the JSON response — handle markdown code blocks
     let jsonStr = text.trim();
