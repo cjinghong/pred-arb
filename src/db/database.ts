@@ -150,6 +150,11 @@ export function initializeDatabase(): void {
     } catch { /* column already exists */ }
   }
 
+  // Migration: add outcomes_inverted column to market_pairs
+  try {
+    db.exec(`ALTER TABLE market_pairs ADD COLUMN outcomes_inverted INTEGER DEFAULT 0`);
+  } catch { /* column already exists */ }
+
   log.info('Database schema initialized');
 }
 
@@ -322,6 +327,7 @@ export function upsertMarketPair(pair: {
   status: string;
   confidence: number;
   matchMethod: string;
+  outcomesInverted?: boolean;
   llmIsSameMarket?: boolean;
   llmConfidence?: number;
   llmReasoning?: string;
@@ -332,13 +338,14 @@ export function upsertMarketPair(pair: {
       market_a_slug, market_a_event_slug,
       market_b_id, market_b_platform, market_b_question,
       market_b_slug, market_b_event_slug,
-      status, confidence, match_method,
+      status, confidence, match_method, outcomes_inverted,
       llm_is_same_market, llm_confidence, llm_reasoning
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(pair_id) DO UPDATE SET
       status = excluded.status,
       confidence = excluded.confidence,
       match_method = excluded.match_method,
+      outcomes_inverted = excluded.outcomes_inverted,
       market_a_slug = excluded.market_a_slug,
       market_a_event_slug = excluded.market_a_event_slug,
       market_b_slug = excluded.market_b_slug,
@@ -354,6 +361,7 @@ export function upsertMarketPair(pair: {
     pair.marketBId, pair.marketBPlatform, pair.marketBQuestion,
     pair.marketBSlug ?? '', pair.marketBEventSlug ?? '',
     pair.status, pair.confidence, pair.matchMethod,
+    pair.outcomesInverted ? 1 : 0,
     pair.llmIsSameMarket !== undefined ? (pair.llmIsSameMarket ? 1 : 0) : null,
     pair.llmConfidence ?? null,
     pair.llmReasoning ?? null,

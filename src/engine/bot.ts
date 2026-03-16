@@ -54,21 +54,27 @@ export class Bot {
     // 1. Initialize database
     initializeDatabase();
 
-    // 2. Create and connect connectors
-    const polymarket = new PolymarketConnector();
-    const predictfun = new PredictFunConnector();
-    const kalshi = new KalshiConnector();
+    // 2. Create and connect connectors (only enabled platforms)
+    const enabledPlatforms = new Set(config.bot.enabledPlatforms);
+    log.info('Enabled platforms', { platforms: [...enabledPlatforms] });
 
-    this.connectors.set('polymarket', polymarket);
-    this.connectors.set('predictfun', predictfun);
-    this.connectors.set('kalshi', kalshi);
+    const platformConnectors: Array<{ platform: string; connector: MarketConnector }> = [];
 
-    // Connect to all platforms (failures are non-fatal — bot runs with available platforms)
-    const platformConnectors: Array<{ platform: string; connector: MarketConnector }> = [
-      { platform: 'polymarket', connector: polymarket },
-      { platform: 'predictfun', connector: predictfun },
-      { platform: 'kalshi', connector: kalshi },
-    ];
+    if (enabledPlatforms.has('polymarket')) {
+      const polymarket = new PolymarketConnector();
+      this.connectors.set('polymarket', polymarket);
+      platformConnectors.push({ platform: 'polymarket', connector: polymarket });
+    }
+    if (enabledPlatforms.has('predictfun')) {
+      const predictfun = new PredictFunConnector();
+      this.connectors.set('predictfun', predictfun);
+      platformConnectors.push({ platform: 'predictfun', connector: predictfun });
+    }
+    if (enabledPlatforms.has('kalshi')) {
+      const kalshi = new KalshiConnector();
+      this.connectors.set('kalshi', kalshi);
+      platformConnectors.push({ platform: 'kalshi', connector: kalshi });
+    }
 
     const connectResults = await Promise.allSettled(
       platformConnectors.map(({ connector }) => connector.connect())

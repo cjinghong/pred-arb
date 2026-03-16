@@ -86,7 +86,12 @@ const TEAM_ALIASES: Record<string, string> = {
   'new orleans pelicans': 'pelicans',
   'new orleans': 'pelicans',
   'utah jazz': 'jazz',
-  'utah': 'jazz',
+  // NOTE: bare 'utah' is ambiguous — jazz (NBA) or utah hockey club (NHL).
+  // Do NOT add 'utah' here. Use league-specific CITY_TEAMS_BY_LEAGUE instead.
+  // The generic table only has unambiguous full-name entries.
+  'utah hockey club': 'utah hockey club',
+  'uta mammoth': 'utah hockey club',       // Kalshi's yes_sub_title for Utah NHL
+  'utah mammoth': 'utah hockey club',
   'washington wizards': 'wizards',
   'washington': 'wizards',
 
@@ -202,6 +207,269 @@ export function normalizeTeamName(name: string): string {
   }
 
   return normalized;
+}
+
+// ─── League-Aware City → Team Resolution ───────────────────────────────
+//
+// The generic TEAM_ALIASES table maps bare city names (e.g., "tampa bay") to
+// ONE league's team. This is WRONG for cross-league lookups:
+//   "tampa bay" → "buccaneers" (NFL), but in NHL it should be "lightning"
+//   "philadelphia" is not even in the generic table
+//
+// This league-specific mapping resolves ambiguous city names correctly when
+// the league is known (which it almost always is for sports matching).
+
+const CITY_TEAMS_BY_LEAGUE: Record<string, Record<string, string>> = {
+  NBA: {
+    'philadelphia': '76ers', 'boston': 'celtics', 'chicago': 'bulls',
+    'dallas': 'mavericks', 'detroit': 'pistons', 'miami': 'heat',
+    'minnesota': 'timberwolves', 'houston': 'rockets', 'atlanta': 'hawks',
+    'toronto': 'raptors', 'cleveland': 'cavaliers', 'denver': 'nuggets',
+    'indiana': 'pacers', 'indianapolis': 'pacers', 'phoenix': 'suns',
+    'washington': 'wizards', 'new york': 'knicks', 'new orleans': 'pelicans',
+    'milwaukee': 'bucks', 'memphis': 'grizzlies', 'sacramento': 'kings',
+    'orlando': 'magic', 'charlotte': 'hornets', 'portland': 'trail blazers',
+    'utah': 'jazz', 'san antonio': 'spurs', 'golden state': 'warriors',
+    'oklahoma city': 'thunder', 'brooklyn': 'nets',
+    'los angeles l': 'lakers', 'los angeles c': 'clippers',
+    'la': 'lakers', // default LA to Lakers in NBA context
+  },
+  NHL: {
+    'tampa bay': 'lightning', 'philadelphia': 'flyers', 'boston': 'bruins',
+    'chicago': 'blackhawks', 'dallas': 'stars', 'detroit': 'red wings',
+    'minnesota': 'wild', 'toronto': 'maple leafs', 'denver': 'avalanche',
+    'colorado': 'avalanche', 'phoenix': 'coyotes', 'arizona': 'coyotes',
+    'washington': 'capitals', 'new york': 'rangers', 'pittsburgh': 'penguins',
+    'seattle': 'kraken', 'nashville': 'predators', 'carolina': 'hurricanes',
+    'buffalo': 'sabres', 'columbus': 'blue jackets', 'new jersey': 'devils',
+    'san jose': 'sharks', 'vegas': 'golden knights', 'las vegas': 'golden knights',
+    'st louis': 'blues', 'los angeles': 'la kings', 'ottawa': 'senators',
+    'montreal': 'canadiens', 'winnipeg': 'jets', 'calgary': 'flames',
+    'edmonton': 'oilers', 'vancouver': 'canucks', 'florida': 'panthers',
+    'utah': 'utah hockey club', 'salt lake': 'utah hockey club', // formerly Arizona Coyotes, relocated 2024
+    'new york r': 'rangers', 'new york i': 'islanders',
+  },
+  NFL: {
+    'tampa bay': 'buccaneers', 'philadelphia': 'eagles', 'new england': 'patriots',
+    'boston': 'patriots', 'chicago': 'bears', 'dallas': 'cowboys',
+    'detroit': 'lions', 'miami': 'dolphins', 'minnesota': 'vikings',
+    'houston': 'texans', 'atlanta': 'falcons', 'cleveland': 'browns',
+    'denver': 'broncos', 'indianapolis': 'colts', 'indiana': 'colts',
+    'phoenix': 'cardinals', 'arizona': 'cardinals', 'washington': 'commanders',
+    'pittsburgh': 'steelers', 'seattle': 'seahawks', 'nashville': 'titans',
+    'tennessee': 'titans', 'carolina': 'panthers', 'buffalo': 'bills',
+    'green bay': 'packers', 'kansas city': 'chiefs', 'san francisco': '49ers',
+    'las vegas': 'raiders', 'jacksonville': 'jaguars', 'new orleans': 'saints',
+    'baltimore': 'ravens', 'cincinnati': 'bengals',
+    'new york g': 'giants', 'new york j': 'jets',
+    'los angeles r': 'rams', 'los angeles c': 'chargers',
+  },
+  MLB: {
+    'philadelphia': 'phillies', 'boston': 'red sox', 'chicago c': 'cubs',
+    'chicago w': 'white sox', 'detroit': 'tigers', 'miami': 'marlins',
+    'minnesota': 'twins', 'houston': 'astros', 'atlanta': 'braves',
+    'toronto': 'blue jays', 'cleveland': 'guardians', 'denver': 'rockies',
+    'colorado': 'rockies', 'phoenix': 'diamondbacks', 'arizona': 'diamondbacks',
+    'washington': 'nationals', 'pittsburgh': 'pirates', 'seattle': 'mariners',
+    'tampa bay': 'rays', 'st louis': 'stl cardinals', 'san francisco': 'sf giants',
+    'los angeles d': 'dodgers', 'los angeles a': 'angels',
+    'milwaukee': 'brewers', 'san diego': 'padres', 'oakland': 'athletics',
+    'kansas city': 'royals', 'baltimore': 'orioles', 'cincinnati': 'reds',
+    'new york y': 'yankees', 'new york m': 'mets',
+    'texas': 'rangers', 'dallas': 'rangers',
+  },
+};
+
+/**
+ * Normalize a team name with league context for correct city→team resolution.
+ * When league is known, checks the league-specific city→team table first,
+ * which correctly handles ambiguous cities (e.g., "Tampa Bay" → "lightning" in NHL).
+ * Falls back to the generic TEAM_ALIASES table.
+ */
+export function normalizeTeamNameForLeague(name: string, league?: string): string {
+  let normalized = name
+    .toLowerCase()
+    .replace(/^the\s+/i, '')
+    .replace(/[''`.]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Strip common Kalshi suffixes
+  normalized = normalized
+    .replace(/\s+winner$/i, '')
+    .replace(/\s+winning$/i, '')
+    .replace(/\s+win$/i, '')
+    .trim();
+
+  // 1. If league is known, check league-specific city→team mapping FIRST.
+  //    This MUST come before the generic alias table because the generic table
+  //    maps bare city names to ONE league's team regardless of context:
+  //      "tampa bay" → "buccaneers" (NFL) — WRONG for NHL (should be "lightning")
+  //      "seattle" → "seahawks" (NFL) — WRONG for NHL (should be "kraken")
+  //    The league-specific table resolves this correctly.
+  if (league && league !== 'UNKNOWN') {
+    const leagueTable = CITY_TEAMS_BY_LEAGUE[league.toUpperCase()];
+    if (leagueTable && leagueTable[normalized]) {
+      return leagueTable[normalized];
+    }
+  }
+
+  // 2. Check generic alias table (handles full team names like "philadelphia 76ers",
+  //    "tampa bay lightning", "golden state warriors" — these are unambiguous)
+  if (TEAM_ALIASES[normalized]) {
+    return TEAM_ALIASES[normalized];
+  }
+
+  return normalized;
+}
+
+/**
+ * Fuzzy match two team/outcome names. Returns true if they likely refer to the same entity.
+ * Handles abbreviations, substring matches, and normalized names.
+ */
+export function fuzzyTeamMatch(nameA: string, nameB: string): boolean {
+  const a = nameA.toLowerCase().trim();
+  const b = nameB.toLowerCase().trim();
+
+  // 1. Exact match
+  if (a === b) return true;
+
+  // 2. Normalized match via alias table (city names → mascots, etc.)
+  const normA = normalizeTeamName(a);
+  const normB = normalizeTeamName(b);
+  if (normA === normB) return true;
+
+  // 3. Substring containment ("fut" in "fut esports", "aurora" in "aurora gaming")
+  if (a.length >= 3 && b.length >= 3) {
+    if (a.includes(b) || b.includes(a)) return true;
+    if (normA.includes(normB) || normB.includes(normA)) return true;
+  }
+
+  // 4. Abbreviation match: "blg" = first letters of "bilibili gaming"
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  if (shorter.length >= 2 && shorter.length <= 5) {
+    const longerWords = longer.split(/\s+/);
+    if (longerWords.length >= 2) {
+      const acronym = longerWords.map(w => w[0]).join('');
+      if (acronym === shorter) return true;
+    }
+  }
+
+  // 5. Token overlap: if ≥50% of tokens match between names
+  const tokensA = new Set(normA.split(/\s+/).filter(t => t.length >= 3));
+  const tokensB = new Set(normB.split(/\s+/).filter(t => t.length >= 3));
+  if (tokensA.size > 0 && tokensB.size > 0) {
+    let overlap = 0;
+    for (const t of tokensA) {
+      if (tokensB.has(t)) overlap++;
+    }
+    const minSize = Math.min(tokensA.size, tokensB.size);
+    if (overlap > 0 && overlap / minSize >= 0.5) return true;
+  }
+
+  return false;
+}
+
+// ─── Slug/Ticker-Based Inversion Detection ──────────────────────────────
+
+/**
+ * Determine outcome inversion by comparing team positions in Polymarket slugs
+ * and Kalshi tickers. This is the MOST RELIABLE signal — no fuzzy matching needed.
+ *
+ * Polymarket slug format: `{league}-{team1}-{team2}-{date}` → team1 = YES
+ *   Example: `nhl-utah-dal-2026-03-16` → YES = Utah
+ *
+ * Kalshi ticker format: `KX{LEAGUE}GAME-{dateYYMMMDD}{TEAM1}{TEAM2}-{YESTEAM}`
+ *   Example: `KXNHLGAME-26MAR16UTADAL-UTA` → YES = UTA
+ *
+ * Returns: true (inverted), false (aligned), undefined (can't determine)
+ */
+export function detectInversionFromSlugAndTicker(
+  polySlug: string | undefined,
+  kalshiId: string | undefined,
+): boolean | undefined {
+  if (!polySlug || !kalshiId) return undefined;
+
+  // ── Extract Polymarket YES team from slug ───────────────────────────
+  // Format: {league}-{team1}-{team2}-{date} or {league}-{team1}-{team2}-{date}-{suffix}
+  // The first team (team1) after the league prefix is the YES team.
+  const polyParts = polySlug.toLowerCase().split('-');
+  // Slug must have at least league + team1 + team2 + date parts
+  if (polyParts.length < 5) return undefined; // e.g. nhl-utah-dal-2026-03-16
+
+  // First part is league (nhl, nba, nfl, etc.)
+  const polyLeague = polyParts[0];
+  // The date is a YYYY-MM-DD somewhere in the slug. Find it.
+  let dateStartIdx = -1;
+  for (let i = 1; i < polyParts.length - 2; i++) {
+    if (/^\d{4}$/.test(polyParts[i]) && /^\d{2}$/.test(polyParts[i + 1]) && /^\d{2}$/.test(polyParts[i + 2])) {
+      dateStartIdx = i;
+      break;
+    }
+  }
+  if (dateStartIdx < 3) return undefined; // Need at least league + 2 teams before date
+
+  // Teams are between league prefix and date
+  const polyTeam1 = polyParts.slice(1, dateStartIdx).join('-'); // handles multi-part names like "new-york"
+  // Actually for sports slugs it's typically single abbreviations
+  // But let's be safe: team1 is everything from index 1 to dateStartIdx-1,
+  // team2 is everything from dateStartIdx-1 to dateStartIdx... wait, that doesn't work for multi-word.
+  // Let's simplify: team1 = polyParts[1], team2 = polyParts[dateStartIdx-1]
+  // For `nhl-utah-dal-2026-03-16`: team1=utah, team2=dal
+  // For `nba-new-york-bos-2026-03-16`: this would be trickier...
+  // Actually Polymarket uses city abbreviations in slugs, not full names.
+  // So format is reliably: league-team1-team2-YYYY-MM-DD[-suffix]
+  const polyYesTeam = polyParts[1]; // First team abbreviation = YES
+
+  // ── Extract Kalshi YES team from ticker ─────────────────────────────
+  // Format: KXLEAGUEGAME-YYMMMDDDTEAM1TEAM2-YESTEAM
+  // Example: KXNHLGAME-26MAR16UTADAL-UTA
+  const kalshiParts = kalshiId.toUpperCase().split('-');
+  if (kalshiParts.length < 3) return undefined;
+
+  const kalshiYesTeam = kalshiParts[kalshiParts.length - 1].toLowerCase(); // Last segment = YES team
+  // Also extract teams from the middle segment to know which is team1/team2
+  const middleSeg = kalshiParts.slice(1, -1).join('-').toLowerCase(); // e.g. "26mar16utadal"
+
+  // ── Compare: does Kalshi YES team match Polymarket's first team? ────
+  // Simple: check if polyYesTeam starts with or contains the Kalshi YES abbreviation, or vice versa
+  const polyYes = polyYesTeam.toLowerCase();
+  const kalshiYes = kalshiYesTeam.toLowerCase();
+
+  // Direct abbreviation match: "utah" starts with "uta", "dal" starts with "dal"
+  if (polyYes === kalshiYes) return false; // Same team is YES on both → not inverted
+  if (polyYes.startsWith(kalshiYes) || kalshiYes.startsWith(polyYes)) return false; // Abbreviation match
+
+  // Check if Kalshi YES team matches polymarket's SECOND team instead
+  // If so, they're inverted (different teams are YES on each platform)
+  if (dateStartIdx >= 3) {
+    const polyTeam2 = polyParts[dateStartIdx - 1].toLowerCase();
+    if (polyTeam2 === kalshiYes) return true; // Kalshi YES = Poly's second team → inverted
+    if (polyTeam2.startsWith(kalshiYes) || kalshiYes.startsWith(polyTeam2)) return true;
+  }
+
+  // Can't determine from abbreviations alone
+  return undefined;
+}
+
+// ─── Question Similarity ─────────────────────────────────────────────────
+
+/**
+ * Compute token-based Jaccard similarity between two question strings.
+ * Returns 0-1 where 1 means identical token sets.
+ */
+export function questionSimilarity(a: string, b: string): number {
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+  const tokensA = new Set(normalize(a).split(/\s+/).filter(t => t.length >= 2));
+  const tokensB = new Set(normalize(b).split(/\s+/).filter(t => t.length >= 2));
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+  let overlap = 0;
+  for (const t of tokensA) {
+    if (tokensB.has(t)) overlap++;
+  }
+  const union = new Set([...tokensA, ...tokensB]).size;
+  return overlap / union;
 }
 
 // ─── Date Extraction ─────────────────────────────────────────────────────
@@ -658,7 +926,7 @@ function detectMarketType(question: string): SportsMarketType {
 export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | null {
   let teams: [string, string] | null = null;
   let gameDate: string | null = null;
-  let yesTeam: string | undefined; // Which team outcome 0 (YES) represents
+  let yesTeamRaw: string | undefined; // Raw yesTeam before league-aware normalization
 
   // ── Platform-specific extraction ──────────────────────────────────────
 
@@ -670,22 +938,23 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     teams = extractTeamsFromKalshiTicker(ticker);
     gameDate = extractDateFromKalshiTicker(ticker);
 
-    // Kalshi per-team markets: the last segment of the ticker is the YES team.
-    // e.g., KXNBAGAME-26MAR16PHXBOS-PHX → YES = PHX (suns)
-    // Also check yes_sub_title from raw data as a fallback.
-    const tickerParts = ticker.split('-');
-    if (tickerParts.length >= 3) {
-      const lastAbbrev = tickerParts[tickerParts.length - 1].toUpperCase();
-      const yesTeamFromTicker = KALSHI_TEAM_ABBREVS[lastAbbrev];
-      if (yesTeamFromTicker) {
-        yesTeam = yesTeamFromTicker;
-      }
+    // Kalshi per-team markets: use yes_sub_title from raw data as the PRIMARY source.
+    // This is the ground truth from Kalshi's API (e.g., "Sacramento" or "San Antonio").
+    // IMPORTANT: The last ticker segment does NOT always correspond to the YES team.
+    // e.g., KXNBAGAME-26MAR17SASSAC-SAS may have YES = Sacramento, NOT San Antonio.
+    const yesSubTitle = raw?.yes_sub_title as string | undefined;
+    if (yesSubTitle) {
+      yesTeamRaw = yesSubTitle;
     }
-    // Fallback: use yes_sub_title from raw data (e.g., "Phoenix")
-    if (!yesTeam) {
-      const yesSubTitle = raw?.yes_sub_title as string | undefined;
-      if (yesSubTitle) {
-        yesTeam = normalizeTeamName(yesSubTitle);
+    // Fallback: use last ticker segment (less reliable, may be wrong)
+    if (!yesTeamRaw) {
+      const tickerParts = ticker.split('-');
+      if (tickerParts.length >= 3) {
+        const lastAbbrev = tickerParts[tickerParts.length - 1].toUpperCase();
+        const yesTeamFromTicker = KALSHI_TEAM_ABBREVS[lastAbbrev];
+        if (yesTeamFromTicker) {
+          yesTeamRaw = yesTeamFromTicker; // Already a mascot name, not a city
+        }
       }
     }
   }
@@ -705,7 +974,7 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
       const outcomeName = market.outcomes[0];
       // Only set yesTeam if the outcome name looks like a team (not "Yes"/"No")
       if (outcomeName && !/^(yes|no)$/i.test(outcomeName)) {
-        yesTeam = normalizeTeamName(outcomeName);
+        yesTeamRaw = outcomeName;
       }
     }
   }
@@ -715,7 +984,7 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     if (market.outcomes && market.outcomes.length >= 2) {
       const outcomeName = market.outcomes[0];
       if (outcomeName && !/^(yes|no)$/i.test(outcomeName)) {
-        yesTeam = normalizeTeamName(outcomeName);
+        yesTeamRaw = outcomeName;
       }
     }
   }
@@ -736,8 +1005,19 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     return null;
   }
 
+  // ── League detection BEFORE yesTeam normalization ─────────────────────
+  // This is critical: the league determines how city names map to teams.
+  // "Tampa Bay" → "lightning" (NHL) or "buccaneers" (NFL)
+  // "Philadelphia" → "76ers" (NBA) or "flyers" (NHL) or "eagles" (NFL)
+
   const league = detectLeague(market.question, market.category, market.slug, market.id);
   const marketType = detectMarketType(market.question);
+
+  // ── Resolve yesTeam with league context ───────────────────────────────
+  let yesTeam: string | undefined;
+  if (yesTeamRaw) {
+    yesTeam = normalizeTeamNameForLeague(yesTeamRaw, league);
+  }
 
   // Sort teams alphabetically so "A vs B" == "B vs A"
   const [sortedA, sortedB] = [teams[0], teams[1]].sort();
@@ -756,6 +1036,7 @@ export function parseSportsMarket(market: DiscoveredMarket): SportsMarketInfo | 
     marketType,
     matchKey,
     yesTeam,
+    yesTeamRaw,
   };
 }
 
@@ -933,16 +1214,93 @@ export class SportsMatcher {
     const pairId = this.pairId(marketA.id, marketB.id);
 
     // ── Detect outcome inversion ──────────────────────────────────────────
-    // If both markets have yesTeam set, check if YES on A means the same team as YES on B.
-    // Example: Polymarket "Suns vs Celtics" (YES=suns) matched with Kalshi "PHX" market (YES=suns) → aligned
-    // Example: Polymarket "Suns vs Celtics" (YES=suns) matched with Kalshi "BOS" market (YES=celtics) → inverted!
+    // Layer 0: Slug/ticker-based detection (most reliable for Polymarket ↔ Kalshi)
+    const polyMarket = marketA.platform === 'polymarket' ? marketA : (marketB.platform === 'polymarket' ? marketB : null);
+    const kalshiMarket = marketA.platform === 'kalshi' ? marketA : (marketB.platform === 'kalshi' ? marketB : null);
+    if (polyMarket && kalshiMarket) {
+      const slugResult = detectInversionFromSlugAndTicker(polyMarket.slug, kalshiMarket.id);
+      if (slugResult !== undefined) {
+        log.info('createPair: slug/ticker analysis → ' + (slugResult ? 'inverted' : 'aligned'), {
+          polySlug: polyMarket.slug, kalshiId: kalshiMarket.id,
+        });
+        return {
+          pairId,
+          marketA,
+          marketB,
+          confidence,
+          matchMethod: 'sports_normalized',
+          outcomesInverted: slugResult,
+          status: this.pairStatuses.get(pairId) || 'approved',
+        };
+      }
+    }
+
+    // Multi-layered detection: yesTeam → league-aware → outcome labels → question similarity
     let outcomesInverted = false;
     if (infoA.yesTeam && infoB.yesTeam) {
-      outcomesInverted = infoA.yesTeam !== infoB.yesTeam;
+      outcomesInverted = !fuzzyTeamMatch(infoA.yesTeam, infoB.yesTeam);
+
+      // Layer 2: league-aware normalization from raw values
+      if (outcomesInverted && (infoA.yesTeamRaw || infoB.yesTeamRaw)) {
+        const league = infoA.league !== 'UNKNOWN' ? infoA.league : infoB.league;
+        if (league && league !== 'UNKNOWN') {
+          const leagueNormA = normalizeTeamNameForLeague(infoA.yesTeamRaw || infoA.yesTeam, league);
+          const leagueNormB = normalizeTeamNameForLeague(infoB.yesTeamRaw || infoB.yesTeam, league);
+          if (fuzzyTeamMatch(leagueNormA, leagueNormB)) {
+            log.info('League-aware re-check overrode inversion', {
+              original: { yesTeamA: infoA.yesTeam, yesTeamB: infoB.yesTeam },
+              leagueResolved: { yesTeamA: leagueNormA, yesTeamB: leagueNormB },
+              league,
+            });
+            outcomesInverted = false;
+          }
+        }
+      }
+
+      // Layer 3: outcome label cross-check
+      // If yesTeam still says inverted, check if outcome labels at same positions match.
+      // This catches esports abbreviations: "Natus Vincere" vs "NAVI" fails yesTeam match,
+      // but "Aurora Gaming" vs "Aurora" matches at outcome[1] → proves same order.
+      if (outcomesInverted && marketA.outcomes.length === 2 && marketB.outcomes.length === 2) {
+        const a0 = marketA.outcomes[0].toLowerCase().trim();
+        const a1 = marketA.outcomes[1].toLowerCase().trim();
+        const b0 = marketB.outcomes[0].toLowerCase().trim();
+        const b1 = marketB.outcomes[1].toLowerCase().trim();
+
+        const sameOrderEvidence = (fuzzyTeamMatch(a0, b0) ? 1 : 0) + (fuzzyTeamMatch(a1, b1) ? 1 : 0);
+        const reversedEvidence = (fuzzyTeamMatch(a0, b1) ? 1 : 0) + (fuzzyTeamMatch(a1, b0) ? 1 : 0);
+
+        if (sameOrderEvidence > reversedEvidence && sameOrderEvidence > 0) {
+          log.info('Outcome label cross-check overrode inversion → aligned', {
+            outcomes: { a: marketA.outcomes, b: marketB.outcomes },
+            sameOrderEvidence, reversedEvidence,
+          });
+          outcomesInverted = false;
+        }
+      }
+
+      // Layer 4: question text similarity
+      // For cross-ref matched pairs, questions are often identical. If questions are
+      // very similar and we still think inverted, trust the question order.
+      // This catches cases where BOTH team names are abbreviated on one platform
+      // (e.g., "BLG" vs "Bilibili Gaming" AND "FOX" vs "BNK FEARX").
+      if (outcomesInverted && marketA.question && marketB.question) {
+        const qSim = questionSimilarity(marketA.question, marketB.question);
+        if (qSim >= 0.8) {
+          log.info('Question similarity overrode inversion → aligned', {
+            similarity: qSim,
+            questionA: marketA.question.substring(0, 80),
+            questionB: marketB.question.substring(0, 80),
+          });
+          outcomesInverted = false;
+        }
+      }
+
       if (outcomesInverted) {
         log.info('Detected inverted outcomes between platforms', {
-          marketA: { id: marketA.id, platform: marketA.platform, yesTeam: infoA.yesTeam },
-          marketB: { id: marketB.id, platform: marketB.platform, yesTeam: infoB.yesTeam },
+          marketA: { id: marketA.id, platform: marketA.platform, yesTeam: infoA.yesTeam, yesTeamRaw: infoA.yesTeamRaw },
+          marketB: { id: marketB.id, platform: marketB.platform, yesTeam: infoB.yesTeam, yesTeamRaw: infoB.yesTeamRaw },
+          league: infoA.league,
         });
       }
     }

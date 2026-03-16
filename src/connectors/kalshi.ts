@@ -853,15 +853,21 @@ export class KalshiConnector extends BaseConnector {
   }
 
   private normalizeMarket(raw: KalshiRawMarket): NormalizedMarket {
-    // Kalshi URL format: /markets/{event_ticker}/{subtitle_slug}/{market_ticker}
-    // e.g., /markets/kxnbagame/professional-basketball-game/kxnbagame-26mar16lalhou
+    // Kalshi URL format: /markets/{series_ticker}/{subtitle_slug}/{event_ticker}
+    // e.g., /markets/kxnbagame/professional-basketball-game/kxnbagame-26mar17phiden
     const subtitleSlug = raw.subtitle ? this.slugifySubtitle(raw.subtitle) : '';
+    const eventTicker = raw.event_ticker?.toLowerCase() || '';
+    // Derive series_ticker from event_ticker by stripping the date+teams suffix
+    // e.g., "kxnbagame-26mar17phiden" → "kxnbagame"
+    const seriesTicker = eventTicker.replace(/-\d{2}[a-z]{3}\d{2}.*$/i, '') || eventTicker;
     const market: NormalizedMarket = {
       id: raw.ticker,
       platform: 'kalshi',
       question: raw.title,
-      slug: subtitleSlug || raw.ticker.toLowerCase(), // subtitle slug for URL middle segment
-      eventSlug: raw.event_ticker?.toLowerCase() || '', // event_ticker for URL first segment
+      // slug encodes both subtitle and event_ticker for URL construction:
+      // Format: "{subtitle_slug}|{event_ticker}" — dashboard splits on "|"
+      slug: `${subtitleSlug || 'market'}|${eventTicker}`,
+      eventSlug: seriesTicker, // series_ticker for URL first segment
       category: raw.category || '',
       outcomes: ['Yes', 'No'],
       outcomeTokenIds: [`${raw.ticker}_yes`, `${raw.ticker}_no`],

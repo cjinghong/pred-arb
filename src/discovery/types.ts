@@ -50,6 +50,8 @@ export interface SportsMarketInfo {
    * If two matched markets have different yesTeam values, outcomes are inverted.
    */
   yesTeam?: string;
+  /** Raw yesTeam value before league-aware normalization (for diagnostics) */
+  yesTeamRaw?: string;
 }
 
 /** A market enriched with category-specific metadata */

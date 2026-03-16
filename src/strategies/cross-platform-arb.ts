@@ -23,7 +23,7 @@ import {
 } from '../types';
 import { MarketConnector } from '../types/connector';
 import { MarketMatcher, MarketPair, PairStatus } from '../matcher/market-matcher';
-import { SportsMatcher } from '../matcher/sports-matcher';
+import { SportsMatcher, normalizeTeamName, normalizeTeamNameForLeague, fuzzyTeamMatch, questionSimilarity, detectInversionFromSlugAndTicker } from '../matcher/sports-matcher';
 import { LLMVerifier } from '../matcher/llm-verifier';
 import { SportsDiscovery } from '../discovery/sports-discovery';
 import { DiscoveredMarket, MarketCategory, SportsLeague } from '../discovery/types';
@@ -33,8 +33,25 @@ import { upsertMarketPair, getAllMarketPairs, updatePairStatus as dbUpdatePairSt
 import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
 import { eventBus } from '../utils/event-bus';
+import {
+  BookWalkLevel,
+  buildDiagnosticSnapshot,
+  writeDiagnosticSnapshot,
+  BuildSnapshotParams,
+} from '../utils/arb-diagnostics';
 
 const log = createChildLogger('strategy:xplatform-arb');
+
+/** Return type for walkBooksForOptimalSize — includes trace for diagnostics */
+interface WalkResult {
+  size: number;
+  avgPriceA: number;
+  avgPriceB: number;
+  profitPerShare: number;
+  profitBps: number;
+  trace: BookWalkLevel[];
+  totalFees: number;
+}
 
 export class CrossPlatformArbStrategy implements Strategy {
   readonly id = 'cross-platform-arb';
@@ -61,7 +78,7 @@ export class CrossPlatformArbStrategy implements Strategy {
 
   /** Throttle: don't re-analyze the same pair more than once per N ms */
   private lastPairAnalysis = new Map<string, number>();
-  private readonly pairAnalysisCooldownMs = 200; // 200ms debounce per pair
+  private readonly pairAnalysisCooldownMs = 5000; // 5s cooldown per pair to prevent scan spam
 
   /** Bound handler reference so we can remove the listener on shutdown */
   private bookUpdateHandler: ((data: { platform: string; marketId: string; outcomeIndex: number }) => void) | null = null;
@@ -271,6 +288,12 @@ export class CrossPlatformArbStrategy implements Strategy {
       for (const pair of this.cachedPairs) {
         if (pair.status !== 'approved') continue;
         if (pair.confidence < this.config.minMatchConfidence) continue;
+
+        // Per-pair cooldown: skip pairs analyzed within the cooldown window
+        const lastCheck = this.lastPairAnalysis.get(pair.pairId) ?? 0;
+        if (Date.now() - lastCheck < this.pairAnalysisCooldownMs) continue;
+        this.lastPairAnalysis.set(pair.pairId, Date.now());
+
         pairsChecked++;
 
         try {
@@ -393,7 +416,7 @@ export class CrossPlatformArbStrategy implements Strategy {
     levelsB: PriceLevel[],  // asks or inverted bids for the "buy" side
     minProfitBps: number,
     maxPositionUsd: number,
-  ): { size: number; avgPriceA: number; avgPriceB: number; profitPerShare: number; profitBps: number } | null {
+  ): WalkResult | null {
     if (levelsA.length === 0 || levelsB.length === 0) return null;
 
     let idxA = 0, idxB = 0;
@@ -401,6 +424,8 @@ export class CrossPlatformArbStrategy implements Strategy {
     let totalSize = 0;
     let totalCostA = 0, totalCostB = 0;
     let totalFees = 0;
+    const trace: BookWalkLevel[] = [];
+    let stepIdx = 0;
 
     while (idxA < levelsA.length && idxB < levelsB.length) {
       const priceA = levelsA[idxA].price;
@@ -432,6 +457,12 @@ export class CrossPlatformArbStrategy implements Strategy {
           totalCostA += priceA * partialChunk;
           totalCostB += priceB * partialChunk;
           totalFees += feePerShare * partialChunk;
+          trace.push({
+            levelIdx: stepIdx++, priceA, priceB, chunkSize: partialChunk,
+            totalCostPerShare, feePerShare, profitPerShare, profitBps,
+            cumulativeSize: totalSize, cumulativeCostA: totalCostA,
+            cumulativeCostB: totalCostB, cumulativeFees: totalFees,
+          });
         }
         break;
       }
@@ -440,6 +471,13 @@ export class CrossPlatformArbStrategy implements Strategy {
       totalCostA += priceA * chunk;
       totalCostB += priceB * chunk;
       totalFees += feePerShare * chunk;
+
+      trace.push({
+        levelIdx: stepIdx++, priceA, priceB, chunkSize: chunk,
+        totalCostPerShare, feePerShare, profitPerShare, profitBps,
+        cumulativeSize: totalSize, cumulativeCostA: totalCostA,
+        cumulativeCostB: totalCostB, cumulativeFees: totalFees,
+      });
 
       remainA -= chunk;
       remainB -= chunk;
@@ -471,6 +509,8 @@ export class CrossPlatformArbStrategy implements Strategy {
       avgPriceB,
       profitPerShare: avgProfitPerShare,
       profitBps: avgProfitBps,
+      trace,
+      totalFees,
     };
   }
 
@@ -762,6 +802,7 @@ export class CrossPlatformArbStrategy implements Strategy {
           confidence: row.confidence as number,
           matchMethod: row.match_method as MarketPair['matchMethod'],
           status,
+          outcomesInverted: (row.outcomes_inverted as number) === 1 ? true : undefined,
         };
 
         // Attach LLM verification if present
@@ -1113,21 +1154,140 @@ export class CrossPlatformArbStrategy implements Strategy {
    * Detect whether two discovered markets have inverted outcomes (YES on A ≠ YES on B).
    * Uses sportsInfo.yesTeam when available. Returns undefined if we can't determine.
    */
+  /**
+   * Detect whether two matched markets have inverted outcome meanings.
+   * Uses multi-layered fuzzy comparison to handle team name variations:
+   * 1. Normalized match via alias table (handles city → mascot, etc.)
+   * 2. Substring containment ("fut" ⊂ "fut esports")
+   * 3. Abbreviation match ("blg" = first letters of "bilibili gaming")
+   * 4. Outcome array comparison (checks if outcome labels match in order or reversed)
+   */
   private detectOutcomesInverted(marketA: DiscoveredMarket, marketB: DiscoveredMarket): boolean | undefined {
+    // ── Layer 0: Slug/Ticker positional analysis (MOST RELIABLE) ────────
+    // For Polymarket ↔ Kalshi pairs, compare team positions in slug and ticker.
+    // Polymarket slug: nhl-{team1}-{team2}-{date} → team1 = YES
+    // Kalshi ticker:   KXNHLGAME-{date}{T1}{T2}-{YESTEAM} → last segment = YES
+    // No fuzzy matching needed — just positional abbreviation comparison.
+    const polyMarket = marketA.platform === 'polymarket' ? marketA : (marketB.platform === 'polymarket' ? marketB : null);
+    const kalshiMarket = marketA.platform === 'kalshi' ? marketA : (marketB.platform === 'kalshi' ? marketB : null);
+    if (polyMarket && kalshiMarket) {
+      const slugResult = detectInversionFromSlugAndTicker(polyMarket.slug, kalshiMarket.id);
+      if (slugResult !== undefined) {
+        // If marketA is Kalshi and marketB is Polymarket, the result is from Poly's perspective
+        // so we need to consider the order. detectInversionFromSlugAndTicker always compares
+        // Poly's YES team vs Kalshi's YES team, so the result is absolute.
+        log.info('detectOutcomesInverted: slug/ticker analysis → ' + (slugResult ? 'inverted' : 'aligned'), {
+          polySlug: polyMarket.slug,
+          kalshiId: kalshiMarket.id,
+          result: slugResult,
+        });
+        return slugResult;
+      }
+    }
+
     const yesTeamA = marketA.sportsInfo?.yesTeam;
     const yesTeamB = marketB.sportsInfo?.yesTeam;
+
+    // ── Layer 1: yesTeam fuzzy matching ──────────────────────────────────
+    let yesTeamSaysInverted: boolean | undefined;
     if (yesTeamA && yesTeamB) {
-      const inverted = yesTeamA !== yesTeamB;
-      if (inverted) {
-        log.info('Cross-ref match: detected inverted outcomes', {
-          marketA: { id: marketA.id, platform: marketA.platform, yesTeam: yesTeamA },
-          marketB: { id: marketB.id, platform: marketB.platform, yesTeam: yesTeamB },
+      const sameTeam = fuzzyTeamMatch(yesTeamA, yesTeamB);
+      if (sameTeam) {
+        log.debug('detectOutcomesInverted: yesTeam fuzzy match → aligned', {
+          yesTeamA, yesTeamB,
         });
+        return false; // Confident: same team → not inverted
       }
-      return inverted;
+
+      // yesTeam didn't match — try league-aware normalization
+      const league = marketA.sportsInfo?.league || marketB.sportsInfo?.league;
+      if (league && league !== 'UNKNOWN') {
+        const rawA = marketA.sportsInfo?.yesTeamRaw || yesTeamA;
+        const rawB = marketB.sportsInfo?.yesTeamRaw || yesTeamB;
+        const leagueNormA = normalizeTeamNameForLeague(rawA, league);
+        const leagueNormB = normalizeTeamNameForLeague(rawB, league);
+        if (fuzzyTeamMatch(leagueNormA, leagueNormB)) {
+          log.info('detectOutcomesInverted: league-aware re-check → aligned', {
+            yesTeamA, yesTeamB, leagueNormA, leagueNormB, league,
+          });
+          return false; // Same team after league-aware normalization
+        }
+      }
+
+      // yesTeam suggests inversion, but don't return yet — cross-check with other signals
+      yesTeamSaysInverted = true;
     }
+
+    // ── Layer 2: Outcome label comparison ────────────────────────────────
+    // Compare both outcome labels pairwise. This catches esports abbreviations
+    // (e.g., "Natus Vincere" vs "NAVI" can't fuzzy-match, but "Aurora Gaming" vs "Aurora" can).
+    if (marketA.outcomes.length === 2 && marketB.outcomes.length === 2) {
+      const a0 = marketA.outcomes[0].toLowerCase().trim();
+      const a1 = marketA.outcomes[1].toLowerCase().trim();
+      const b0 = marketB.outcomes[0].toLowerCase().trim();
+      const b1 = marketB.outcomes[1].toLowerCase().trim();
+
+      // Check same-order: outcome[0]↔[0] AND/OR outcome[1]↔[1]
+      const match00 = fuzzyTeamMatch(a0, b0);
+      const match11 = fuzzyTeamMatch(a1, b1);
+      // Check reversed: outcome[0]↔[1] AND/OR outcome[1]↔[0]
+      const match01 = fuzzyTeamMatch(a0, b1);
+      const match10 = fuzzyTeamMatch(a1, b0);
+
+      const sameOrderEvidence = (match00 ? 1 : 0) + (match11 ? 1 : 0);
+      const reversedEvidence = (match01 ? 1 : 0) + (match10 ? 1 : 0);
+
+      if (sameOrderEvidence > reversedEvidence && sameOrderEvidence > 0) {
+        log.info('detectOutcomesInverted: outcome labels → aligned', {
+          outcomes: { a: marketA.outcomes, b: marketB.outcomes },
+          sameOrderEvidence, reversedEvidence,
+          yesTeamSaysInverted: yesTeamSaysInverted ?? 'no yesTeam',
+        });
+        return false;
+      }
+      if (reversedEvidence > sameOrderEvidence && reversedEvidence > 0) {
+        log.info('detectOutcomesInverted: outcome labels → inverted', {
+          outcomes: { a: marketA.outcomes, b: marketB.outcomes },
+          sameOrderEvidence, reversedEvidence,
+        });
+        return true;
+      }
+      // No outcome labels matched at all — continue to layer 3
+    }
+
+    // ── Layer 3: Question text similarity ────────────────────────────────
+    // For cross-reference matched pairs (predict.fun → Polymarket), questions are often
+    // identical. If questions are very similar and both use "TeamA vs TeamB" format,
+    // the outcomes are in the same order.
+    if (marketA.question && marketB.question) {
+      const qSimilarity = questionSimilarity(marketA.question, marketB.question);
+      if (qSimilarity >= 0.8) {
+        // Questions are very similar — trust that outcomes are in the same order
+        // This handles esports where both team names are abbreviated on one platform
+        // (e.g., "BLG" vs "Bilibili Gaming", "FOX" vs "BNK FEARX")
+        log.info('detectOutcomesInverted: identical questions → aligned', {
+          similarity: qSimilarity,
+          questionA: marketA.question.substring(0, 80),
+          questionB: marketB.question.substring(0, 80),
+          yesTeamSaysInverted: yesTeamSaysInverted ?? 'no yesTeam',
+        });
+        return false;
+      }
+    }
+
+    // ── Fallback: trust yesTeam signal if we had one ─────────────────────
+    if (yesTeamSaysInverted !== undefined) {
+      log.info('detectOutcomesInverted: falling back to yesTeam signal → inverted', {
+        marketA: { id: marketA.id, platform: marketA.platform, yesTeam: yesTeamA },
+        marketB: { id: marketB.id, platform: marketB.platform, yesTeam: yesTeamB },
+      });
+      return true;
+    }
+
     return undefined;
   }
+
+  // questionSimilarity is now imported from sports-matcher module
 
   /**
    * Apply cross-reference matches from predict.fun's built-in fields.
@@ -1260,6 +1420,7 @@ export class CrossPlatformArbStrategy implements Strategy {
           status: pair.status,
           confidence: pair.confidence,
           matchMethod: pair.matchMethod,
+          outcomesInverted: pair.outcomesInverted,
           llmIsSameMarket: pair.llmVerification?.isSameMarket,
           llmConfidence: pair.llmVerification?.confidence,
           llmReasoning: pair.llmVerification?.reasoning,
@@ -1486,12 +1647,25 @@ export class CrossPlatformArbStrategy implements Strategy {
       if (walkResult && walkResult.size > 0) {
         const totalValue = walkResult.size * (walkResult.avgPriceA + walkResult.avgPriceB);
         if (minDepthUsd <= 0 || totalValue >= minDepthUsd) {
-          opportunities.push(this.createOpportunity(
+          const opp = this.createOpportunity(
             pair,
             'YES', walkResult.avgPriceA, bookAYes, walkResult.size,
             bOutcomeForNo, walkResult.avgPriceB, bookBYes, walkResult.size,
             walkResult.profitPerShare * walkResult.size, walkResult.profitBps, walkResult.size,
-          ));
+          );
+          opportunities.push(opp);
+
+          // ── Diagnostic snapshot ──
+          this.emitDiagnostic({
+            opportunity: opp, pair, direction: 'D1',
+            bookAYes, bookBRaw, bookBEffective: bookBYes,
+            bookWalkLevels: walkResult.trace,
+            feePerShareA: this.estimateFees(pair.marketA.platform, walkResult.avgPriceA, 1),
+            feePerShareB: this.estimateFees(pair.marketB.platform, walkResult.avgPriceB, 1),
+            dynamicMinProfitBps: dynamicMinBps,
+            configMinProfitBps: this.config.minProfitBps,
+            bOutcomeForYes, bOutcomeForNo,
+          });
         } else {
           onSkip('below_depth');
         }
@@ -1534,12 +1708,25 @@ export class CrossPlatformArbStrategy implements Strategy {
       if (walkResult && walkResult.size > 0) {
         const totalValue = walkResult.size * (walkResult.avgPriceA + walkResult.avgPriceB);
         if (minDepthUsd <= 0 || totalValue >= minDepthUsd) {
-          opportunities.push(this.createOpportunity(
+          const opp = this.createOpportunity(
             pair,
             'NO', walkResult.avgPriceA, bookAYes, walkResult.size,
             bOutcomeForYes, walkResult.avgPriceB, bookBYes, walkResult.size,
             walkResult.profitPerShare * walkResult.size, walkResult.profitBps, walkResult.size,
-          ));
+          );
+          opportunities.push(opp);
+
+          // ── Diagnostic snapshot ──
+          this.emitDiagnostic({
+            opportunity: opp, pair, direction: 'D2',
+            bookAYes, bookBRaw, bookBEffective: bookBYes,
+            bookWalkLevels: walkResult.trace,
+            feePerShareA: this.estimateFees(pair.marketA.platform, walkResult.avgPriceA, 1),
+            feePerShareB: this.estimateFees(pair.marketB.platform, walkResult.avgPriceB, 1),
+            dynamicMinProfitBps: dynamicMinBps2,
+            configMinProfitBps: this.config.minProfitBps,
+            bOutcomeForYes, bOutcomeForNo,
+          });
         } else {
           onSkip('below_depth');
         }
@@ -1560,6 +1747,22 @@ export class CrossPlatformArbStrategy implements Strategy {
    */
   private async analyzePair(pair: MarketPair): Promise<ArbitrageOpportunity[]> {
     return this.analyzePairWithDiagnostics(pair, () => {});
+  }
+
+  /**
+   * Build and write a diagnostic snapshot for a detected arb opportunity.
+   * Non-blocking — errors are caught and logged, never thrown.
+   */
+  private emitDiagnostic(params: Omit<BuildSnapshotParams, 'maxPositionUsd'> & { maxPositionUsd?: number }): void {
+    try {
+      const snapshot = buildDiagnosticSnapshot({
+        ...params,
+      });
+      snapshot.maxPositionUsd = this.config.maxPositionUsd;
+      writeDiagnosticSnapshot(snapshot);
+    } catch (err) {
+      log.warn('Failed to write arb diagnostic', { error: (err as Error).message });
+    }
   }
 
   private createOpportunity(

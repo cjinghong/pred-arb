@@ -123,9 +123,13 @@ function getPlatformMarketUrl(platform: string, slug: string, marketId: string, 
   }
   if (platform === 'predictfun') return slug ? `https://predict.fun/market/${slug}` : `https://predict.fun/market/${marketId}`;
   if (platform === 'kalshi') {
-    // Kalshi URL: /markets/{event_ticker}/{subtitle_slug}/{market_ticker}
-    // eventSlug = event_ticker, slug = subtitle slug, marketId = market ticker
-    if (eventSlug && slug) return `https://kalshi.com/markets/${eventSlug}/${slug}/${marketId.toLowerCase()}`;
+    // Kalshi URL: /markets/{series_ticker}/{subtitle_slug}/{event_ticker}
+    // eventSlug = series_ticker, slug = "{subtitle_slug}|{event_ticker}"
+    const parts = slug.split('|');
+    const subtitleSlug = parts[0] || '';
+    const eventTicker = parts[1] || '';
+    if (eventSlug && subtitleSlug && eventTicker) return `https://kalshi.com/markets/${eventSlug}/${subtitleSlug}/${eventTicker}`;
+    if (eventSlug && eventTicker) return `https://kalshi.com/markets/${eventSlug}/${eventTicker}`;
     if (eventSlug) return `https://kalshi.com/markets/${eventSlug}`;
     return `https://kalshi.com/markets/${marketId.toLowerCase()}`;
   }

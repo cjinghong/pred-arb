@@ -61,6 +61,14 @@ export const config = {
      * When set, fetches ALL markets in that category (pagination) instead of top-200 by volume.
      */
     marketCategory: (process.env.MARKET_CATEGORY || '').toLowerCase().trim(),
+    /**
+     * Comma-separated list of enabled platforms. Only these platforms will be connected and used.
+     * Values: 'polymarket', 'predictfun', 'kalshi'
+     * Default: 'polymarket,kalshi' (predict.fun disabled by default)
+     * Set ENABLED_PLATFORMS=polymarket,predictfun,kalshi to enable all three.
+     */
+    enabledPlatforms: (process.env.ENABLED_PLATFORMS || 'polymarket,kalshi')
+      .toLowerCase().split(',').map(p => p.trim()).filter(Boolean),
   },
 
   dashboard: {
