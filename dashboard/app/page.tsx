@@ -236,6 +236,7 @@ export default function DashboardPage() {
   const [marketSearch, setMarketSearch] = useState('');
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [marketCategory, setMarketCategory] = useState('');
+  const [marketCategories, setMarketCategories] = useState<string[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [configParams, setConfigParams] = useState<{ minProfitBps: number; maxPositionUsd: number; maxTotalExposureUsd: number }>({
     minProfitBps: 150, maxPositionUsd: 500, maxTotalExposureUsd: 5000,
@@ -279,6 +280,47 @@ export default function DashboardPage() {
       case 'risk_alert':
         addFeed('RISK', 'Limit breach detected', 'negative');
         break;
+      case 'discovery_category_start':
+        addFeed('DISC', `Discovering ${msg.data.category} [${msg.data.index}/${msg.data.total}] (${msg.data.pipeline})...`, 'cyan');
+        break;
+      case 'discovery_category_complete':
+        addFeed('DISC', `${msg.data.category} done: ${msg.data.marketsFound} markets, ${msg.data.newPairs} new pairs (${(msg.data.durationMs / 1000).toFixed(1)}s)`, 'positive');
+        break;
+      case 'discovery_category_error':
+        addFeed('DISC', `${msg.data.category} failed: ${msg.data.error}`, 'negative');
+        break;
+      case 'discovery_fetch':
+        addFeed('FETCH', `${msg.data.platform}: ${msg.data.marketsFound} ${msg.data.category} markets`, 'neutral');
+        break;
+      case 'discovery_matching': {
+        const mp = msg.data;
+        const matchMsg = mp.newPairs > 0
+          ? `${mp.platformA} ↔ ${mp.platformB}: ${mp.newPairs} new pairs (${mp.unmatchedA + mp.unmatchedB} unmatched)`
+          : `${mp.platformA} ↔ ${mp.platformB}: 0 pairs from ${mp.unmatchedA + mp.unmatchedB} unmatched`;
+        addFeed('MATCH', matchMsg, mp.newPairs > 0 ? 'amber' : 'neutral');
+        break;
+      }
+      case 'discovery_match_pass': {
+        const pp = msg.data;
+        const passLabels: Record<string, string> = {
+          'cross-ref': 'Cross-ref',
+          'slug': 'Slug match',
+          'sports': 'Sports norm',
+          'fuzzy': 'Fuzzy match',
+          'llm-start': 'LLM matching',
+          'llm-done': 'LLM done',
+          'llm-skip': 'LLM skipped',
+        };
+        const label = passLabels[pp.pass] || pp.pass;
+        if (pp.pass === 'llm-start') {
+          addFeed('PASS', `${label}: processing ${pp.remaining} markets...`, 'cyan');
+        } else if (pp.pass === 'llm-skip') {
+          addFeed('PASS', `${label} (no LLM configured), ${pp.remaining} unmatched`, 'neutral');
+        } else {
+          addFeed('PASS', `${label}: ${pp.pairs} pairs, ${pp.remaining} remaining`, pp.pairs > 0 ? 'amber' : 'neutral');
+        }
+        break;
+      }
     }
   }, []);
 
@@ -388,6 +430,7 @@ export default function DashboardPage() {
     const apiBase = getApiBase();
     fetch(`${apiBase}/api/config`).then(r => r.json()).then(cfg => {
       if (cfg.marketCategory !== undefined) setMarketCategory(cfg.marketCategory);
+      if (cfg.marketCategories !== undefined) setMarketCategories(cfg.marketCategories);
       setConfigParams(prev => ({
         minProfitBps: cfg.minProfitBps ?? prev.minProfitBps,
         maxPositionUsd: cfg.maxPositionUsd ?? prev.maxPositionUsd,
@@ -412,6 +455,7 @@ export default function DashboardPage() {
 
   const handleCategoryChange = async (newCategory: string) => {
     setMarketCategory(newCategory);
+    setMarketCategories([]); // Clear multi-category when single is selected
     try {
       const apiBase = getApiBase();
       await fetch(`${apiBase}/api/config/category`, {
@@ -429,6 +473,25 @@ export default function DashboardPage() {
       alert(`Category update failed: ${(err as Error).message}`);
     }
     setIsRefreshing(false);
+  };
+
+  const handleCategoryToggle = async (cat: string) => {
+    const current = [...marketCategories];
+    const idx = current.indexOf(cat);
+    if (idx >= 0) current.splice(idx, 1);
+    else current.push(cat);
+    setMarketCategories(current);
+    try {
+      const apiBase = getApiBase();
+      await fetch(`${apiBase}/api/config/categories`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categories: current }),
+      });
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Categories → ${current.join(', ') || 'none'}`, cls: 'cyan' }, ...prev.slice(0, 99)]);
+    } catch (err) {
+      alert(`Categories update failed: ${(err as Error).message}`);
+    }
   };
 
   const handleParamSave = async (paramName: string, value: string) => {
@@ -754,14 +817,37 @@ export default function DashboardPage() {
             {activeTab === 'markets' && (
               <>
                 {/* Category + Refresh bar */}
-                <div className="filter-bar" style={{ alignItems: 'center' }}>
+                <div className="filter-bar" style={{ alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                   <div className="filter-group">
-                    <span className="filter-label">CATEGORY</span>
+                    <span className="filter-label">CATEGORIES</span>
+                    <div className="category-chips">
+                      {[
+                        { value: 'sports', label: 'SPORTS' },
+                        { value: 'politics', label: 'POLITICS' },
+                        { value: 'crypto', label: 'CRYPTO' },
+                        { value: 'esports', label: 'ESPORTS' },
+                        { value: 'finance', label: 'FINANCE' },
+                        { value: 'culture', label: 'CULTURE' },
+                      ].map(cat => (
+                        <button
+                          key={cat.value}
+                          className={`category-chip ${marketCategories.includes(cat.value) ? 'active' : ''}`}
+                          onClick={() => handleCategoryToggle(cat.value)}
+                        >
+                          {cat.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="filter-group" style={{ marginLeft: '4px' }}>
+                    <span className="filter-label" style={{ fontSize: '9px', opacity: 0.5 }}>OR SINGLE</span>
                     <select
                       className="category-select"
-                      value={marketCategory}
-                      onChange={e => handleCategoryChange(e.target.value)}
+                      value={marketCategories.length > 0 ? '__multi__' : marketCategory}
+                      onChange={e => { if (e.target.value !== '__multi__') handleCategoryChange(e.target.value); }}
+                      style={{ opacity: marketCategories.length > 0 ? 0.4 : 1 }}
                     >
+                      {marketCategories.length > 0 && <option value="__multi__">MULTI ({marketCategories.length})</option>}
                       <option value="">ALL MARKETS</option>
                       <optgroup label="Sports">
                         <option value="sports">ALL SPORTS</option>
@@ -852,7 +938,7 @@ export default function DashboardPage() {
                           <span className="pair-group-count">{group.pairs.length}</span>
                         </div>
                         {group.pairs.map((pair, i) => (
-                          <div className={`pair-row pair-status-${pair.status} clickable`} key={pair.pairId || i}
+                          <div className={`pair-row pair-status-${pair.status} clickable`} key={`${pair.pairId}-${i}`}
                             onClick={() => navigateToPair(pair)}>
                             <div className="pair-info">
                               <div className="pair-markets">

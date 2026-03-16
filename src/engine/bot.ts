@@ -120,6 +120,8 @@ export class Bot {
     this.apiServer.setCategoryHandlers(
       () => xPlatformArb.getCategory(),
       (cat) => xPlatformArb.setCategory(cat),
+      () => xPlatformArb.getCategories(),
+      (cats) => xPlatformArb.setCategories(cats),
     );
     this.apiServer.setConfigParamsHandlers(
       () => xPlatformArb.getConfigParams(),

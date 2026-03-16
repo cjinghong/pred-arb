@@ -458,18 +458,19 @@ export class KalshiConnector extends BaseConnector {
     let cursor: string | null = null;
     const pageSize = 200;
     const maxPages = 20;
-    const MAX_CATEGORY_MARKETS = 2000; // Cap to avoid huge payloads
+    const MAX_CATEGORY_MARKETS = _options?.limit || 2000; // Respect caller's limit
 
     this.log.info('Fetching Kalshi events by category', { category, kalshiCategory });
 
     for (let page = 0; page < maxPages; page++) {
       const params = new URLSearchParams();
       params.set('limit', String(pageSize));
-      params.set('status', 'open');
       params.set('with_nested_markets', 'true');
-      // Server-side category filter on events endpoint
-      params.set('category', kalshiCategory);
+      // NOTE: Kalshi removed `category` and possibly `status` query params from GET /events
+      // (circa March 2026). We filter client-side instead.
       if (cursor) params.set('cursor', cursor);
+
+      this.log.info('Kalshi events request', { url: `${this.apiUrl}/events?${params.toString()}` });
 
       const response = await this.kalshiGet<KalshiEventsResponse>(
         `${this.apiUrl}/events?${params.toString()}`
@@ -479,8 +480,14 @@ export class KalshiConnector extends BaseConnector {
       if (events.length === 0) break;
 
       for (const event of events) {
+        // Client-side category filter: only include events whose category matches.
+        // Many Kalshi events have empty/missing category — skip those too.
+        if (!event.category || event.category.toLowerCase() !== kalshiCategory.toLowerCase()) {
+          continue;
+        }
         const markets = event.markets || [];
         for (const m of markets) {
+          // Client-side status filter (server-side param removed)
           if (m.status !== 'open' && m.status !== 'active') continue;
           // Inherit category from the event since market.category is empty
           if (!m.category && event.category) {
@@ -492,6 +499,8 @@ export class KalshiConnector extends BaseConnector {
 
       cursor = response.cursor || null;
       if (!cursor || events.length < pageSize) break;
+      // Early exit: if we already have enough markets, stop paginating
+      if (allMarkets.length >= MAX_CATEGORY_MARKETS) break;
     }
 
     // Sort by volume (most liquid first) and cap at MAX_CATEGORY_MARKETS
@@ -501,7 +510,7 @@ export class KalshiConnector extends BaseConnector {
     this.log.info('Kalshi category fetch complete', {
       category,
       kalshiCategory,
-      totalFound: allMarkets.length,
+      marketsFound: allMarkets.length,
       kept: capped.length,
     });
 

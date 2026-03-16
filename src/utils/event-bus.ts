@@ -24,6 +24,12 @@ export interface BotEvents {
   'connector:disconnected': { platform: string };
   'connector:error': { platform: string; error: string };
   'risk:limit_breach': { type: string; current: number; limit: number };
+  'discovery:category_start': { category: string; index: number; total: number; pipeline: 'sports' | 'generic' };
+  'discovery:category_complete': { category: string; index: number; total: number; durationMs: number; marketsFound: number; newPairs: number; totalPairs: number };
+  'discovery:category_error': { category: string; error: string };
+  'discovery:fetch': { platform: string; category: string; marketsFound: number };
+  'discovery:matching': { category: string; platformA: string; platformB: string; unmatchedA: number; unmatchedB: number; newPairs: number };
+  'discovery:match_pass': { pass: string; pairs: number; remaining: number };
   'dashboard:update': Record<string, unknown>;
 }
 

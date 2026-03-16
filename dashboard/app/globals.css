@@ -1322,6 +1322,33 @@ html, body {
 .category-select option { background: var(--bg-secondary); color: var(--text-primary); }
 .category-select optgroup { color: var(--accent-amber); font-style: normal; }
 
+/* ─── Category Chips (multi-select) ──────────────────────────────────── */
+.category-chips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.category-chip {
+  padding: 3px 10px;
+  border: 1px solid var(--border-bright);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.category-chip:hover {
+  border-color: var(--accent-cyan);
+  color: var(--text-primary);
+}
+.category-chip.active {
+  border-color: var(--accent-amber);
+  background: rgba(255, 191, 0, 0.12);
+  color: var(--accent-amber);
+}
+
 /* ─── Refresh Button ──────────────────────────────────────────────────── */
 .btn-refresh {
   padding: 4px 14px;

@@ -707,20 +707,47 @@ export class CrossPlatformArbStrategy implements Strategy {
   /** Runtime category override (dashboard can change this without restart) */
   private runtimeCategory: string | null = null;
 
+  /** Runtime categories override (dashboard can change without restart) */
+  private runtimeCategories: string[] | null = null;
+
   /** Runtime parameter overrides (dashboard can change these without restart) */
   private runtimeMinProfitBps: number | null = null;
   private runtimeMaxPositionUsd: number | null = null;
   private runtimeMaxTotalExposureUsd: number | null = null;
 
-  /** Get the effective category (runtime override > env var) */
+  /** Get the effective single category (runtime override > env var). Legacy. */
   getCategory(): string {
     return this.runtimeCategory ?? config.bot.marketCategory;
+  }
+
+  /**
+   * Get the effective list of categories to iterate sequentially.
+   * Priority: runtimeCategories > MARKET_CATEGORIES env > single MARKET_CATEGORY > []
+   */
+  getCategories(): string[] {
+    if (this.runtimeCategories && this.runtimeCategories.length > 0) {
+      return this.runtimeCategories;
+    }
+    if (config.bot.marketCategories.length > 0) {
+      return config.bot.marketCategories;
+    }
+    // Fall back to single category
+    const single = this.getCategory();
+    return single ? [single] : [];
   }
 
   /** Set category at runtime (from dashboard). Pass '' to clear. */
   setCategory(category: string): void {
     this.runtimeCategory = category || null;
+    // Also clear multi-category override so single category takes effect
+    this.runtimeCategories = null;
     log.info('Market category updated at runtime', { category: this.getCategory() });
+  }
+
+  /** Set multiple categories at runtime (from dashboard). */
+  setCategories(categories: string[]): void {
+    this.runtimeCategories = categories.length > 0 ? categories : null;
+    log.info('Market categories updated at runtime', { categories: this.getCategories() });
   }
 
   /** Get effective config params (runtime overrides > env vars) */
@@ -945,17 +972,96 @@ export class CrossPlatformArbStrategy implements Strategy {
       return;
     }
 
-    const category = this.getCategory() || undefined;
+    const categories = this.getCategories();
 
-    // ── Route to category-specific discovery + matching ────────────────────
-    // Each category (sports, politics, crypto) has its own optimized
-    // discovery and matching pipeline for higher quality results.
-    const isSportsCategory = this.isSportsCategory(category);
+    if (categories.length > 0) {
+      // ── Multi-category sequential discovery + matching ─────────────────
+      // Process each category one at a time: fetch from all platforms, match,
+      // then move to the next. This scopes matching to same-category markets
+      // and prevents cross-category noise that wastes LLM calls and time.
+      log.info('Sequential category discovery', {
+        categories,
+        totalCategories: categories.length,
+      });
 
-    if (isSportsCategory) {
-      await this.refreshSportsPairs(activePlatforms, category);
+      for (let idx = 0; idx < categories.length; idx++) {
+        const cat = categories[idx];
+        const startMs = Date.now();
+        const pipeline = this.isSportsCategory(cat) ? 'sports' as const : 'generic' as const;
+        log.info(`Category ${idx + 1}/${categories.length}: ${cat}`, { category: cat });
+
+        eventBus.emit('discovery:category_start', {
+          category: cat, index: idx + 1, total: categories.length, pipeline,
+        });
+
+        const pairsBefore = this.cachedPairs.length;
+        try {
+          if (pipeline === 'sports') {
+            await this.refreshSportsPairs(activePlatforms, cat);
+          } else {
+            await this.refreshGenericPairs(activePlatforms, cat);
+          }
+
+          const newPairsCount = this.cachedPairs.length - pairsBefore;
+          const durationMs = Date.now() - startMs;
+          log.info(`Category ${idx + 1}/${categories.length}: ${cat} done`, {
+            category: cat,
+            durationMs,
+            totalPairs: this.cachedPairs.length,
+          });
+
+          // Sum up markets found across platforms for this category
+          let marketsFound = 0;
+          for (const markets of this.lastFetchedMarkets.values()) {
+            marketsFound += markets.length;
+          }
+
+          eventBus.emit('discovery:category_complete', {
+            category: cat, index: idx + 1, total: categories.length,
+            durationMs, marketsFound, newPairs: newPairsCount, totalPairs: this.cachedPairs.length,
+          });
+        } catch (err) {
+          // Non-fatal: log and continue to next category
+          log.error(`Category ${cat} failed, continuing to next`, {
+            category: cat,
+            error: (err as Error).message,
+          });
+          eventBus.emit('discovery:category_error', {
+            category: cat, error: (err as Error).message,
+          });
+        }
+      }
     } else {
-      await this.refreshGenericPairs(activePlatforms, category);
+      // ── Single/no category (legacy behavior) ─────────────────────────
+      const category = this.getCategory() || undefined;
+      const pipeline = this.isSportsCategory(category) ? 'sports' as const : 'generic' as const;
+      const catLabel = category || 'all';
+
+      eventBus.emit('discovery:category_start', {
+        category: catLabel, index: 1, total: 1, pipeline,
+      });
+
+      const pairsBefore = this.cachedPairs.length;
+      const startMs = Date.now();
+
+      if (pipeline === 'sports') {
+        await this.refreshSportsPairs(activePlatforms, category);
+      } else {
+        await this.refreshGenericPairs(activePlatforms, category);
+      }
+
+      let marketsFound = 0;
+      for (const markets of this.lastFetchedMarkets.values()) {
+        marketsFound += markets.length;
+      }
+
+      eventBus.emit('discovery:category_complete', {
+        category: catLabel, index: 1, total: 1,
+        durationMs: Date.now() - startMs,
+        marketsFound,
+        newPairs: this.cachedPairs.length - pairsBefore,
+        totalPairs: this.cachedPairs.length,
+      });
     }
   }
 
@@ -1006,11 +1112,14 @@ export class CrossPlatformArbStrategy implements Strategy {
       maxResults: 1000,
     });
 
-    // Cache for dashboard visibility
+    // Cache for dashboard visibility + emit per-platform fetch events
     const platformMarkets = new Map<Platform, NormalizedMarket[]>();
     for (const [platform, markets] of result.markets) {
       this.lastFetchedMarkets.set(platform, markets);
       platformMarkets.set(platform, markets);
+      eventBus.emit('discovery:fetch', {
+        platform, category: category || 'sports', marketsFound: markets.length,
+      });
     }
 
     // ── Step 2: Incremental matching ──────────────────────────────────────
@@ -1053,6 +1162,7 @@ export class CrossPlatformArbStrategy implements Strategy {
 
         // Sports matcher: deterministic team+date matching
         const pairsSeen = new Set<string>();
+        let pairCountForThisPlatformPair = 0;
 
         if (unmatchedA.length > 0) {
           log.info(`Sports matching NEW ${platA} (${unmatchedA.length}) ↔ ${platB} (${allMarketsB.length})`);
@@ -1061,6 +1171,7 @@ export class CrossPlatformArbStrategy implements Strategy {
             if (!pairsSeen.has(p.pairId)) {
               pairsSeen.add(p.pairId);
               newPairs.push(p);
+              pairCountForThisPlatformPair++;
             }
           }
         }
@@ -1072,9 +1183,17 @@ export class CrossPlatformArbStrategy implements Strategy {
             if (!pairsSeen.has(p.pairId)) {
               pairsSeen.add(p.pairId);
               newPairs.push(p);
+              pairCountForThisPlatformPair++;
             }
           }
         }
+
+        eventBus.emit('discovery:matching', {
+          category: category || 'sports',
+          platformA: platA, platformB: platB,
+          unmatchedA: unmatchedA.length, unmatchedB: unmatchedB.length,
+          newPairs: pairCountForThisPlatformPair,
+        });
       }
     }
 
@@ -1116,12 +1235,15 @@ export class CrossPlatformArbStrategy implements Strategy {
 
     const fetchResults = await Promise.all(fetchPromises);
 
-    // Cache for dashboard visibility
+    // Cache for dashboard visibility + emit per-platform fetch events
     const platformMarkets = new Map<Platform, NormalizedMarket[]>();
     for (const { platform, markets } of fetchResults) {
       this.lastFetchedMarkets.set(platform, markets);
       platformMarkets.set(platform, markets);
       log.info(`Markets fetched from ${platform}`, { count: markets.length });
+      eventBus.emit('discovery:fetch', {
+        platform, category: category || 'all', marketsFound: markets.length,
+      });
     }
 
     // ── Incremental matching ──────────────────────────────────────────────
@@ -1163,6 +1285,7 @@ export class CrossPlatformArbStrategy implements Strategy {
         }
 
         const pairsSeen = new Set<string>();
+        let pairCountForThisPlatformPair = 0;
 
         if (unmatchedA.length > 0) {
           log.info(`Matching NEW ${platA} (${unmatchedA.length}) ↔ ${platB} (${allMarketsB.length})`);
@@ -1171,6 +1294,7 @@ export class CrossPlatformArbStrategy implements Strategy {
             if (!pairsSeen.has(p.pairId)) {
               pairsSeen.add(p.pairId);
               newPairs.push(p);
+              pairCountForThisPlatformPair++;
             }
           }
         }
@@ -1182,9 +1306,17 @@ export class CrossPlatformArbStrategy implements Strategy {
             if (!pairsSeen.has(p.pairId)) {
               pairsSeen.add(p.pairId);
               newPairs.push(p);
+              pairCountForThisPlatformPair++;
             }
           }
         }
+
+        eventBus.emit('discovery:matching', {
+          category: category || 'all',
+          platformA: platA, platformB: platB,
+          unmatchedA: unmatchedA.length, unmatchedB: unmatchedB.length,
+          newPairs: pairCountForThisPlatformPair,
+        });
       }
     }
 
@@ -1433,18 +1565,27 @@ export class CrossPlatformArbStrategy implements Strategy {
    * Shared finalization: merge new pairs, persist, rebuild index, subscribe WS.
    */
   private finalizeRefresh(newPairs: MarketPair[], oldPairIds: Set<string>): void {
-    if (newPairs.length > 0) {
-      log.info('New pairs discovered', { count: newPairs.length });
-      this.cachedPairs.push(...newPairs);
+    // Deduplicate: only add pairs whose pairId isn't already in cachedPairs
+    const existingPairIds = new Set(this.cachedPairs.map(p => p.pairId));
+    const uniqueNewPairs = newPairs.filter(p => !existingPairIds.has(p.pairId));
+
+    if (uniqueNewPairs.length > 0) {
+      log.info('New pairs discovered', {
+        count: uniqueNewPairs.length,
+        duplicatesSkipped: newPairs.length - uniqueNewPairs.length,
+      });
+      this.cachedPairs.push(...uniqueNewPairs);
     } else {
-      log.info('No new pairs found');
+      log.info('No new pairs found', {
+        duplicatesSkipped: newPairs.length,
+      });
     }
 
     this.lastPairRefresh = Date.now();
     this.rebuildMarketIndex();
 
     // Persist only NEW pairs to DB
-    for (const pair of newPairs) {
+    for (const pair of uniqueNewPairs) {
       try {
         upsertMarketPair({
           pairId: pair.pairId,

@@ -40,6 +40,8 @@ export class ApiServer {
   private refreshMarkets: (() => Promise<void>) | null = null;
   private getCategory: (() => string) | null = null;
   private setCategory: ((category: string) => void) | null = null;
+  private getCategories: (() => string[]) | null = null;
+  private setCategories: ((categories: string[]) => void) | null = null;
   private getBotTradeMarketIds: (() => Set<string>) | null = null;
   private getConfigParams: (() => { minProfitBps: number; maxPositionUsd: number; maxTotalExposureUsd: number }) | null = null;
   private setConfigParams: ((params: { minProfitBps?: number; maxPositionUsd?: number; maxTotalExposureUsd?: number }) => void) | null = null;
@@ -92,9 +94,14 @@ export class ApiServer {
   }
 
   /** Wire up category getter/setter for runtime config */
-  setCategoryHandlers(get: () => string, set: (category: string) => void): void {
+  setCategoryHandlers(
+    get: () => string, set: (category: string) => void,
+    getMulti: () => string[], setMulti: (categories: string[]) => void,
+  ): void {
     this.getCategory = get;
     this.setCategory = set;
+    this.getCategories = getMulti;
+    this.setCategories = setMulti;
   }
 
   /** Wire up config params getter/setter for runtime tuning */
@@ -155,6 +162,7 @@ export class ApiServer {
         scanIntervalMs: config.bot.scanIntervalMs,
         minDepthUsd: config.bot.minDepthUsd,
         marketCategory: this.getCategory ? this.getCategory() : config.bot.marketCategory,
+        marketCategories: this.getCategories ? this.getCategories() : config.bot.marketCategories,
       });
     });
 
@@ -210,6 +218,22 @@ export class ApiServer {
       this.setCategory(category.toLowerCase().trim());
       log.info('Market category updated via API', { category });
       res.json({ category: this.getCategory ? this.getCategory() : category });
+    });
+
+    this.app.post('/api/config/categories', (req, res) => {
+      const { categories } = req.body;
+      if (!Array.isArray(categories) || !categories.every((c: unknown) => typeof c === 'string')) {
+        res.status(400).json({ error: 'categories must be an array of strings' });
+        return;
+      }
+      if (!this.setCategories) {
+        res.status(503).json({ error: 'Categories handler not initialized' });
+        return;
+      }
+      const cleaned = categories.map((c: string) => c.toLowerCase().trim()).filter(Boolean);
+      this.setCategories(cleaned);
+      log.info('Market categories updated via API', { categories: cleaned });
+      res.json({ categories: this.getCategories ? this.getCategories() : cleaned });
     });
 
     this.app.post('/api/bot/refresh-markets', async (_req, res) => {
@@ -403,6 +427,14 @@ export class ApiServer {
 
     // Forward book updates so the dashboard can live-update orderbook views
     eventBus.on('book:update', forward('book_update'));
+
+    // Forward discovery progress events so dashboard shows what the bot is doing
+    eventBus.on('discovery:category_start', forward('discovery_category_start'));
+    eventBus.on('discovery:category_complete', forward('discovery_category_complete'));
+    eventBus.on('discovery:category_error', forward('discovery_category_error'));
+    eventBus.on('discovery:fetch', forward('discovery_fetch'));
+    eventBus.on('discovery:matching', forward('discovery_matching'));
+    eventBus.on('discovery:match_pass', forward('discovery_match_pass'));
   }
 
   async start(): Promise<void> {

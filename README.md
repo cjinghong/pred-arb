@@ -1,364 +1,251 @@
-# PRED-ARB
+# pred-arb
 
-> Prediction market cross-platform arbitrage bot with a retro-futuristic Bloomberg terminal dashboard.
-
-Continuously scans [Polymarket](https://polymarket.com) and [predict.fun](https://predict.fun) for equivalent markets trading at different prices. When the combined cost of holding both YES on one platform and NO on the other drops below $1.00, the bot surfaces the opportunity and (in live mode) executes both legs simultaneously.
-
----
+Cross-platform prediction market arbitrage bot. Monitors [Polymarket](https://polymarket.com), [Kalshi](https://kalshi.com), and [predict.fun](https://predict.fun) for pricing discrepancies on equivalent markets, then executes simultaneous 2-legged trades to lock in risk-free profit.
 
 ## How it works
 
-Binary prediction markets always settle at either $1.00 (outcome occurred) or $0.00 (it didn't). Because you can hold YES on one platform and NO on another for the same event, the combined position is guaranteed to pay out $1.00 regardless of the result. If you can buy both legs for less than $1.00, you have locked-in arbitrage profit.
+Binary prediction markets settle at $1 (event happened) or $0 (it didn't). By buying YES on one platform and NO on another for the same event, the combined position pays out $1 regardless of the outcome. If both legs cost less than $1, the difference is guaranteed profit.
 
 ```
-Polymarket:   "Will X happen?" — YES ask at $0.48
-predict.fun:  "Will X happen?" — NO  ask at $0.49
+Polymarket:  "Will X happen?" — YES @ $0.48
+Kalshi:      "Will X happen?" — NO  @ $0.49
 
 Cost:   $0.48 + $0.49 = $0.97
-Payout: $1.00
-Profit: $0.03 per share (≈ 309 basis points)
+Payout: $1.00 (guaranteed)
+Profit: $0.03/share (≈ 3.1%)
 ```
 
-The strategy runs in both directions — YES on A + NO on B, and NO on A + YES on B — and uses WebSocket-driven scanning to detect opportunities the instant order books change.
+The bot scans both directions (YES-A + NO-B and NO-A + YES-B) across all platform pairs, using WebSocket order book updates to detect opportunities instantly.
 
-> See [docs/cross-platform-arb.md](docs/cross-platform-arb.md) for a detailed strategy deep-dive covering mechanics, sizing, edge cases, and risk considerations.
+## Quick start
 
----
+### Prerequisites
 
-## Features
+- **Node.js 18+** (20 LTS recommended)
+- **Platform accounts** on at least 2 of: Polymarket, Kalshi, predict.fun
+- **LLM** for non-sports market matching (optional — [Ollama](https://ollama.com) for free local inference, or an Anthropic API key)
 
-- **Event-driven scanning** — WebSocket order book updates trigger instant arb detection instead of polling. A reverse market-to-pair index provides O(1) lookup with 200ms per-pair debounce.
-- **Multi-platform architecture** — add new prediction markets by implementing a single `MarketConnector` interface
-- **Extensible strategy engine** — swap in new strategies (e.g. multi-leg, hedged, statistical arb) by implementing the `Strategy` interface
-- **Fuzzy market matching** — Fuse.js text similarity + slug/date/category heuristics to identify equivalent markets across platforms, with optional LLM verification
-- **Pre-trade risk checks** — position size limits, total exposure cap, per-platform balance checks, match-confidence threshold
-- **Dry-run mode on by default** — logs all opportunities and simulated executions without placing real orders
-- **Bloomberg terminal dashboard** — retro-futuristic React UI with live P&L metrics, opportunity feed, trade history, live orderbook viewer, and bot controls
-- **Live order book viewer** — click any market or matched pair to view live order books with YES/NO toggle, flash animations on updates, and inline arb analysis
-- **Persistent SQLite database** — all opportunities and trades recorded for post-analysis
-- **Typed event bus** — fully typed internal pub/sub for clean component communication
-- **Graceful shutdown** — handles `SIGINT`/`SIGTERM`, cleans up connectors and open orders
+### Install
 
----
+```bash
+git clone https://github.com/cjinghong/pred-arb.git
+cd pred-arb
+npm run setup        # installs backend + dashboard dependencies
+cp .env.example .env
+```
+
+### Configure
+
+Edit `.env` with your platform credentials. See `.env.example` for all options with descriptions.
+
+The minimum you need to get started in dry-run mode (no real trades):
+
+```env
+# Pick your platforms (need at least 2)
+ENABLED_PLATFORMS=polymarket,kalshi
+
+# Polymarket — public key + private key for reading markets
+POLYMARKET_PRIVATE_KEY=your_hex_private_key
+POLYMARKET_PROXY_ADDRESS=0xYourProxyAddress
+
+# Kalshi — API key + RSA private key for reading markets
+KALSHI_API_KEY_ID=your_key_id
+KALSHI_PRIVATE_KEY_PATH=./kalshi-key.pem
+
+# Categories to scan
+MARKET_CATEGORIES=sports,politics
+
+# LLM for matching non-sports markets (optional)
+LLM_PROVIDER=ollama
+LLM_MODEL=llama3.1
+```
+
+> **No credentials?** The bot will still start and show the dashboard — connectors that fail to authenticate are skipped gracefully. You need at least 2 connected platforms for arbitrage detection.
+
+### Run
+
+```bash
+# Development (hot-reload)
+npm run dev                # bot + API on :3848
+npm run dashboard:dev      # dashboard on :3847 (separate terminal)
+
+# Production
+npm run build:all          # compile everything
+npm start                  # bot + API + dashboard on :3848
+```
+
+Open the dashboard at `http://localhost:3847` (dev) or `http://localhost:3848` (production).
 
 ## Architecture
 
 ```
-┌─────────────────────────┐        ┌──────────────────────────┐
-│  PolymarketConnector     │        │  PredictFunConnector      │
-│  (Gamma + CLOB APIs)     │        │  (REST + WS via          │
-│  WS: wss://ws.polymarket │        │   wss://ws.predict.fun)   │
-└──────────┬──────────────┘        └──────────┬───────────────┘
-           │         implements               │
-           │       MarketConnector            │
-           └──────────────┬──────────────────┘
-                          │
-                 ┌────────▼─────────┐
-                 │   MarketMatcher   │
-                 │                   │
-                 │  Pass 1: slug     │  exact slug → 0.95 confidence
-                 │  Pass 2: Fuse.js  │  fuzzy text + date/category boost
-                 │  Pass 3: LLM      │  optional verification via Anthropic
-                 └────────┬──────────┘
-                          │  MarketPair[]
-                 ┌────────▼──────────────────────┐
-                 │  WS OrderBook Manager          │
-                 │  ┌──────────────────────────┐  │
-                 │  │ book:update events ──────────┼──→ Event Bus
-                 │  └──────────────────────────┘  │
-                 └────────┬───────────────────────┘
-                          │  triggers
-                 ┌────────▼──────────────────────┐
-                 │      Strategy Engine           │
-                 │  ┌────────────────────────────┐│
-                 │  │ CrossPlatformArbStrategy    ││
-                 │  │                             ││
-                 │  │ marketToPairs index (O(1))  ││  ← reverse lookup
-                 │  │ for each update:            ││
-                 │  │   find pair → fetch books   ││
-                 │  │   check YES+NO cost < $1    ││
-                 │  │   emit ArbitrageOpportunity ││
-                 │  └────────────────────────────┘│
-                 └────────┬───────────────────────┘
-                          │  ArbitrageOpportunity[]
-                 ┌────────▼──────────────────┐
-                 │    ExecutionEngine          │
-                 │  ┌─────────────────────┐   │
-                 │  │    Risk Manager      │   │  position limits
-                 │  │  - max positions     │   │  exposure cap
-                 │  │  - exposure cap      │   │  balance checks
-                 │  │  - balance check     │   │  confidence floor
-                 │  │  - confidence floor  │   │
-                 │  └─────────────────────┘   │
-                 │  → place both legs          │
-                 └────────┬──────────────────────┘
-                          │
-                 ┌────────▼──────────────────┐
-                 │     Bot Orchestrator        │
-                 │  ┌───────────────────────┐ │
-                 │  │   Event Bus (typed)    │ │
-                 │  └───────────────────────┘ │
-                 │  ┌───────────────────────┐ │
-                 │  │  SQLite Database       │ │  opportunities
-                 │  └───────────────────────┘ │  trades, metrics
-                 │  ┌───────────────────────┐ │
-                 │  │  API Server            │ │  REST + WebSocket
-                 │  │  (Express + ws)        │ │  → dashboard
-                 │  └───────────────────────┘ │
-                 └───────────────────────────────┘
+Bot Orchestrator (bot.ts)
+  ├── Connectors (3 platforms)
+  │     ├── PolymarketConnector   ← CLOB SDK, EIP-712, USDC/Polygon
+  │     ├── KalshiConnector       ← RSA-PSS auth, USD/cents
+  │     └── PredictFunConnector   ← SDK + JWT, USDT/BNB
+  │
+  ├── Market Discovery (category-aware)
+  │     ├── SportsDiscovery       ← platform-specific sports APIs
+  │     └── Generic Discovery     ← paginated category fetching
+  │
+  ├── Market Matching
+  │     ├── SportsMatcher         ← deterministic team+date matching (no LLM)
+  │     ├── MarketMatcher         ← 5-pass pipeline: cross-ref → slug → fuzzy → LLM
+  │     └── LLMVerifier           ← Anthropic / Ollama / OpenAI-compatible
+  │
+  ├── Strategy: CrossPlatformArb
+  │     ├── Book walking          ← walks multiple price levels for optimal sizing
+  │     ├── Fee-aware analysis    ← platform-specific fee deduction
+  │     └── Dynamic thresholds    ← adjusts min profit by confidence/spread/depth
+  │
+  ├── ExecutionEngine             ← 2-legged simultaneous trades
+  ├── RiskManager                 ← position limits, exposure caps, balance checks
+  │
+  └── API Server (Express + WebSocket)
+        └── Dashboard (Next.js)   ← Bloomberg terminal-style UI
 ```
 
----
+### N-platform pairwise design
+
+With 3 platforms, the bot generates all unique pairs and runs matching independently on each:
+
+- Polymarket ↔ Kalshi
+- Polymarket ↔ predict.fun
+- predict.fun ↔ Kalshi
+
+Connector failures are non-fatal — the bot continues with whichever platforms connect (minimum 2 required).
+
+### Category-aware discovery
+
+Market discovery and matching are category-aware. Set `MARKET_CATEGORIES=sports,politics,crypto` to process each category sequentially — fetch from all platforms, match within the category, then move to the next. This avoids cross-category noise and wasted LLM calls.
+
+**Sports** use a deterministic pipeline: platform-specific sports APIs → team name normalization (100+ alias entries) → match by `team1|team2::date::league` key. No LLM needed.
+
+**Non-sports** (politics, crypto) use the generic 5-pass pipeline: cross-reference IDs → slug matching → fuzzy text → LLM batch-match. LLM matches require manual approval on the dashboard.
+
+## Dashboard
+
+The dashboard uses a retro Bloomberg terminal aesthetic — amber/green on black, monospace font, scanline overlay.
+
+**Tabs:**
+
+- **Opportunities** — live arb opportunities with profit, prices, status, and match confidence
+- **Markets** — all fetched markets, matched pairs grouped by status, manual match UI
+- **Trades** — execution history with leg details and P&L
+- **Positions** — live positions from the risk manager
+
+**Header controls:** PAUSE / RESUME / STOP / RESET
+
+**Category chips:** toggle which categories to scan (sports, politics, crypto, etc.) with auto-refresh on change.
+
+**Pair detail page:** click any matched pair to see side-by-side live order books with YES/NO toggle and inline arb analysis.
 
 ## Project structure
 
 ```
 pred-arb/
 ├── src/
-│   ├── types/
-│   │   ├── market.ts              # NormalizedMarket, OrderBook, ArbitrageOpportunity, TradeRecord, …
-│   │   ├── connector.ts           # MarketConnector interface
-│   │   └── strategy.ts            # Strategy interface
-│   │
-│   ├── connectors/
-│   │   ├── base-connector.ts      # Abstract base with HTTP helpers and retry logic
-│   │   ├── polymarket.ts          # Polymarket Gamma + CLOB connector
-│   │   ├── predictfun.ts          # predict.fun REST + WS connector (x-api-key auth)
-│   │   └── ws-orderbook-manager.ts # WebSocket order book manager — emits book:update events
-│   │
-│   ├── matcher/
-│   │   ├── market-matcher.ts      # Fuse.js fuzzy matching + slug/date/category heuristics
-│   │   └── llm-verifier.ts        # Optional LLM-based pair verification (Anthropic)
-│   │
-│   ├── strategies/
-│   │   └── cross-platform-arb.ts  # YES+NO complement arbitrage (event-driven via WS)
-│   │
-│   ├── engine/
-│   │   ├── bot.ts                 # Main orchestrator — event-driven scanning, startup, shutdown
-│   │   ├── execution-engine.ts    # Validate → risk check → place orders
-│   │   ├── risk-manager.ts        # Pre-trade risk checks and position tracking
-│   │   └── api-server.ts          # Express REST + WebSocket server + orderbook endpoint
-│   │
-│   ├── db/
-│   │   └── database.ts            # SQLite schema, CRUD helpers, dashboard metrics query
-│   │
-│   ├── utils/
-│   │   ├── config.ts              # Centralized env-var config
-│   │   ├── logger.ts              # Winston structured logger
-│   │   └── event-bus.ts           # Typed pub/sub event bus
-│   │
-│   └── index.ts                   # Entry point + graceful shutdown
-│
-├── dashboard/
-│   ├── app/
-│   │   ├── layout.tsx             # Root layout + fonts
-│   │   ├── page.tsx               # Terminal dashboard (React)
-│   │   ├── pair/page.tsx          # Matched pair detail page with live orderbooks
-│   │   ├── orderbook-viewer.tsx   # Orderbook component (YES/NO toggle, flash, arb summary)
-│   │   └── globals.css            # Bloomberg terminal styles
-│   ├── next.config.ts             # Next.js (static export)
-│   └── package.json
-│
-├── docs/
-│   └── cross-platform-arb.md     # Detailed strategy documentation
-│
-├── data/                          # SQLite DB created here at runtime
-├── .env.example
+│   ├── connectors/           # Platform connectors (Polymarket, Kalshi, predict.fun)
+│   ├── discovery/            # Category-aware market discovery
+│   ├── matcher/              # Market matching (sports, generic, LLM)
+│   ├── strategies/           # Arbitrage strategy
+│   ├── engine/               # Bot orchestrator, execution, risk, API server
+│   ├── db/                   # SQLite database
+│   ├── utils/                # Config, logging, event bus, rate limiter
+│   ├── scripts/              # Standalone test scripts per platform
+│   └── index.ts              # Entry point
+├── dashboard/                # Next.js frontend (static export)
+├── docs/                     # Strategy documentation
+├── .env.example              # Environment template
 ├── package.json
 └── tsconfig.json
 ```
 
----
+## Configuration reference
 
-## Setup
+All configuration is via environment variables. See `.env.example` for the complete list.
 
-### Prerequisites
+**Key settings:**
 
-- Node.js 18+
-- A funded USDC wallet on Polygon (for Polymarket live mode)
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLED_PLATFORMS` | `polymarket,kalshi` | Comma-separated platforms to connect |
+| `DRY_RUN` | `true` | Set to `false` for live trading |
+| `MIN_PROFIT_BPS` | `150` | Minimum profit threshold (basis points) |
+| `MAX_POSITION_USD` | `500` | Max USD per trade leg |
+| `MAX_TOTAL_EXPOSURE_USD` | `5000` | Total exposure cap |
+| `MARKET_CATEGORIES` | — | Categories to scan (e.g., `sports,politics`) |
+| `LLM_PROVIDER` | `anthropic` | LLM for matching: `ollama`, `anthropic`, `openai` |
 
-### Install
+## Live trading
 
-```bash
-git clone <repo>
-cd pred-arb
-npm run setup          # installs backend + dashboard deps
-cp .env.example .env
-```
+> **The bot starts in dry-run mode by default.** Set `DRY_RUN=false` only after reviewing simulated results.
 
-### Configure
+**Recommended go-live sequence:**
 
-Edit `.env`:
+1. Run in dry-run mode, review matched pairs and simulated opportunities
+2. Set conservative limits: `MAX_POSITION_USD=10`, `MIN_PROFIT_BPS=200`
+3. Set `DRY_RUN=false`, monitor for 24h
+4. Gradually increase position sizes as confidence grows
 
-```env
-# Polymarket — needed only for live order placement
-POLYMARKET_API_KEY=
-POLYMARKET_API_SECRET=
-POLYMARKET_API_PASSPHRASE=
-POLYMARKET_PRIVATE_KEY=       # EOA private key for EIP-712 order signing
-POLYMARKET_CHAIN_ID=137
+**Platform requirements for live trading:**
 
-# predict.fun — needed only for live order placement
-PREDICTFUN_API_KEY=           # required for mainnet; testnet is open
-PREDICTFUN_PRIVATE_KEY=
-PREDICTFUN_USE_TESTNET=false
+- **Polymarket** — funded USDC wallet on Polygon, L2 API credentials (key/secret/passphrase), private key for EIP-712 signing
+- **Kalshi** — API key ID + RSA-4096 private key uploaded to Kalshi settings
+- **predict.fun** — API key (from Discord), Privy wallet private key, Smart Wallet address
 
-# Bot parameters
-MIN_PROFIT_BPS=150            # 1.5% minimum profit after fees
-MAX_POSITION_USD=500          # max spend per trade leg
-MAX_TOTAL_EXPOSURE_USD=5000   # total outstanding exposure cap
-SCAN_INTERVAL_MS=10000        # fallback scan interval (primary is WS-driven)
-MIN_DEPTH_USD=50              # min orderbook depth; set to 0 for testing
-PAIR_REFRESH_INTERVAL_MS=300000 # how often to re-fetch and match markets (5 min)
+**Fee schedule:**
 
-# Optional: LLM pair verification (auto-approves pairs when set)
-ANTHROPIC_API_KEY=
-
-# Ports
-API_PORT=3848
-DASHBOARD_PORT=3847
-```
-
-> **Credentials are only required for live trading.** The bot reads public market data and runs in dry-run mode without any keys configured.
-
----
-
-## Running
-
-```bash
-# Development (hot-reload bot + separate dashboard dev server)
-npm run start:dev          # terminal 1 — bot on :3848
-npm run dashboard:dev      # terminal 2 — Next.js dashboard on :3847
-
-# Production
-npm run build:all          # compile backend + build dashboard
-npm start                  # serves bot + dashboard together on :3848
-```
-
-Open `http://localhost:3847` (dev) or `http://localhost:3848` (production) for the dashboard.
-
----
-
-## Dashboard
-
-The admin dashboard uses a retro-futuristic Bloomberg terminal aesthetic — amber/green on black, JetBrains Mono, ASCII sparklines, scanline overlay.
-
-**Panels:**
-
-| Panel | Description |
-|---|---|
-| Metrics strip | Rolling 24h / 7d / all-time P&L, win rate, trade count, exposure, equity sparkline |
-| Opportunities | Live feed with market questions, platforms, outcomes, prices, expected profit, bps, size, and match confidence. Click to navigate to the pair detail page. |
-| Markets | All markets across platforms with match status. Filter by platform, match status, pair approval state. Click matched pairs to view their dedicated pair page. |
-| Trades | Executed trades with leg details, realized P&L, fees, and status |
-| Activity Feed | Real-time event stream (scan completions, trade executions, risk alerts) |
-
-**Pair detail page:**
-
-Click any matched pair from the dashboard to open a full-page view with side-by-side live orderbooks, YES/NO toggle per book, flash-on-update animations, and inline arb analysis showing both directions with cost, size, and profit in basis points.
-
-**Bot controls:**
-
-- **PAUSE** — suspends scanning, leaves open orders as-is
-- **RESUME** — resumes scanning
-- **STOP** — graceful shutdown of all connectors and strategies
-
-The dashboard connects over WebSocket for push updates and falls back to REST polling every 5 seconds.
-
----
+| Platform | Maker | Taker |
+|---|---|---|
+| Polymarket | 0% | 0% |
+| Kalshi | 0% | $0.07 × P × (1−P) per contract (min $0.02) |
+| predict.fun | 0% | 2% × min(price, 1−price) × shares |
 
 ## Adding a new platform
 
-Implement the `MarketConnector` interface:
+Implement the `MarketConnector` interface in `src/connectors/`:
 
 ```typescript
-// src/connectors/my-platform.ts
-import { BaseConnector } from './base-connector';
-
 export class MyPlatformConnector extends BaseConnector {
   readonly platform: Platform = 'myplatform';
   readonly name = 'My Platform';
 
-  async connect(): Promise<void> { /* test connectivity */ }
-  async disconnect(): Promise<void> { /* cleanup */ }
+  async connect(): Promise<void> { /* ... */ }
   async fetchMarkets(opts?: FetchMarketsOptions): Promise<NormalizedMarket[]> { /* ... */ }
-  async fetchMarket(id: string): Promise<NormalizedMarket | null> { /* ... */ }
   async fetchOrderBook(marketId: string, outcomeIndex: number): Promise<OrderBook> { /* ... */ }
   async placeOrder(order: OrderRequest): Promise<OrderResult> { /* ... */ }
   async cancelOrder(orderId: string): Promise<boolean> { /* ... */ }
   async getOpenOrders(): Promise<OrderResult[]> { /* ... */ }
-  async getPositions(): Promise<Position[]> { /* ... */ }
   async getBalance(): Promise<number> { /* ... */ }
 }
 ```
 
-Then register it in `src/engine/bot.ts` and add `'myplatform'` to the `Platform` union type in `src/types/market.ts`.
+Then add `'myplatform'` to the `Platform` type in `src/types/market.ts` and register the connector in `src/engine/bot.ts`.
 
----
+## Development
 
-## Adding a new strategy
-
-Implement the `Strategy` interface:
-
-```typescript
-export class MyStrategy implements Strategy {
-  readonly id = 'my-strategy';
-  async scan(): Promise<ArbitrageOpportunity[]> { /* your logic */ }
-  async validate(opportunity: ArbitrageOpportunity): Promise<boolean> { /* re-check */ }
-  // ...
-}
+```bash
+npm run dev              # hot-reload backend
+npm run dashboard:dev    # hot-reload frontend
+npm run typecheck        # TypeScript check (no emit)
+npm test                 # run tests
+npm run build:all        # compile everything
 ```
-
-Register it in `bot.ts`. Strategies never execute trades directly — they emit opportunities that flow through the execution engine and risk manager.
-
----
-
-## Risk management
-
-All trades pass through the `RiskManager` before execution. Checks in order:
-
-1. **Max open positions** — hard cap of 20 concurrent positions
-2. **Total exposure cap** — sum of all outstanding position costs cannot exceed `MAX_TOTAL_EXPOSURE_USD`; oversized trades are scaled down rather than rejected
-3. **Per-trade size limit** — enforces `MAX_POSITION_USD` per leg
-4. **Balance check** — verifies sufficient balance on both platforms with a 10% reserve held back
-5. **Match confidence floor** — rejects opportunities where the market match confidence is below 0.6
-
----
-
-## Live trading notes
-
-> The bot starts in **dry-run mode** (`dryRun = true` in `bot.ts`). All opportunities are logged and simulated, but no real orders are placed. Review simulated P&L before going live.
-
-**Polymarket** requires a funded USDC wallet on Polygon (chain ID 137), API credentials generated via the CLOB API, and EIP-712 order signing with your private key.
-
-**predict.fun** requires an API key (`x-api-key` header) for mainnet. Testnet is open and requires no key. Set `PREDICTFUN_USE_TESTNET=true` in `.env` for testnet.
-
----
 
 ## Tech stack
 
 | Layer | Technology |
 |---|---|
-| Language | TypeScript 5, Node.js 18+ |
-| HTTP | Native `fetch` (Node 18+) with exponential backoff |
-| WebSocket | `ws` library (order book streaming + dashboard push) |
-| Market matching | Fuse.js (fuzzy search) + optional LLM verification |
-| Database | SQLite via `better-sqlite3` |
-| API server | Express |
-| Logging | Winston (structured JSON) |
-| Dashboard | React 18, Next.js 15 (static export) |
-| Wallet / signing | ethers.js v6 |
-| Configuration | dotenv |
+| Runtime | TypeScript, Node.js 18+ |
+| Platforms | Polymarket (CLOB SDK), Kalshi (REST + RSA-PSS), predict.fun (SDK + JWT) |
+| Matching | Deterministic (sports) + Fuse.js + LLM (Anthropic / Ollama) |
+| Database | SQLite (better-sqlite3) |
+| API | Express + WebSocket |
+| Dashboard | Next.js 15 (React, static export) |
+| Signing | ethers.js v6 (EIP-712, typed data) |
 
----
+## License
 
-## Development
-
-```bash
-npm run typecheck        # TypeScript type check (no emit)
-npm run build            # Compile to build/
-npm run build:dashboard  # Build dashboard to dashboard/out/
-npm run build:all        # Both
-```
-
-Logs are written to stdout in JSON format (Winston). Set `LOG_LEVEL=debug` for verbose connector and order book output.
+MIT

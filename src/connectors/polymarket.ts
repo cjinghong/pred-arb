@@ -423,7 +423,8 @@ export class PolymarketConnector extends BaseConnector {
     const allMarkets: NormalizedMarket[] = [];
     const pageSize = 100;
     let offset = 0;
-    const maxPages = 20; // Safety limit: 2000 markets max
+    const maxMarkets = options?.limit || 2000; // Respect caller's limit
+    const maxPages = Math.ceil(maxMarkets / pageSize); // Safety limit
 
     this.log.info('Fetching Polymarket markets by category', { category, tag });
 
@@ -463,6 +464,8 @@ export class PolymarketConnector extends BaseConnector {
 
       // If we got fewer than pageSize, we've reached the end
       if (raw.length < pageSize) break;
+      // Respect max markets limit
+      if (allMarkets.length >= maxMarkets) break;
     }
 
     this.log.info('Polymarket category fetch complete', {

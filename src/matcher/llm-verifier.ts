@@ -324,25 +324,24 @@ export class LLMVerifier {
   Fuzzy score: ${c.fuzzyScore.toFixed(3)}`;
     }).join('\n\n');
 
-    const prompt = `You are a prediction market analyst verifying whether market pairs across different platforms are EXACTLY the same market (will resolve identically).
+    const prompt = `You are verifying whether prediction market pairs are EXACTLY the same market for cross-platform arbitrage.
 
-CRITICAL: For cross-platform arbitrage to work, both markets MUST resolve to the SAME outcome at the SAME time. A "YES" on Platform A and a "NO" on Platform B must be perfectly complementary.
+STRICT MATCHING RULES — ALL must be true for isSameMarket=true:
+1. SAME ASSET/ENTITY: "Bitcoin" ≠ "Ethereum". "Trump" ≠ "Biden". "Morgan Wallen" ≠ "Ethereum".
+2. SAME TARGET/THRESHOLD: "$100,000" ≠ "$60,000". "above 4000" ≠ "above 1600".
+3. SAME DATE/TIMEFRAME: "by December 31, 2026" ≠ "on March 17". "end of year" ≠ "end of month".
+4. SAME DIRECTION: "Will X happen?" and "Will X happen?" = same. "reach" vs "stay below" = different.
 
-Consider these factors:
-- Are they asking about the EXACT same event/question?
-- Do they have the same resolution criteria and timeframe?
-- Could one resolve differently than the other due to different wording?
-- Watch out for similar but NOT identical questions (e.g., "by end of 2026" vs "by March 2026")
+If ANY of these differ, isSameMarket MUST be false. When in doubt, say false.
 
-For each pair, respond with a JSON object. Return ONLY a JSON array, no other text:
+WRONG (isSameMarket must be false):
+- "Will Morgan Wallen be top Spotify artist 2026?" vs "Will Ethereum be above $1600 on March 17?" → COMPLETELY DIFFERENT topics
+- "Will Ethereum reach $4,000 by Dec 2026?" vs "Will Bitcoin be above $60,000 on March 19?" → DIFFERENT asset + price + date
+- "Will Bitcoin reach $100k by Dec 2026?" vs "Will Bitcoin be above $60k on March 19?" → DIFFERENT price + date
+
+For each pair, return ONLY a JSON array:
 [
-  {
-    "pair": 1,
-    "isSameMarket": true/false,
-    "confidence": 0.0-1.0,
-    "reasoning": "brief explanation"
-  },
-  ...
+  { "pair": 1, "isSameMarket": false, "confidence": 0.0, "reasoning": "Different topics entirely" }
 ]
 
 Here are the pairs to verify:

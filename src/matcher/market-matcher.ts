@@ -13,6 +13,7 @@ import Fuse, { IFuseOptions } from 'fuse.js';
 import { NormalizedMarket, Platform } from '../types';
 import { createChildLogger } from '../utils/logger';
 import { LLMVerifier, LLMVerificationResult } from './llm-verifier';
+import { eventBus } from '../utils/event-bus';
 
 const log = createChildLogger('matcher');
 
@@ -212,6 +213,96 @@ export class MarketMatcher {
     return `${sorted[0]}::${sorted[1]}`;
   }
 
+  /**
+   * Post-LLM sanity check: verify that two questions share enough content
+   * to plausibly be the same market. Catches hallucinated LLM matches like
+   * "Morgan Wallen Spotify" ↔ "Ethereum price" that share zero entities.
+   *
+   * Uses token overlap: extracts meaningful words (3+ chars, not stop words),
+   * requires at least 1 shared significant token between the two questions.
+   */
+  static passesBasicSanityCheck(questionA: string, questionB: string): boolean {
+    const stopWords = new Set([
+      'will', 'the', 'be', 'of', 'on', 'by', 'in', 'at', 'to', 'for', 'a', 'an',
+      'is', 'are', 'was', 'were', 'has', 'have', 'had', 'do', 'does', 'did',
+      'and', 'or', 'but', 'not', 'yes', 'no', 'this', 'that', 'with', 'from',
+      'above', 'below', 'over', 'under', 'before', 'after', 'reach', 'hit',
+      'price', 'market', 'what', 'who', 'when', 'where', 'how', 'which',
+      'than', 'more', 'less', 'most', 'least', 'any', 'all', 'each', 'every',
+    ]);
+
+    const extractTokens = (q: string): Set<string> => {
+      const tokens = q.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
+      const meaningful = tokens.filter(t => t.length >= 3 && !stopWords.has(t));
+      return new Set(meaningful);
+    };
+
+    const tokensA = extractTokens(questionA);
+    const tokensB = extractTokens(questionB);
+
+    // Count shared tokens
+    let shared = 0;
+    for (const t of tokensA) {
+      if (tokensB.has(t)) shared++;
+    }
+
+    // Require at least 2 shared meaningful tokens, or 1 if questions are very short
+    const minTokens = Math.min(tokensA.size, tokensB.size);
+    const requiredShared = minTokens <= 3 ? 1 : 2;
+
+    if (shared < requiredShared) {
+      return false;
+    }
+
+    // Additional check: if one question mentions a specific entity/asset
+    // that the other doesn't mention at all, reject.
+    // Extract proper nouns / capitalized words and numbers from originals.
+    const extractEntities = (q: string): Set<string> => {
+      const entities = new Set<string>();
+      // Cryptocurrency/asset names
+      const assets = q.match(/\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|dogecoin|doge|cardano|ada)\b/gi);
+      if (assets) assets.forEach(a => entities.add(a.toLowerCase()));
+      // Dollar amounts
+      const amounts = q.match(/\$[\d,]+(?:\.\d+)?/g);
+      if (amounts) amounts.forEach(a => entities.add(a.replace(/,/g, '')));
+      // Percentages
+      const pcts = q.match(/\d+(?:\.\d+)?%/g);
+      if (pcts) pcts.forEach(p => entities.add(p));
+      // Named entities: capitalized multi-word sequences
+      const names = q.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g);
+      if (names) names.forEach(n => entities.add(n.toLowerCase()));
+      return entities;
+    };
+
+    const entitiesA = extractEntities(questionA);
+    const entitiesB = extractEntities(questionB);
+
+    // If both have crypto asset mentions, they must share at least one
+    const cryptoA = [...entitiesA].filter(e => ['bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol', 'xrp', 'dogecoin', 'doge', 'cardano', 'ada'].includes(e));
+    const cryptoB = [...entitiesB].filter(e => ['bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol', 'xrp', 'dogecoin', 'doge', 'cardano', 'ada'].includes(e));
+    if (cryptoA.length > 0 && cryptoB.length > 0) {
+      // Normalize BTC→bitcoin, ETH→ethereum for comparison
+      const normCrypto = (c: string) => {
+        const map: Record<string, string> = { btc: 'bitcoin', eth: 'ethereum', sol: 'solana', ada: 'cardano', doge: 'dogecoin' };
+        return map[c] || c;
+      };
+      const normA = new Set(cryptoA.map(normCrypto));
+      const normB = new Set(cryptoB.map(normCrypto));
+      const hasSharedCrypto = [...normA].some(a => normB.has(a));
+      if (!hasSharedCrypto) return false; // Different crypto assets
+    }
+
+    // If both have dollar amounts, at least one must match
+    const dollarsA = [...entitiesA].filter(e => e.startsWith('$'));
+    const dollarsB = [...entitiesB].filter(e => e.startsWith('$'));
+    if (dollarsA.length > 0 && dollarsB.length > 0) {
+      const hasSharedDollar = dollarsA.some(a => dollarsB.includes(a));
+      if (!hasSharedDollar) return false; // Different price targets
+    }
+
+    return true;
+  }
+
   /** Set pair status (from dashboard or API) */
   setPairStatus(pairId: string, status: PairStatus): void {
     this.pairStatuses.set(pairId, status);
@@ -382,6 +473,7 @@ export class MarketMatcher {
 
     const crossRefCount = pairs.length;
     log.info(`Pass 0+1: ${crossRefCount} pairs from cross-reference + manual`);
+    eventBus.emit('discovery:match_pass', { pass: 'cross-ref', pairs: crossRefCount, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
 
     // ─── Pass 2: Exact slug matching (Map-based O(n+m)) ────────────────
     const slugBIndex = new Map<string, NormalizedMarket>();
@@ -413,6 +505,7 @@ export class MarketMatcher {
     }
 
     log.info(`Pass 2: ${pairs.length - crossRefCount} pairs from slug match`);
+    eventBus.emit('discovery:match_pass', { pass: 'slug', pairs: pairs.length - crossRefCount, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
 
     // ─── Pass 3: Sports-specific normalization ──────────────────────────
     const unmatchedA3 = marketsA.filter(a => !usedA.has(a.id));
@@ -452,6 +545,7 @@ export class MarketMatcher {
     }
 
     log.info(`Pass 3: ${sportsMatches} pairs from sports normalization`);
+    eventBus.emit('discovery:match_pass', { pass: 'sports', pairs: sportsMatches, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
 
     // ─── Pass 4: Fuzzy question matching ────────────────────────────────
     const unmatchedA4 = marketsA.filter(a => !usedA.has(a.id));
@@ -492,12 +586,29 @@ export class MarketMatcher {
       }
     }
 
+    eventBus.emit('discovery:match_pass', { pass: 'fuzzy', pairs: fuzzyCandidates.length, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
+
     // ─── Pass 5: LLM batch-match for remaining unmatched ────────────────
     const remainingA = marketsA.filter(a => !usedA.has(a.id));
     const remainingB = marketsB.filter(b => !usedB.has(b.id));
 
     if (this.llmVerifier.isEnabled && remainingA.length > 0 && remainingB.length > 0) {
-      const llmPairs = await this.llmBatchMatch(remainingA, remainingB);
+      // Cap each side to top 50 by volume to prevent LLM timeout on huge market sets
+      const MAX_LLM_MARKETS = 50;
+      const capA = remainingA.length > MAX_LLM_MARKETS
+        ? remainingA.sort((a, b) => (b.volume || 0) - (a.volume || 0)).slice(0, MAX_LLM_MARKETS)
+        : remainingA;
+      const capB = remainingB.length > MAX_LLM_MARKETS
+        ? remainingB.sort((a, b) => (b.volume || 0) - (a.volume || 0)).slice(0, MAX_LLM_MARKETS)
+        : remainingB;
+
+      if (remainingA.length > MAX_LLM_MARKETS || remainingB.length > MAX_LLM_MARKETS) {
+        log.info(`LLM batch-match capped: ${remainingA.length}→${capA.length} A, ${remainingB.length}→${capB.length} B`);
+      }
+
+      eventBus.emit('discovery:match_pass', { pass: 'llm-start', pairs: 0, remaining: capA.length + capB.length });
+
+      const llmPairs = await this.llmBatchMatch(capA, capB);
       for (const lp of llmPairs) {
         const pairId = MarketMatcher.pairId(lp.marketA.id, lp.marketB.id);
         const savedStatus = this.pairStatuses.get(pairId);
@@ -507,13 +618,18 @@ export class MarketMatcher {
           marketB: lp.marketB,
           confidence: lp.confidence,
           matchMethod: 'llm_matched',
-          status: savedStatus || (lp.confidence >= 0.95 ? 'approved' : 'pending'),
+          // LLM matches always start as 'pending' — require manual approval.
+          // Local LLMs can hallucinate high confidence on wrong matches.
+          status: savedStatus || 'pending',
           llmVerification: lp.llmResult,
         });
         usedA.add(lp.marketA.id);
         usedB.add(lp.marketB.id);
       }
       log.info(`Pass 5: ${llmPairs.length} pairs from LLM batch-match`);
+      eventBus.emit('discovery:match_pass', { pass: 'llm-done', pairs: llmPairs.length, remaining: marketsA.length + marketsB.length - usedA.size - usedB.size });
+    } else if (!this.llmVerifier.isEnabled) {
+      eventBus.emit('discovery:match_pass', { pass: 'llm-skip', pairs: 0, remaining: remainingA.length + remainingB.length });
     }
 
     // ─── Apply LLM verification to fuzzy candidates ─────────────────────
@@ -560,9 +676,8 @@ export class MarketMatcher {
           if (llmResult.isSameMarket && llmResult.confidence >= 0.85) {
             confidence = Math.max(confidence, llmResult.confidence);
             matchMethod = 'llm_verified';
-            if (!savedStatus) {
-              status = llmResult.confidence >= 0.95 ? 'approved' : 'pending';
-            }
+            // LLM-verified matches always stay pending — require manual approval.
+            // Local LLMs can hallucinate high confidence on wrong matches.
           } else if (!llmResult.isSameMarket) {
             if (!savedStatus) {
               status = 'rejected';
@@ -648,9 +763,24 @@ export class MarketMatcher {
       return `  B${i + 1}. "${m.question}"${cat}${end} (id: ${m.id})`;
     }).join('\n');
 
-    const prompt = `You are a prediction market analyst. Below are two lists of prediction markets from different platforms. Your job is to identify which markets from LIST A are THE SAME MARKET as a market in LIST B.
+    const prompt = `You are a prediction market matching engine. You must identify EXACT market matches between two platforms for cross-platform arbitrage.
 
-Two markets are "the same" if they would resolve identically — same event, same resolution criteria, same timeframe. Be careful with similar-but-different questions (e.g., "by end of 2026" vs "by March 2026" are NOT the same).
+CRITICAL RULES — read carefully before matching:
+1. SAME ASSET/ENTITY: Both markets must reference the EXACT SAME asset, person, entity, or event. "Bitcoin" ≠ "Ethereum". "Trump" ≠ "Biden". "Lakers" ≠ "Celtics".
+2. SAME THRESHOLD/TARGET: Both must use the same price target, percentage, or metric. "$100,000" ≠ "$60,000". "above 4000" ≠ "above 60000".
+3. SAME DATE/TIMEFRAME: Both must resolve on the same date or timeframe. "by December 31, 2026" ≠ "on March 19". "end of Q1" ≠ "end of year".
+4. SAME DIRECTION: "Will X happen?" ≠ "Will X NOT happen?" unless outcomes are explicitly complementary.
+5. SAME RESOLUTION CRITERIA: Both must resolve under the same conditions. "reach" vs "close above" may differ.
+
+WRONG MATCHES (examples of what NOT to match):
+- "Will Ethereum reach $4,000 by Dec 2026?" ↔ "Will Bitcoin be above $60,000 on March 19?" → DIFFERENT ASSET + DIFFERENT PRICE + DIFFERENT DATE
+- "Will Bitcoin reach $100,000 by Dec 2026?" ↔ "Will Bitcoin be above $60,000 on March 19?" → DIFFERENT PRICE + DIFFERENT DATE
+- "Will Trump win 2028?" ↔ "Will a Republican win 2028?" → DIFFERENT ENTITY (Trump ≠ any Republican)
+- "Fed rate cut in June?" ↔ "Fed rate cut in September?" → DIFFERENT DATE
+
+CORRECT MATCHES (examples):
+- "Will Bitcoin reach $100k by end of 2026?" ↔ "Bitcoin to hit $100,000 by December 31, 2026?" → SAME asset, target, date
+- "Will Trump win the 2028 election?" ↔ "Donald Trump to win 2028 presidential election?" → SAME person, event, date
 
 LIST A:
 ${listA}
@@ -658,13 +788,12 @@ ${listA}
 LIST B:
 ${listB}
 
-Return ONLY a JSON array of matched pairs. If a market has no match, omit it. For each match include your confidence (0.0-1.0) and brief reasoning:
+Return ONLY a JSON array. Include ONLY matches where ALL criteria (asset, target, date, direction) are identical. If unsure, do NOT include the pair. Return [] if no exact matches found.
 [
-  { "a": "A1", "b": "B3", "confidence": 0.98, "reasoning": "Both ask if BTC hits $100k by end of 2026" },
-  ...
+  { "a": "A1", "b": "B3", "confidence": 0.95, "reasoning": "Both: Bitcoin, $100k target, by end of 2026" }
 ]
 
-Only include matches you're confident about (>= 0.85). Return [] if no matches found.`;
+Confidence guide: 0.99 = identical wording, 0.95 = same meaning different wording, <0.90 = do NOT include.`;
 
     try {
       // Use the LLM verifier's callLLM() to support both Anthropic and Ollama/OpenAI providers
@@ -682,10 +811,21 @@ Only include matches you're confident about (>= 0.85). Return [] if no matches f
         const bIdx = parseInt(match.b.replace(/^B/i, '')) - 1;
 
         if (aIdx < 0 || aIdx >= subsetA.length || bIdx < 0 || bIdx >= subsetB.length) continue;
-        if (match.confidence < 0.85) continue;
+        if (match.confidence < 0.90) continue; // Raised from 0.85 → 0.90
 
         const mA = subsetA[aIdx];
         const mB = subsetB[bIdx];
+
+        // ── Post-LLM sanity check: catch hallucinated matches ──────────
+        if (!MarketMatcher.passesBasicSanityCheck(mA.question, mB.question)) {
+          log.warn('LLM match REJECTED by sanity check', {
+            a: mA.question.slice(0, 80),
+            b: mB.question.slice(0, 80),
+            llmConfidence: match.confidence,
+            llmReasoning: match.reasoning,
+          });
+          continue;
+        }
 
         const llmResult: LLMVerificationResult = {
           marketA: { id: mA.id, platform: mA.platform, question: mA.question },

@@ -62,6 +62,18 @@ export const config = {
      */
     marketCategory: (process.env.MARKET_CATEGORY || '').toLowerCase().trim(),
     /**
+     * Comma-separated list of categories to discover and match sequentially.
+     * Each category is fetched on all platforms, matched, then the next category runs.
+     * This scopes matching to same-category markets and avoids cross-category noise.
+     * Example: MARKET_CATEGORIES=sports,politics,crypto
+     * When set, overrides MARKET_CATEGORY. When empty, falls back to MARKET_CATEGORY behavior.
+     */
+    marketCategories: (process.env.MARKET_CATEGORIES || '')
+      .toLowerCase().trim()
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean),
+    /**
      * Comma-separated list of enabled platforms. Only these platforms will be connected and used.
      * Values: 'polymarket', 'predictfun', 'kalshi'
      * Default: 'polymarket,kalshi' (predict.fun disabled by default)

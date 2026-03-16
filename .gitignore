@@ -9,6 +9,8 @@ dist/
 .env
 .env.local
 .env.*.local
+*.pem
+id_do
 
 # Database
 data/
@@ -21,6 +23,9 @@ data/
 logs/
 *.log
 npm-debug.log*
+
+# Diagnostics
+arb-diagnostics*
 
 # OS
 .DS_Store
@@ -41,8 +46,10 @@ dashboard/.next/
 *.tsbuildinfo
 .cache/
 
+# Personal deployment (contains server IPs, SSH keys, etc.)
+deploy.sh
+server-setup.sh
+DEPLOYMENT.md
+
 # Claude scratchpad
 CLAUDE.md
-
-id_do
-prediction-market-backend.pem

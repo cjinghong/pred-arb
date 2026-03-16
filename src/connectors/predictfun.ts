@@ -434,16 +434,10 @@ export class PredictFunConnector extends BaseConnector {
       params.set('status', 'OPEN');
     }
 
-    // predict.fun supports sort: VOLUME_TOTAL_DESC, VOLUME_24H_DESC, etc.
-    if (options?.sortBy) {
-      const sortMap: Record<string, string> = {
-        volume: options.sortDirection === 'asc' ? 'VOLUME_TOTAL_ASC' : 'VOLUME_TOTAL_DESC',
-        liquidity: options.sortDirection === 'asc' ? 'VOLUME_TOTAL_ASC' : 'VOLUME_TOTAL_DESC', // no liquidity sort; use volume as proxy
-        updatedAt: options.sortDirection === 'asc' ? 'VOLUME_24H_ASC' : 'VOLUME_24H_DESC',
-      };
-      const sortValue = sortMap[options.sortBy];
-      if (sortValue) params.set('sort', sortValue);
-    }
+    // NOTE: /v1/categories uses CategorySort enum (not MarketSort).
+    // Valid CategorySort values differ from MarketSort (VOLUME_TOTAL_DESC etc.).
+    // Do NOT pass MarketSort values here — they cause HTTP 400.
+    // Omit sort param to use the API's default ordering.
 
     // Use /v1/categories to get the category slug (needed for frontend URLs)
     const url = `${this.apiUrl}/v1/categories?${params.toString()}`;
