@@ -17,7 +17,7 @@ import { CrossPlatformArbStrategy } from '../strategies/cross-platform-arb';
 import { ExecutionEngine } from './execution-engine';
 import { RiskManager } from './risk-manager';
 import { ApiServer } from './api-server';
-import { initializeDatabase, setBotStateKV } from '../db/database';
+import { initializeDatabase, setBotStateKV, getBotTradeMarketIds } from '../db/database';
 import { config } from '../utils/config';
 import { createChildLogger } from '../utils/logger';
 import { eventBus } from '../utils/event-bus';
@@ -109,6 +109,7 @@ export class Bot {
       return xPlatformArb.addManualPair(marketAId, marketBId);
     });
     this.apiServer.setPositionsGetter(() => this.riskManager.getPositions());
+    this.apiServer.setBotTradeMarketIdsGetter(() => getBotTradeMarketIds());
     this.apiServer.setRefreshMarketsHandler(async () => {
       await xPlatformArb.forceRefreshPairs();
       // Run a scan after refresh to find new opportunities immediately
@@ -119,6 +120,24 @@ export class Bot {
     this.apiServer.setCategoryHandlers(
       () => xPlatformArb.getCategory(),
       (cat) => xPlatformArb.setCategory(cat),
+    );
+    this.apiServer.setConfigParamsHandlers(
+      () => xPlatformArb.getConfigParams(),
+      (params) => {
+        xPlatformArb.setConfigParams(params);
+        // Also update RiskManager limits so risk checks use the new values
+        if (params.maxTotalExposureUsd !== undefined) {
+          this.riskManager.setMaxTotalExposure(params.maxTotalExposureUsd);
+        }
+        if (params.maxPositionUsd !== undefined) {
+          this.riskManager.setMaxPositionSize(params.maxPositionUsd);
+        }
+      },
+      async () => {
+        // Clear cooldowns so all pairs get re-analyzed with new thresholds
+        xPlatformArb.clearCooldowns();
+        await xPlatformArb.scan();
+      },
     );
     this.apiServer.setResetHandler(async () => {
       // Reset in-memory state

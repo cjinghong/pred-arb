@@ -200,6 +200,8 @@ export interface Position {
   avgEntryPrice: number;
   currentPrice: number;
   unrealizedPnl: number;
+  /** Direct URL to the market on the platform */
+  marketUrl?: string;
 }
 
 export interface PortfolioSnapshot {

@@ -26,13 +26,21 @@ interface Trade {
   leg_a_market_id: string;
   leg_a_side: string;
   leg_a_price: number;
+  leg_a_question?: string;
   leg_b_platform: string;
   leg_b_market_id: string;
   leg_b_side: string;
   leg_b_price: number;
+  leg_b_question?: string;
+  opp_leg_a_outcome?: string;
+  opp_leg_b_outcome?: string;
   expected_profit_usd: number;
+  expected_profit_bps?: number;
   realized_profit_usd: number | null;
   fees: number;
+  total_cost_usd?: number;
+  leg_a_size?: number;
+  leg_b_size?: number;
   created_at: string;
   notes: string;
 }
@@ -62,9 +70,11 @@ interface PositionItem {
   outcomeIndex: number;
   side: string;
   size: number;
+  marketUrl?: string;
   avgEntryPrice: number;
   currentPrice: number;
   unrealizedPnl: number;
+  source?: 'bot' | 'personal';
 }
 
 interface BotStatus {
@@ -227,6 +237,11 @@ export default function DashboardPage() {
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [marketCategory, setMarketCategory] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [configParams, setConfigParams] = useState<{ minProfitBps: number; maxPositionUsd: number; maxTotalExposureUsd: number }>({
+    minProfitBps: 150, maxPositionUsd: 500, maxTotalExposureUsd: 5000,
+  });
+  const [editingParam, setEditingParam] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -235,7 +250,7 @@ export default function DashboardPage() {
 
   const handleWsMessage = useCallback((msg: WsMessage) => {
     const addFeed = (type: string, text: string, cls: string) => {
-      setFeed(prev => [{ time: formatTime(msg.timestamp), type, msg: text, cls }, ...prev].slice(0, 50));
+      setFeed(prev => [{ time: formatTime(msg.timestamp), type, msg: text, cls }, ...prev].slice(0, 100));
     };
 
     switch (msg.type) {
@@ -297,8 +312,8 @@ export default function DashboardPage() {
         const [s, m, t, o, mk, pos] = await Promise.all([
           fetch(`${apiBase}/api/status`).then(r => r.json()),
           fetch(`${apiBase}/api/metrics`).then(r => r.json()),
-          fetch(`${apiBase}/api/trades?limit=30`).then(r => r.json()),
-          fetch(`${apiBase}/api/opportunities?limit=30`).then(r => r.json()),
+          fetch(`${apiBase}/api/trades?limit=500`).then(r => r.json()),
+          fetch(`${apiBase}/api/opportunities?limit=500`).then(r => r.json()),
           fetch(`${apiBase}/api/markets`).then(r => r.json()).catch(() => ({ platforms: {}, matchedPairs: [] })),
           fetch(`${apiBase}/api/positions`).then(r => r.json()).catch(() => []),
         ]);
@@ -368,11 +383,16 @@ export default function DashboardPage() {
     await fetch(`${apiBase}/api/bot/${cmd}`, { method: 'POST' });
   };
 
-  // Fetch initial config (category)
+  // Fetch initial config (category + params)
   useEffect(() => {
     const apiBase = getApiBase();
     fetch(`${apiBase}/api/config`).then(r => r.json()).then(cfg => {
       if (cfg.marketCategory !== undefined) setMarketCategory(cfg.marketCategory);
+      setConfigParams(prev => ({
+        minProfitBps: cfg.minProfitBps ?? prev.minProfitBps,
+        maxPositionUsd: cfg.maxPositionUsd ?? prev.maxPositionUsd,
+        maxTotalExposureUsd: cfg.maxTotalExposureUsd ?? prev.maxTotalExposureUsd,
+      }));
     }).catch(() => {});
   }, []);
 
@@ -383,7 +403,7 @@ export default function DashboardPage() {
       const resp = await fetch(`${apiBase}/api/bot/refresh-markets`, { method: 'POST' });
       const data = await resp.json();
       if (data.markets) setMarketsSummary(data.markets as MarketsSummary);
-      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Markets refreshed${marketCategory ? ` (${marketCategory})` : ''}`, cls: 'cyan' }, ...prev.slice(0, 49)]);
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Markets refreshed${marketCategory ? ` (${marketCategory})` : ''}`, cls: 'cyan' }, ...prev.slice(0, 99)]);
     } catch (err) {
       alert(`Refresh failed: ${(err as Error).message}`);
     }
@@ -404,11 +424,32 @@ export default function DashboardPage() {
       const resp = await fetch(`${apiBase}/api/bot/refresh-markets`, { method: 'POST' });
       const data = await resp.json();
       if (data.markets) setMarketsSummary(data.markets as MarketsSummary);
-      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Category → ${newCategory || 'ALL'}, markets refreshed`, cls: 'cyan' }, ...prev.slice(0, 49)]);
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `Category → ${newCategory || 'ALL'}, markets refreshed`, cls: 'cyan' }, ...prev.slice(0, 99)]);
     } catch (err) {
       alert(`Category update failed: ${(err as Error).message}`);
     }
     setIsRefreshing(false);
+  };
+
+  const handleParamSave = async (paramName: string, value: string) => {
+    const num = Number(value);
+    if (isNaN(num)) return;
+    try {
+      const apiBase = getApiBase();
+      const resp = await fetch(`${apiBase}/api/config/params`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [paramName]: num }),
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setConfigParams(prev => ({ ...prev, ...data }));
+        setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: `${paramName} → ${num}`, cls: 'cyan' }, ...prev.slice(0, 99)]);
+      }
+    } catch (err) {
+      alert(`Failed to update ${paramName}: ${(err as Error).message}`);
+    }
+    setEditingParam(null);
   };
 
   const handleReset = async () => {
@@ -421,7 +462,7 @@ export default function DashboardPage() {
       setOpportunities([]);
       setMarketsSummary({ platforms: {}, matchedPairs: [] });
       setPositions([]);
-      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: 'Full reset — bot restarting', cls: 'amber' }, ...prev.slice(0, 49)]);
+      setFeed(prev => [{ time: formatTime(new Date().toISOString()), type: 'SYS', msg: 'Full reset — bot restarting', cls: 'amber' }, ...prev.slice(0, 99)]);
       setPnlHistory([]);
       setStatus(s => ({ ...s, state: data.state || 'RUNNING' }));
       setMetrics({ pnl24h: 0, pnl7d: 0, pnlAllTime: 0, winRate: 0, totalTrades: 0, avgProfitPerTrade: 0, sharpeRatio: 0, currentExposure: 0, maxDrawdown: 0 });
@@ -617,7 +658,7 @@ export default function DashboardPage() {
           {/* Tab bar */}
           <div className="tab-bar">
             <button className={`tab-btn ${activeTab === 'opportunities' ? 'tab-active' : ''}`} onClick={() => setActiveTab('opportunities')}>
-              OPPORTUNITIES
+              OPPORTUNITIES ({opportunities.length})
             </button>
             <button className={`tab-btn ${activeTab === 'markets' ? 'tab-active' : ''}`} onClick={() => setActiveTab('markets')}>
               MARKETS ({totalMarkets})
@@ -647,11 +688,12 @@ export default function DashboardPage() {
                 </div>
                 {filteredOpps.length === 0 ? (
                   <div className="empty-state">{opportunities.length === 0 ? 'Scanning for opportunities...' : 'No matches'}</div>
-                ) : filteredOpps.map(opp => {
+                ) : filteredOpps.map((opp, idx) => {
                   const oppSt = getOppStatus(opp);
                   return (
                   <div className="opp-card clickable" key={opp.id} onClick={() => navigateToPairFromOpp(opp)}>
                     <div className="opp-card-header">
+                      <span className="opp-number">#{filteredOpps.length - idx}</span>
                       <span className="row-time">{formatTime(opp.discoveredAt)}</span>
                       <span className={`row-profit ${pnlClass(opp.expectedProfitUsd)}`}>
                         {formatUsd(opp.expectedProfitUsd)}
@@ -941,31 +983,51 @@ export default function DashboardPage() {
               <>
                 {trades.length === 0 ? (
                   <div className="empty-state">No trades executed yet</div>
-                ) : trades.map(t => (
-                  <div className="row" key={t.id}>
-                    <span className="row-time">{formatTime(t.created_at)}</span>
-                    <span className={`row-platform platform-${t.leg_a_platform || 'polymarket'}`}>
-                      {(t.leg_a_platform || 'POLY').slice(0, 5)}
-                    </span>
-                    <span className="row-price">{t.leg_a_price?.toFixed(3) || '—'}</span>
-                    <span style={{ color: 'var(--text-dim)' }}>↔</span>
-                    <span className={`row-platform platform-${t.leg_b_platform || 'predictfun'}`}>
-                      {(t.leg_b_platform || 'PFUN').slice(0, 5)}
-                    </span>
-                    <span className="row-price">{t.leg_b_price?.toFixed(3) || '—'}</span>
-                    <span className={`row-profit ${pnlClass(t.realized_profit_usd)}`}>
-                      {formatUsd(t.realized_profit_usd ?? t.expected_profit_usd)}
-                    </span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>
-                      FEE {t.fees?.toFixed(2) || '0.00'}
-                    </span>
-                    <span className={`row-status ${
-                      t.status === 'EXECUTED' ? 'status-executed' :
-                      t.status === 'FAILED' ? 'status-failed-trade' : 'status-pending-trade'
-                    }`}>
-                      {t.status}
-                    </span>
-                    {t.notes && <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>{t.notes}</span>}
+                ) : trades.map((t, idx) => (
+                  <div className="trade-card" key={t.id}>
+                    <div className="trade-card-header">
+                      <span className="opp-number">#{trades.length - idx}</span>
+                      <span className="row-time">{formatTime(t.created_at)}</span>
+                      <span className={`row-profit ${pnlClass(t.realized_profit_usd)}`}>
+                        {formatUsd(t.realized_profit_usd ?? t.expected_profit_usd)}
+                      </span>
+                      {t.expected_profit_bps != null && (
+                        <span className="opp-bps">{t.expected_profit_bps.toFixed(0)} bps</span>
+                      )}
+                      {t.leg_a_size != null && (
+                        <span className="opp-size">sz {t.leg_a_size.toFixed(0)}</span>
+                      )}
+                      <span className={`row-status ${
+                        t.status === 'EXECUTED' ? 'status-executed' :
+                        t.status === 'FAILED' ? 'status-failed-trade' : 'status-pending-trade'
+                      }`}>
+                        {t.status}
+                      </span>
+                      {t.notes && <span style={{ color: 'var(--text-dim)', fontSize: '9px' }}>{t.notes}</span>}
+                    </div>
+                    <div className="opp-card-legs">
+                      <div className="opp-leg">
+                        <span className={`row-platform platform-${t.leg_a_platform || 'polymarket'}`}>
+                          {(t.leg_a_platform || 'POLY').slice(0, 5)}
+                        </span>
+                        <span className={`row-outcome ${t.opp_leg_a_outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                          {t.opp_leg_a_outcome || t.leg_a_side || '—'}
+                        </span>
+                        <span className="row-price">{t.leg_a_price?.toFixed(3) || '—'}</span>
+                        <span className="opp-market-q">{t.leg_a_question?.slice(0, 50) || t.leg_a_market_id?.slice(0, 20) || '—'}</span>
+                      </div>
+                      <span className="opp-arrow">↔</span>
+                      <div className="opp-leg">
+                        <span className={`row-platform platform-${t.leg_b_platform || 'predictfun'}`}>
+                          {(t.leg_b_platform || 'PFUN').slice(0, 5)}
+                        </span>
+                        <span className={`row-outcome ${t.opp_leg_b_outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
+                          {t.opp_leg_b_outcome || t.leg_b_side || '—'}
+                        </span>
+                        <span className="row-price">{t.leg_b_price?.toFixed(3) || '—'}</span>
+                        <span className="opp-market-q">{t.leg_b_question?.slice(0, 50) || t.leg_b_market_id?.slice(0, 20) || '—'}</span>
+                      </div>
+                    </div>
                   </div>
                 ))}
               </>
@@ -980,17 +1042,20 @@ export default function DashboardPage() {
                   <a
                     className="position-row clickable"
                     key={`${pos.platform}-${pos.marketId}-${i}`}
-                    href={getPlatformMarketUrl(pos.platform, '', pos.marketId)}
+                    href={pos.marketUrl || getPlatformMarketUrl(pos.platform, '', pos.marketId)}
                     target="_blank"
                     rel="noopener noreferrer"
                   >
+                    <span className={`pos-source ${pos.source === 'bot' ? 'pos-source-bot' : 'pos-source-personal'}`}>
+                      {pos.source === 'bot' ? 'BOT' : 'USER'}
+                    </span>
                     <span className={`row-platform platform-${pos.platform}`}>{pos.platform.slice(0, 5).toUpperCase()}</span>
                     <span className={`row-outcome ${pos.side === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>{pos.side}</span>
-                    <span className="pos-size">{pos.size.toFixed(1)} shares</span>
-                    <span className="pos-entry">@ {pos.avgEntryPrice.toFixed(3)}</span>
-                    <span className="pos-current">now {pos.currentPrice.toFixed(3)}</span>
-                    <span className={`row-profit ${pnlClass(pos.unrealizedPnl)}`}>
-                      {formatUsd(pos.unrealizedPnl)}
+                    <span className="pos-size">{(pos.size ?? 0).toFixed(1)} shares</span>
+                    <span className="pos-entry">@ {(pos.avgEntryPrice ?? 0).toFixed(3)}</span>
+                    <span className="pos-current">now {(pos.currentPrice ?? 0).toFixed(3)}</span>
+                    <span className={`row-profit ${pnlClass(pos.unrealizedPnl ?? 0)}`}>
+                      {formatUsd(pos.unrealizedPnl ?? 0)}
                     </span>
                     <span className="pos-question">{pos.marketQuestion?.slice(0, 45) || pos.marketId}</span>
                     <span className="pos-link-icon">↗</span>
@@ -1003,7 +1068,7 @@ export default function DashboardPage() {
 
         {/* RIGHT: Activity Feed + Strategy */}
         <div className="main-right">
-          <div className="panel" style={{ flex: 1 }}>
+          <div className="panel" style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
             <div className="panel-header">
               <span className="panel-title">Activity Feed</span>
               <span className="panel-tag">STREAM</span>
@@ -1021,7 +1086,7 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="panel" style={{ flex: 0, minHeight: 'auto' }}>
+          <div className="panel" style={{ flexShrink: 0 }}>
             <div className="panel-header">
               <span className="panel-title">Strategy</span>
               <span className="panel-tag">CONFIG</span>
@@ -1033,12 +1098,48 @@ export default function DashboardPage() {
                   <span className="status-badge status-running" style={{ fontSize: 8 }}>ACTIVE</span>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px 12px', fontSize: 10 }}>
+                  {/* Min Profit BPS */}
                   <span className="metric-label">MIN PROFIT</span>
-                  <span style={{ color: 'var(--text-primary)' }}>150 BPS</span>
+                  {editingParam === 'minProfitBps' ? (
+                    <form onSubmit={e => { e.preventDefault(); handleParamSave('minProfitBps', editValue); }} style={{ display: 'flex', gap: 2 }}>
+                      <input className="config-input" autoFocus value={editValue} onChange={e => setEditValue(e.target.value)}
+                        onBlur={() => setEditingParam(null)} onKeyDown={e => { if (e.key === 'Escape') setEditingParam(null); }} />
+                      <span style={{ color: 'var(--text-dim)', fontSize: 9 }}>BPS</span>
+                    </form>
+                  ) : (
+                    <span className="config-value" onClick={() => { setEditingParam('minProfitBps'); setEditValue(String(configParams.minProfitBps)); }}>
+                      {configParams.minProfitBps} BPS
+                    </span>
+                  )}
+                  {/* Max Position */}
                   <span className="metric-label">MAX POSITION</span>
-                  <span style={{ color: 'var(--text-primary)' }}>$500</span>
+                  {editingParam === 'maxPositionUsd' ? (
+                    <form onSubmit={e => { e.preventDefault(); handleParamSave('maxPositionUsd', editValue); }} style={{ display: 'flex', gap: 2 }}>
+                      <span style={{ color: 'var(--text-dim)', fontSize: 9 }}>$</span>
+                      <input className="config-input" autoFocus value={editValue} onChange={e => setEditValue(e.target.value)}
+                        onBlur={() => setEditingParam(null)} onKeyDown={e => { if (e.key === 'Escape') setEditingParam(null); }} />
+                    </form>
+                  ) : (
+                    <span className="config-value" onClick={() => { setEditingParam('maxPositionUsd'); setEditValue(String(configParams.maxPositionUsd)); }}>
+                      ${configParams.maxPositionUsd}
+                    </span>
+                  )}
+                  {/* Max Total Exposure */}
+                  <span className="metric-label">MAX EXPOSURE</span>
+                  {editingParam === 'maxTotalExposureUsd' ? (
+                    <form onSubmit={e => { e.preventDefault(); handleParamSave('maxTotalExposureUsd', editValue); }} style={{ display: 'flex', gap: 2 }}>
+                      <span style={{ color: 'var(--text-dim)', fontSize: 9 }}>$</span>
+                      <input className="config-input" autoFocus value={editValue} onChange={e => setEditValue(e.target.value)}
+                        onBlur={() => setEditingParam(null)} onKeyDown={e => { if (e.key === 'Escape') setEditingParam(null); }} />
+                    </form>
+                  ) : (
+                    <span className="config-value" onClick={() => { setEditingParam('maxTotalExposureUsd'); setEditValue(String(configParams.maxTotalExposureUsd)); }}>
+                      ${configParams.maxTotalExposureUsd.toLocaleString()}
+                    </span>
+                  )}
+                  {/* Scan Interval (read-only) */}
                   <span className="metric-label">SCAN INTERVAL</span>
-                  <span style={{ color: 'var(--text-primary)' }}>10s</span>
+                  <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>event-driven</span>
                 </div>
               </div>
             </div>

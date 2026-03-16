@@ -30,6 +30,12 @@ export interface BookSelection {
   platformB?: string;
   marketIdB?: string;
   questionB?: string;
+  /** Whether outcome 0 (YES) on market A means the opposite of outcome 0 (YES) on market B */
+  outcomesInverted?: boolean;
+  /** Outcome labels for market A, e.g. ["Lightning", "Kraken"] */
+  outcomesA?: string[];
+  /** Outcome labels for market B, e.g. ["Kraken", "Lightning"] */
+  outcomesB?: string[];
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -64,6 +70,9 @@ export default function OrderBookViewer({
 }) {
   const [bookA, setBookA] = useState<OrderBookData | null>(null);
   const [bookB, setBookB] = useState<OrderBookData | null>(null);
+  // YES books always fetched for arb calculation (independent of toggle)
+  const [yesBookA, setYesBookA] = useState<OrderBookData | null>(null);
+  const [yesBookB, setYesBookB] = useState<OrderBookData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // YES/NO toggle per book: 0 = YES, 1 = NO
@@ -145,16 +154,32 @@ export default function OrderBookViewer({
     let active = true;
 
     const refresh = async () => {
+      // Fetch the toggled display books
       const a = await fetchBook(selection.platformA, selection.marketIdA, outcomeA);
       if (!active) return;
       detectFlashes(a, prevBidsA, prevAsksA, 'A');
       setBookA(a);
+      // If toggle is on YES, reuse for arb calc; otherwise fetch YES separately
+      if (outcomeA === 0) {
+        setYesBookA(a);
+      } else {
+        const yesA = await fetchBook(selection.platformA, selection.marketIdA, 0);
+        if (!active) return;
+        setYesBookA(yesA);
+      }
 
       if (selection.mode === 'pair' && selection.platformB && selection.marketIdB) {
         const b = await fetchBook(selection.platformB, selection.marketIdB, outcomeB);
         if (!active) return;
         detectFlashes(b, prevBidsB, prevAsksB, 'B');
         setBookB(b);
+        if (outcomeB === 0) {
+          setYesBookB(b);
+        } else {
+          const yesB = await fetchBook(selection.platformB, selection.marketIdB, 0);
+          if (!active) return;
+          setYesBookB(yesB);
+        }
       }
     };
 
@@ -271,15 +296,16 @@ export default function OrderBookViewer({
         )}
       </div>
 
-      {/* Arb summary for pairs */}
-      {selection.mode === 'pair' && bookA && bookB && (
+      {/* Arb summary for pairs — always uses YES books for calculation */}
+      {selection.mode === 'pair' && yesBookA && yesBookB && (
         <ArbSummary
-          bookA={bookA}
-          bookB={bookB}
+          bookA={yesBookA}
+          bookB={yesBookB}
           platformA={selection.platformA}
           platformB={selection.platformB!}
-          outcomeA={outcomeA}
-          outcomeB={outcomeB}
+          outcomesInverted={selection.outcomesInverted}
+          outcomesA={selection.outcomesA}
+          outcomesB={selection.outcomesB}
         />
       )}
     </div>
@@ -316,85 +342,180 @@ function OutcomeToggle({ value, onChange }: { value: number; onChange: (v: numbe
 }
 
 // ─── Arb Summary ─────────────────────────────────────────────────────────
+//
+// Hold-to-resolution (HTR) arb: buy opposing outcomes across platforms so that
+// regardless of which team/outcome wins, one position pays $1 and the other $0.
+// Profit = $1 - total cost of both legs.
+//
+// When outcomesInverted = true, YES on platform A means the OPPOSITE of YES on
+// platform B. The bot handles this by flipping book B before comparing. Here we
+// replicate that logic so the dashboard shows the same math the bot uses.
 
 function ArbSummary({
-  bookA, bookB, platformA, platformB, outcomeA, outcomeB,
+  bookA, bookB, platformA, platformB,
+  outcomesInverted, outcomesA, outcomesB,
 }: {
   bookA: OrderBookData; bookB: OrderBookData;
   platformA: string; platformB: string;
-  outcomeA: number; outcomeB: number;
+  outcomesInverted?: boolean;
+  outcomesA?: string[];
+  outcomesB?: string[];
 }) {
-  // Always compute arb based on YES books (outcome 0) regardless of current toggle
-  // But show the currently selected outcome context
+  // bookA and bookB are ALWAYS the YES books (outcome index 0).
+  // The arb calculation is independent of the YES/NO toggle above.
   const pA = platformA.slice(0, 5).toUpperCase();
   const pB = platformB.slice(0, 5).toUpperCase();
+  const inverted = outcomesInverted ?? false;
 
-  // Direction 1: Buy YES on A + Buy NO on B
-  // Cost = A.bestAsk (YES price) + (1 - B.bestBid) (NO price = 1 - YES bid)
-  const d1Valid = bookA.bestAsk !== null && bookB.bestBid !== null;
-  const costYesA = bookA.bestAsk ?? 0;
-  const costNoB = bookB.bestBid !== null ? 1 - bookB.bestBid : 0;
-  const totalCostD1 = costYesA + costNoB;
+  // Resolve human-readable outcome labels
+  // outcomesA[0] = what "YES" means on A (e.g. "Lightning")
+  // outcomesA[1] = what "NO" means on A (e.g. "Kraken")
+  const teamA_yes = outcomesA?.[0] || 'YES';  // what A's YES represents
+  const teamA_no  = outcomesA?.[1] || 'NO';   // what A's NO represents
+
+  // Effective book B: when inverted, flip B's book (bids↔asks, prices inverted)
+  // This mirrors what the bot does in cross-platform-arb.ts
+  let effBookB: { bestBid: number | null; bestAsk: number | null; bids: PriceLevel[]; asks: PriceLevel[] };
+  if (inverted) {
+    effBookB = {
+      bestBid: bookB.bestAsk !== null ? 1 - bookB.bestAsk : null,
+      bestAsk: bookB.bestBid !== null ? 1 - bookB.bestBid : null,
+      bids: bookB.asks.map(a => ({ price: 1 - a.price, size: a.size })).sort((a, b) => b.price - a.price),
+      asks: bookB.bids.map(b => ({ price: 1 - b.price, size: b.size })).sort((a, b) => a.price - b.price),
+    };
+  } else {
+    effBookB = bookB;
+  }
+
+  // What outcome to actually buy on B (native) for each direction:
+  const bNativeForD1 = inverted ? 'YES' : 'NO';   // bot buys B's native YES when inverted (= opposite outcome)
+  const bNativeForD2 = inverted ? 'NO' : 'YES';
+
+  // ── Direction 1: Bet on team A_YES winning ──
+  // Buy YES on A (at A's best ask) + buy opposing outcome on B
+  // Opposing on B: if aligned, buy NO on B (cost = 1 - B_yes_bid)
+  //                if inverted, buy YES on B (cost = B_yes_ask), which represents the opposite team
+  // Using effective book: always = A.bestAsk + (1 - effB.bestBid)
+  const d1Valid = bookA.bestAsk !== null && effBookB.bestBid !== null;
+  const costA_d1 = bookA.bestAsk ?? 0;
+  const costB_d1 = effBookB.bestBid !== null ? 1 - effBookB.bestBid : 0;
+  const totalCostD1 = costA_d1 + costB_d1;
   const profitD1 = 1 - totalCostD1;
 
-  // Direction 2: Buy NO on A + Buy YES on B
-  const d2Valid = bookA.bestBid !== null && bookB.bestAsk !== null;
-  const costNoA = bookA.bestBid !== null ? 1 - bookA.bestBid : 0;
-  const costYesB = bookB.bestAsk ?? 0;
-  const totalCostD2 = costNoA + costYesB;
+  // ── Direction 2: Bet on team A_NO winning ──
+  // Buy NO on A (cost = 1 - A_yes_bid) + buy opposing outcome on B
+  // Using effective book: always = (1 - A.bestBid) + effB.bestAsk
+  const d2Valid = bookA.bestBid !== null && effBookB.bestAsk !== null;
+  const costA_d2 = bookA.bestBid !== null ? 1 - bookA.bestBid : 0;
+  const costB_d2 = effBookB.bestAsk ?? 0;
+  const totalCostD2 = costA_d2 + costB_d2;
   const profitD2 = 1 - totalCostD2;
 
-  // Sizing
-  const sizeD1A = bookA.asks?.[0]?.size ?? 0;
-  const sizeD1B = bookB.bids?.[0]?.size ?? 0;
-  const maxSizeD1 = Math.min(sizeD1A, sizeD1B);
-  const sizeD2A = bookA.bids?.[0]?.size ?? 0;
-  const sizeD2B = bookB.asks?.[0]?.size ?? 0;
-  const maxSizeD2 = Math.min(sizeD2A, sizeD2B);
-
-  const outLabel = (idx: number) => idx === 0 ? 'YES' : 'NO';
-  const note = (outcomeA !== 0 || outcomeB !== 0)
-    ? '(arb calc uses YES books; toggle above to inspect NO book)'
-    : '';
+  // Sizing (top-of-book only for display)
+  const maxSizeD1 = Math.min(
+    bookA.asks?.[0]?.size ?? 0,
+    inverted ? (bookB.asks?.[0]?.size ?? 0) : (bookB.bids?.[0]?.size ?? 0),
+  );
+  const maxSizeD2 = Math.min(
+    bookA.bids?.[0]?.size ?? 0,
+    inverted ? (bookB.bids?.[0]?.size ?? 0) : (bookB.asks?.[0]?.size ?? 0),
+  );
 
   return (
     <div className="ob-arb-summary">
       <div className="ob-arb-header">
         ARB ANALYSIS
-        {note && <span className="ob-arb-note">{note}</span>}
+        {inverted && <span className="ob-arb-inverted-tag">OUTCOMES INVERTED</span>}
+      </div>
+
+      {/* How it works */}
+      <div className="ob-arb-explainer">
+        Hold-to-resolution: buy opposing outcomes across platforms. One leg always pays $1, the other $0. Profit = $1 - total cost.
+        {inverted && ` Since outcomes are inverted, YES on ${pA} and YES on ${pB} represent different teams.`}
+        {' '}Computed from YES books — unaffected by the toggle above.
       </div>
 
       {d1Valid && (
-        <div className="ob-arb-row">
-          <span className="ob-arb-label">
-            <span className="ob-arb-dir">D1</span>
-            YES {pA} + NO {pB}
-          </span>
-          <span className="ob-arb-cost">Cost: {formatPrice(totalCostD1)}</span>
-          <span className="ob-arb-size">Size: {formatSize(maxSizeD1)}</span>
-          <span className={`ob-arb-profit ${profitD1 > 0 ? 'positive' : 'negative'}`}>
-            {profitD1 > 0 ? '+' : ''}{formatPrice(profitD1)} ({totalCostD1 > 0 ? ((profitD1 / totalCostD1) * 10000).toFixed(0) : '0'} bps)
-          </span>
+        <div className={`ob-arb-direction ${profitD1 > 0 ? 'ob-arb-profitable' : ''}`}>
+          <div className="ob-arb-dir-header">
+            <span className="ob-arb-dir-label">DIRECTION 1</span>
+            <span className="ob-arb-dir-bet">Bet: {teamA_yes} wins</span>
+            <span className={`ob-arb-profit ${profitD1 > 0 ? 'positive' : 'negative'}`}>
+              {profitD1 > 0 ? '+' : ''}{formatPrice(profitD1)}/share ({totalCostD1 > 0 ? ((profitD1 / totalCostD1) * 10000).toFixed(0) : '0'} bps)
+            </span>
+          </div>
+          <div className="ob-arb-legs">
+            <div className="ob-arb-leg">
+              <span className={`ob-arb-leg-platform platform-${platformA}`}>{pA}</span>
+              <span className="ob-arb-leg-action">Buy YES</span>
+              <span className="ob-arb-leg-price">@ {formatPrice(costA_d1)}</span>
+              {outcomesA && <span className="ob-arb-leg-team">{outcomesA[0]}</span>}
+            </div>
+            <div className="ob-arb-leg">
+              <span className={`ob-arb-leg-platform platform-${platformB}`}>{pB}</span>
+              <span className="ob-arb-leg-action">Buy {bNativeForD1}</span>
+              <span className="ob-arb-leg-price">@ {formatPrice(costB_d1)}</span>
+              {outcomesB && <span className="ob-arb-leg-team">
+                {inverted ? outcomesB[0] : outcomesB[1]}
+              </span>}
+            </div>
+          </div>
+          <div className="ob-arb-math">
+            Cost: {formatPrice(costA_d1)} + {formatPrice(costB_d1)} = {formatPrice(totalCostD1)} | Size: {formatSize(maxSizeD1)}
+          </div>
+          <div className="ob-arb-scenarios">
+            <span className="ob-arb-scenario">
+              If {teamA_yes} wins: A pays $1, B pays $0 → net = $1 - ${formatPrice(totalCostD1)} = <span className={profitD1 >= 0 ? 'positive' : 'negative'}>${formatPrice(Math.abs(profitD1))}</span>
+            </span>
+            <span className="ob-arb-scenario">
+              If {teamA_no} wins: A pays $0, B pays $1 → net = $1 - ${formatPrice(totalCostD1)} = <span className={profitD1 >= 0 ? 'positive' : 'negative'}>${formatPrice(Math.abs(profitD1))}</span>
+            </span>
+          </div>
         </div>
       )}
 
       {d2Valid && (
-        <div className="ob-arb-row">
-          <span className="ob-arb-label">
-            <span className="ob-arb-dir">D2</span>
-            NO {pA} + YES {pB}
-          </span>
-          <span className="ob-arb-cost">Cost: {formatPrice(totalCostD2)}</span>
-          <span className="ob-arb-size">Size: {formatSize(maxSizeD2)}</span>
-          <span className={`ob-arb-profit ${profitD2 > 0 ? 'positive' : 'negative'}`}>
-            {profitD2 > 0 ? '+' : ''}{formatPrice(profitD2)} ({totalCostD2 > 0 ? ((profitD2 / totalCostD2) * 10000).toFixed(0) : '0'} bps)
-          </span>
+        <div className={`ob-arb-direction ${profitD2 > 0 ? 'ob-arb-profitable' : ''}`}>
+          <div className="ob-arb-dir-header">
+            <span className="ob-arb-dir-label">DIRECTION 2</span>
+            <span className="ob-arb-dir-bet">Bet: {teamA_no} wins</span>
+            <span className={`ob-arb-profit ${profitD2 > 0 ? 'positive' : 'negative'}`}>
+              {profitD2 > 0 ? '+' : ''}{formatPrice(profitD2)}/share ({totalCostD2 > 0 ? ((profitD2 / totalCostD2) * 10000).toFixed(0) : '0'} bps)
+            </span>
+          </div>
+          <div className="ob-arb-legs">
+            <div className="ob-arb-leg">
+              <span className={`ob-arb-leg-platform platform-${platformA}`}>{pA}</span>
+              <span className="ob-arb-leg-action">Buy NO</span>
+              <span className="ob-arb-leg-price">@ {formatPrice(costA_d2)}</span>
+              {outcomesA && <span className="ob-arb-leg-team">{outcomesA[1]}</span>}
+            </div>
+            <div className="ob-arb-leg">
+              <span className={`ob-arb-leg-platform platform-${platformB}`}>{pB}</span>
+              <span className="ob-arb-leg-action">Buy {bNativeForD2}</span>
+              <span className="ob-arb-leg-price">@ {formatPrice(costB_d2)}</span>
+              {outcomesB && <span className="ob-arb-leg-team">
+                {inverted ? outcomesB[1] : outcomesB[0]}
+              </span>}
+            </div>
+          </div>
+          <div className="ob-arb-math">
+            Cost: {formatPrice(costA_d2)} + {formatPrice(costB_d2)} = {formatPrice(totalCostD2)} | Size: {formatSize(maxSizeD2)}
+          </div>
+          <div className="ob-arb-scenarios">
+            <span className="ob-arb-scenario">
+              If {teamA_no} wins: A pays $1, B pays $0 → net = $1 - ${formatPrice(totalCostD2)} = <span className={profitD2 >= 0 ? 'positive' : 'negative'}>${formatPrice(Math.abs(profitD2))}</span>
+            </span>
+            <span className="ob-arb-scenario">
+              If {teamA_yes} wins: A pays $0, B pays $1 → net = $1 - ${formatPrice(totalCostD2)} = <span className={profitD2 >= 0 ? 'positive' : 'negative'}>${formatPrice(Math.abs(profitD2))}</span>
+            </span>
+          </div>
         </div>
       )}
 
       {!d1Valid && !d2Valid && (
-        <div className="ob-arb-row">
-          <span className="ob-arb-label" style={{ color: 'var(--text-dim)' }}>Insufficient book data for arb calculation</span>
+        <div className="ob-arb-direction">
+          <span style={{ color: 'var(--text-dim)' }}>Insufficient book data for arb calculation</span>
         </div>
       )}
     </div>

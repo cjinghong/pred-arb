@@ -707,6 +707,11 @@ export class CrossPlatformArbStrategy implements Strategy {
   /** Runtime category override (dashboard can change this without restart) */
   private runtimeCategory: string | null = null;
 
+  /** Runtime parameter overrides (dashboard can change these without restart) */
+  private runtimeMinProfitBps: number | null = null;
+  private runtimeMaxPositionUsd: number | null = null;
+  private runtimeMaxTotalExposureUsd: number | null = null;
+
   /** Get the effective category (runtime override > env var) */
   getCategory(): string {
     return this.runtimeCategory ?? config.bot.marketCategory;
@@ -716,6 +721,38 @@ export class CrossPlatformArbStrategy implements Strategy {
   setCategory(category: string): void {
     this.runtimeCategory = category || null;
     log.info('Market category updated at runtime', { category: this.getCategory() });
+  }
+
+  /** Get effective config params (runtime overrides > env vars) */
+  getConfigParams(): { minProfitBps: number; maxPositionUsd: number; maxTotalExposureUsd: number } {
+    return {
+      minProfitBps: this.runtimeMinProfitBps ?? config.bot.minProfitBps,
+      maxPositionUsd: this.runtimeMaxPositionUsd ?? config.bot.maxPositionUsd,
+      maxTotalExposureUsd: this.runtimeMaxTotalExposureUsd ?? config.bot.maxTotalExposureUsd,
+    };
+  }
+
+  /** Clear per-pair analysis cooldowns so the next scan re-checks all pairs */
+  clearCooldowns(): void {
+    this.lastPairAnalysis.clear();
+  }
+
+  /** Set config params at runtime (from dashboard). Null values are ignored. */
+  setConfigParams(params: { minProfitBps?: number; maxPositionUsd?: number; maxTotalExposureUsd?: number }): void {
+    if (params.minProfitBps !== undefined) {
+      this.runtimeMinProfitBps = params.minProfitBps;
+      this.config.minProfitBps = params.minProfitBps;
+      log.info('minProfitBps updated at runtime', { minProfitBps: params.minProfitBps });
+    }
+    if (params.maxPositionUsd !== undefined) {
+      this.runtimeMaxPositionUsd = params.maxPositionUsd;
+      this.config.maxPositionUsd = params.maxPositionUsd;
+      log.info('maxPositionUsd updated at runtime', { maxPositionUsd: params.maxPositionUsd });
+    }
+    if (params.maxTotalExposureUsd !== undefined) {
+      this.runtimeMaxTotalExposureUsd = params.maxTotalExposureUsd;
+      log.info('maxTotalExposureUsd updated at runtime', { maxTotalExposureUsd: params.maxTotalExposureUsd });
+    }
   }
 
   /**

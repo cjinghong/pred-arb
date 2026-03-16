@@ -263,10 +263,30 @@ export function updateTradeStatus(
   db.prepare(`UPDATE trades SET ${sets.join(', ')} WHERE id = ?`).run(...params);
 }
 
+/** Get all market IDs involved in bot trades (for cross-referencing with live positions) */
+export function getBotTradeMarketIds(): Set<string> {
+  const rows = getDb().prepare(`
+    SELECT DISTINCT leg_a_platform, leg_a_market_id, leg_b_platform, leg_b_market_id
+    FROM trades
+  `).all() as Array<{ leg_a_platform: string; leg_a_market_id: string; leg_b_platform: string; leg_b_market_id: string }>;
+  const ids = new Set<string>();
+  for (const r of rows) {
+    if (r.leg_a_platform && r.leg_a_market_id) ids.add(`${r.leg_a_platform}:${r.leg_a_market_id}`);
+    if (r.leg_b_platform && r.leg_b_market_id) ids.add(`${r.leg_b_platform}:${r.leg_b_market_id}`);
+  }
+  return ids;
+}
+
 export function getRecentTrades(limit = 100): Record<string, unknown>[] {
-  return getDb().prepare(
-    'SELECT * FROM trades ORDER BY created_at DESC LIMIT ?'
-  ).all(limit) as Record<string, unknown>[];
+  return getDb().prepare(`
+    SELECT t.*,
+      o.leg_a_question, o.leg_b_question,
+      o.leg_a_outcome AS opp_leg_a_outcome, o.leg_b_outcome AS opp_leg_b_outcome,
+      o.expected_profit_bps
+    FROM trades t
+    LEFT JOIN opportunities o ON t.opportunity_id = o.id
+    ORDER BY t.created_at DESC LIMIT ?
+  `).all(limit) as Record<string, unknown>[];
 }
 
 // ─── Dashboard Metrics ───────────────────────────────────────────────────

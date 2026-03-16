@@ -8,11 +8,12 @@ import OrderBookViewer, { BookSelection } from '../orderbook-viewer';
 
 interface MatchedPair {
   pairId: string;
-  marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
-  marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string };
+  marketA: { id: string; platform: string; question: string; slug: string; eventSlug?: string; outcomes?: string[] };
+  marketB: { id: string; platform: string; question: string; slug: string; eventSlug?: string; outcomes?: string[] };
   confidence: number;
   matchMethod: string;
   status: string;
+  outcomesInverted?: boolean;
   llmReasoning?: string;
 }
 
@@ -127,6 +128,9 @@ function PairPageContent() {
     platformB: pair.marketB.platform,
     marketIdB: pair.marketB.id,
     questionB: pair.marketB.question,
+    outcomesInverted: pair.outcomesInverted,
+    outcomesA: pair.marketA.outcomes,
+    outcomesB: pair.marketB.outcomes,
   };
 
   return (

@@ -40,6 +40,10 @@ export class ApiServer {
   private refreshMarkets: (() => Promise<void>) | null = null;
   private getCategory: (() => string) | null = null;
   private setCategory: ((category: string) => void) | null = null;
+  private getBotTradeMarketIds: (() => Set<string>) | null = null;
+  private getConfigParams: (() => { minProfitBps: number; maxPositionUsd: number; maxTotalExposureUsd: number }) | null = null;
+  private setConfigParams: ((params: { minProfitBps?: number; maxPositionUsd?: number; maxTotalExposureUsd?: number }) => void) | null = null;
+  private triggerScan: (() => Promise<void>) | null = null;
   private connectors = new Map<Platform, MarketConnector>();
 
   constructor(
@@ -72,6 +76,11 @@ export class ApiServer {
     this.getPositions = fn;
   }
 
+  /** Wire up bot trade market IDs for cross-referencing positions */
+  setBotTradeMarketIdsGetter(fn: () => Set<string>): void {
+    this.getBotTradeMarketIds = fn;
+  }
+
   /** Wire up strategy reset handler */
   setResetHandler(fn: () => void | Promise<void>): void {
     this.resetStrategy = fn;
@@ -86,6 +95,17 @@ export class ApiServer {
   setCategoryHandlers(get: () => string, set: (category: string) => void): void {
     this.getCategory = get;
     this.setCategory = set;
+  }
+
+  /** Wire up config params getter/setter for runtime tuning */
+  setConfigParamsHandlers(
+    get: () => { minProfitBps: number; maxPositionUsd: number; maxTotalExposureUsd: number },
+    set: (params: { minProfitBps?: number; maxPositionUsd?: number; maxTotalExposureUsd?: number }) => void,
+    scan: () => Promise<void>,
+  ): void {
+    this.getConfigParams = get;
+    this.setConfigParams = set;
+    this.triggerScan = scan;
   }
 
   /** Wire up connectors for order book fetching */
@@ -125,14 +145,56 @@ export class ApiServer {
     });
 
     this.app.get('/api/config', (_req, res) => {
-      res.json({
+      const params = this.getConfigParams ? this.getConfigParams() : {
         minProfitBps: config.bot.minProfitBps,
         maxPositionUsd: config.bot.maxPositionUsd,
         maxTotalExposureUsd: config.bot.maxTotalExposureUsd,
+      };
+      res.json({
+        ...params,
         scanIntervalMs: config.bot.scanIntervalMs,
         minDepthUsd: config.bot.minDepthUsd,
         marketCategory: this.getCategory ? this.getCategory() : config.bot.marketCategory,
       });
+    });
+
+    this.app.post('/api/config/params', (req, res) => {
+      const { minProfitBps, maxPositionUsd, maxTotalExposureUsd } = req.body;
+      if (!this.setConfigParams) {
+        res.status(503).json({ error: 'Config params handler not initialized' });
+        return;
+      }
+      const updates: { minProfitBps?: number; maxPositionUsd?: number; maxTotalExposureUsd?: number } = {};
+      if (minProfitBps !== undefined) {
+        const v = Number(minProfitBps);
+        if (isNaN(v)) { res.status(400).json({ error: 'minProfitBps must be a number' }); return; }
+        updates.minProfitBps = v;
+      }
+      if (maxPositionUsd !== undefined) {
+        const v = Number(maxPositionUsd);
+        if (isNaN(v) || v <= 0) { res.status(400).json({ error: 'maxPositionUsd must be a positive number' }); return; }
+        updates.maxPositionUsd = v;
+      }
+      if (maxTotalExposureUsd !== undefined) {
+        const v = Number(maxTotalExposureUsd);
+        if (isNaN(v) || v <= 0) { res.status(400).json({ error: 'maxTotalExposureUsd must be a positive number' }); return; }
+        updates.maxTotalExposureUsd = v;
+      }
+      if (Object.keys(updates).length === 0) {
+        res.status(400).json({ error: 'No valid parameters provided' });
+        return;
+      }
+      this.setConfigParams(updates);
+      log.info('Config params updated via API', updates);
+      const current = this.getConfigParams ? this.getConfigParams() : updates;
+      res.json(current);
+
+      // Trigger a scan in the background so new thresholds take effect immediately
+      if (this.triggerScan) {
+        this.triggerScan().catch(err =>
+          log.error('Post-config-change scan failed', { error: (err as Error).message })
+        );
+      }
     });
 
     this.app.post('/api/config/category', (req, res) => {
@@ -174,12 +236,31 @@ export class ApiServer {
       res.json(this.getMarketsSummary());
     });
 
-    this.app.get('/api/positions', (_req, res) => {
-      if (!this.getPositions) {
+    this.app.get('/api/positions', async (_req, res) => {
+      try {
+        // Fetch real positions from all connected platform APIs
+        const allPositions: Array<Record<string, unknown>> = [];
+        const botMarketIds = this.getBotTradeMarketIds ? this.getBotTradeMarketIds() : new Set<string>();
+
+        for (const [platform, connector] of this.connectors.entries()) {
+          try {
+            const positions = await connector.getPositions();
+            for (const pos of positions) {
+              allPositions.push({
+                ...pos,
+                source: botMarketIds.has(`${platform}:${pos.marketId}`) ? 'bot' : 'personal',
+              });
+            }
+          } catch (err) {
+            log.warn(`Failed to fetch positions from ${platform}`, { error: (err as Error).message });
+          }
+        }
+
+        res.json(allPositions);
+      } catch (err) {
+        log.error('Failed to fetch positions', { error: (err as Error).message });
         res.json([]);
-        return;
       }
-      res.json(this.getPositions());
     });
 
     // ─── Order Book Endpoint ──────────────────────────────────────────

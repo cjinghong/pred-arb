@@ -46,6 +46,23 @@ export class RiskManager {
   /** Minimum balance to keep as reserve (%) */
   private reserveRatio = 0.1;
 
+  /** Update max total exposure at runtime */
+  setMaxTotalExposure(value: number): void {
+    this.maxTotalExposure = value;
+    log.info('maxTotalExposure updated at runtime', { maxTotalExposure: value });
+  }
+
+  /** Update max position size at runtime */
+  setMaxPositionSize(value: number): void {
+    this.maxPositionSize = value;
+    log.info('maxPositionSize updated at runtime', { maxPositionSize: value });
+  }
+
+  /** Get current limits for dashboard display */
+  getLimits(): { maxTotalExposure: number; maxPositionSize: number } {
+    return { maxTotalExposure: this.maxTotalExposure, maxPositionSize: this.maxPositionSize };
+  }
+
   initialize(connectors: Map<Platform, MarketConnector>): void {
     this.connectors = connectors;
     log.info('Risk manager initialized', {

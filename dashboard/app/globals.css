@@ -137,6 +137,30 @@ html, body {
 .amber { color: var(--accent-amber); }
 .cyan { color: var(--accent-cyan); }
 
+/* ─── Config Inline Editing ──────────────────────────────────────────── */
+.config-value {
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 1px 4px;
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+.config-value:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent-amber);
+}
+.config-input {
+  background: var(--bg-surface);
+  border: 1px solid var(--accent-amber);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  width: 60px;
+  outline: none;
+}
+
 /* ─── Main Content: 2-column layout ───────────────────────────────────── */
 .main-content {
   flex: 1;
@@ -644,22 +668,124 @@ html, body {
 
 /* Arb summary */
 .ob-arb-summary {
-  padding: 10px 14px;
+  padding: 12px 14px;
   border-top: 1px solid var(--border-primary);
   background: var(--bg-primary);
 }
 
-.ob-arb-row {
-  display: flex; gap: 16px; align-items: center;
-  padding: 4px 0;
-  font-size: 10px;
-}
-
-.ob-arb-label { color: var(--text-secondary); flex: 1; }
-.ob-arb-cost { color: var(--accent-amber); }
 .ob-arb-profit { font-weight: 700; }
 .ob-arb-profit.positive { color: var(--accent-green); }
 .ob-arb-profit.negative { color: var(--accent-red); }
+
+.ob-arb-explainer {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.ob-arb-inverted-tag {
+  font-size: 8px;
+  font-weight: 600;
+  color: var(--accent-amber, #ffb300);
+  background: rgba(255, 179, 0, 0.15);
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.3px;
+}
+
+.ob-arb-direction {
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-secondary);
+}
+
+.ob-arb-direction.ob-arb-profitable {
+  border-color: rgba(0, 255, 136, 0.3);
+  background: rgba(0, 255, 136, 0.03);
+}
+
+.ob-arb-dir-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.ob-arb-dir-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--accent-amber);
+  padding: 1px 5px;
+  background: rgba(255, 184, 0, 0.1);
+  border-radius: 2px;
+}
+
+.ob-arb-dir-bet {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex: 1;
+}
+
+.ob-arb-legs {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 5px;
+}
+
+.ob-arb-leg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+}
+
+.ob-arb-leg-platform {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.ob-arb-leg-action {
+  font-weight: 600;
+  color: var(--text-secondary);
+  min-width: 50px;
+}
+
+.ob-arb-leg-price {
+  color: var(--accent-cyan);
+  font-weight: 500;
+}
+
+.ob-arb-leg-team {
+  color: var(--accent-blue, #66ccff);
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.ob-arb-math {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.ob-arb-scenarios {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ob-arb-scenario {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
 
 /* ─── YES/NO Toggle ───────────────────────────────────────────────────── */
 .ob-outcome-toggle {
@@ -714,16 +840,7 @@ html, body {
   color: var(--accent-amber); margin-bottom: 6px;
   display: flex; align-items: center; gap: 8px;
 }
-.ob-arb-note { font-size: 9px; color: var(--text-dim); font-weight: 400; letter-spacing: 0; }
-.ob-arb-dir {
-  display: inline-block;
-  padding: 1px 4px; margin-right: 4px;
-  background: rgba(255, 184, 0, 0.1);
-  color: var(--accent-amber);
-  font-size: 8px; font-weight: 700;
-  border-radius: 1px;
-}
-.ob-arb-size { color: var(--accent-cyan); font-size: 10px; }
+.ob-arb-note { font-size: 9px; color: var(--text-dim); font-weight: 400; letter-spacing: 0; margin-bottom: 6px; }
 
 /* ─── Inline mode (no modal overlay) ──────────────────────────────────── */
 .ob-inline {
@@ -855,10 +972,23 @@ html, body {
   border-left-color: var(--accent-green);
 }
 
-.opp-card-header {
+.opp-number { font-size: 9px; color: var(--text-dim); font-weight: 600; letter-spacing: 0.5px; min-width: 24px; }
+
+.opp-card-header, .trade-card-header {
   display: flex; align-items: center; gap: 10px;
   margin-bottom: 4px;
   font-size: 11px;
+}
+
+.trade-card {
+  padding: 8px 6px;
+  border-bottom: 1px solid rgba(30, 38, 64, 0.5);
+  border-left: 3px solid transparent;
+  transition: all 0.15s;
+}
+.trade-card:hover {
+  background: rgba(0, 212, 255, 0.03);
+  border-left-color: var(--accent-cyan);
 }
 
 .opp-bps {
@@ -1075,6 +1205,12 @@ html, body {
 
 .pos-size { color: var(--text-primary); font-weight: 600; }
 .pos-entry { color: var(--text-secondary); }
+.pos-source {
+  font-size: 8px; font-weight: 700; letter-spacing: 1px;
+  padding: 1px 5px; border-radius: 3px;
+}
+.pos-source-bot { background: rgba(0, 255, 170, 0.15); color: var(--accent-green); }
+.pos-source-personal { background: rgba(0, 212, 255, 0.12); color: var(--accent-cyan); }
 .pos-current { color: var(--accent-cyan); }
 .pos-question { color: var(--text-secondary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pos-link-icon { color: var(--accent-cyan); font-size: 12px; opacity: 0.5; transition: opacity 0.15s; }

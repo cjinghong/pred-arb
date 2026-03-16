@@ -826,12 +826,127 @@ export class PolymarketConnector extends BaseConnector {
   }
 
   async getPositions(): Promise<Position[]> {
-    // Polymarket doesn't have a direct positions endpoint in the CLOB client.
-    // We can derive positions from balance allowance or trade history.
-    // For now, return empty — positions are tracked in-memory by RiskManager.
-    this.log.debug('getPositions: using RiskManager in-memory tracking');
-    return [];
+    // Use the Gamma data API to fetch real positions
+    const address = config.polymarket.proxyAddress || this.walletAddress;
+    if (!address) {
+      this.log.debug('getPositions: no wallet address configured');
+      return [];
+    }
+
+    try {
+      const url = `https://data-api.polymarket.com/positions?user=${address.toLowerCase()}`;
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        this.log.warn('Polymarket positions API failed', { status: resp.status });
+        return [];
+      }
+      const data = await resp.json() as Array<{
+        asset: string;
+        market: string;
+        conditionId: string;
+        slug?: string;
+        title?: string;
+        outcome?: string;
+        size: number;
+        avgPrice: number;
+        currentPrice: number;
+        curPrice?: number;
+        pnl: number;
+        initialValue: number;
+        currentValue: number;
+        resolved?: boolean;
+        active?: boolean;
+        closed?: boolean;
+      }>;
+
+      // Filter: only active positions (size > 0, not resolved)
+      const active = data.filter(p => {
+        if (!p.size || p.size <= 0) return false;
+        if (p.resolved === true || p.closed === true) return false;
+        // Resolved markets have price pinned at 0 or 1
+        const price = p.currentPrice ?? p.curPrice ?? 0.5;
+        if (price <= 0.001 || price >= 0.999) return false;
+        return true;
+      });
+
+      // Build URL map from slugs — try data-api slug first, then Gamma API lookup
+      const slugMap = new Map<string, string>();
+
+      // Step 1: Use slug from data-api response if available (most reliable)
+      for (const p of active) {
+        if (p.slug && p.conditionId) {
+          slugMap.set(p.conditionId, `https://polymarket.com/event/${p.slug}`);
+        }
+      }
+
+      // Step 2: Check marketCache (bot's own matched markets) for slug/eventSlug
+      for (const p of active) {
+        if (!p.conditionId || slugMap.has(p.conditionId)) continue;
+        const cached = this.marketCache.get(p.conditionId);
+        if (cached) {
+          if (cached.eventSlug) {
+            slugMap.set(p.conditionId, `https://polymarket.com/event/${cached.eventSlug}`);
+          } else if (cached.slug) {
+            slugMap.set(p.conditionId, `https://polymarket.com/event/${cached.slug}`);
+          }
+        }
+      }
+
+      // Step 3: For positions still missing slugs, batch-lookup from Gamma API
+      const missingConditionIds = active
+        .filter(p => p.conditionId && !slugMap.has(p.conditionId))
+        .map(p => p.conditionId);
+
+      if (missingConditionIds.length > 0) {
+        try {
+          // Query Gamma API one condition_id at a time (multiple condition_id params
+          // in a single URL may not be supported; also removed closed=false which
+          // was filtering out active sports markets)
+          for (const condId of missingConditionIds) {
+            try {
+              const gammaUrl = `${config.polymarket.gammaUrl}/markets?condition_id=${condId}`;
+              const gammaResp = await fetch(gammaUrl);
+              if (gammaResp.ok) {
+                const markets = await gammaResp.json() as Array<{
+                  condition_id: string;
+                  question?: string;
+                  slug?: string;
+                  events?: Array<{ slug?: string }>;
+                }>;
+                for (const m of markets) {
+                  const eventSlug = m.events?.[0]?.slug;
+                  if (eventSlug && m.condition_id) {
+                    slugMap.set(m.condition_id, `https://polymarket.com/event/${eventSlug}`);
+                  } else if (m.slug && m.condition_id) {
+                    slugMap.set(m.condition_id, `https://polymarket.com/event/${m.slug}`);
+                  }
+                }
+              }
+            } catch { /* skip individual lookup failures */ }
+          }
+        } catch (err) {
+          this.log.debug('Gamma slug lookup failed (non-fatal)', { error: (err as Error).message });
+        }
+      }
+
+      return active.map(p => ({
+        platform: 'polymarket' as Platform,
+        marketId: p.conditionId || p.market || p.asset,
+        marketQuestion: p.title || p.market || p.asset,
+        outcomeIndex: p.outcome === 'Yes' ? 0 : 1,
+        side: (p.outcome === 'Yes' ? 'YES' : 'NO') as 'YES' | 'NO',
+        size: p.size,
+        avgEntryPrice: p.avgPrice || 0,
+        currentPrice: p.currentPrice ?? p.curPrice ?? 0,
+        unrealizedPnl: p.pnl || (p.currentValue - p.initialValue) || 0,
+        marketUrl: slugMap.get(p.conditionId) || undefined,
+      }));
+    } catch (err) {
+      this.log.warn('Failed to fetch Polymarket positions', { error: (err as Error).message });
+      return [];
+    }
   }
+
 
   async getBalance(): Promise<number> {
     const client = this.ensureClobClient();

@@ -47,14 +47,24 @@ interface KalshiRawMarket {
   response_price_units: string;
   notional_value: number;
   tick_size: number;
-  yes_bid: number;
-  yes_ask: number;
-  no_bid: number;
-  no_ask: number;
-  last_price: number;
-  previous_yes_bid: number;
-  previous_yes_ask: number;
-  previous_price: number;
+  // Legacy integer cents fields (REMOVED by Kalshi on 2026-03-12)
+  yes_bid?: number;
+  yes_ask?: number;
+  no_bid?: number;
+  no_ask?: number;
+  last_price?: number;
+  previous_yes_bid?: number;
+  previous_yes_ask?: number;
+  previous_price?: number;
+  // New dollar string fields (e.g., "0.27")
+  yes_bid_dollars?: string;
+  yes_ask_dollars?: string;
+  no_bid_dollars?: string;
+  no_ask_dollars?: string;
+  last_price_dollars?: string;
+  previous_yes_bid_dollars?: string;
+  previous_yes_ask_dollars?: string;
+  previous_price_dollars?: string;
   volume: number;
   volume_24h: number;
   liquidity: number;
@@ -159,12 +169,19 @@ interface KalshiFillsResponse {
 interface KalshiPositionsResponse {
   market_positions: Array<{
     ticker: string;
-    position: number;
-    market_exposure: number;
-    realized_pnl: number;
-    total_traded: number;
+    // Legacy integer fields (may be 0 or missing in newer API)
+    position?: number;
+    market_exposure?: number;
+    realized_pnl?: number;
+    total_traded?: number;
+    // New fixed-point string fields (e.g., "10.00", "-5.00")
+    position_fp?: string;
+    market_exposure_dollars?: number;
+    realized_pnl_dollars?: number;
+    total_traded_dollars?: number;
     resting_orders_count: number;
-    fees_paid: number;
+    fees_paid?: number;
+    fees_paid_dollars?: number;
   }>;
   cursor: string | null;
 }
@@ -741,23 +758,100 @@ export class KalshiConnector extends BaseConnector {
 
   async getPositions(): Promise<Position[]> {
     try {
+      // Only fetch unsettled positions
       const response = await this.kalshiGet<KalshiPositionsResponse>(
-        `${this.apiUrl}/portfolio/positions`
+        `${this.apiUrl}/portfolio/positions?settlement_status=unsettled`
       );
 
-      return (response.market_positions || [])
-        .filter(p => p.position !== 0)
-        .map(p => ({
+      // Parse position size: prefer position_fp (string, e.g. "10.00"), fall back to position (int)
+      const parsePosition = (p: (typeof response.market_positions)[number]): number => {
+        if (p.position_fp !== undefined && p.position_fp !== null) {
+          return parseFloat(p.position_fp);
+        }
+        return p.position ?? 0;
+      };
+
+      const positions = (response.market_positions || [])
+        .filter(p => {
+          const pos = parsePosition(p);
+          // Filter out settled/empty positions
+          if (pos === 0 || isNaN(pos)) return false;
+          return true;
+        });
+
+      this.log.debug('Kalshi positions fetched', {
+        raw: response.market_positions?.length ?? 0,
+        afterFilter: positions.length,
+        sample: response.market_positions?.slice(0, 3).map(p => ({
+          ticker: p.ticker,
+          position: p.position,
+          position_fp: p.position_fp,
+        })),
+      });
+
+      // Batch-fetch market details for titles and URLs
+      const result: Position[] = [];
+      for (const p of positions) {
+        const posSize = parsePosition(p);
+
+        // Derive URL from ticker pattern:
+        // Per-team ticker: KXNBAGAME-26MAR16GSWWAS-WAS
+        // Event ticker: KXNBAGAME-26MAR16GSWWAS (strip last team segment)
+        // Series ticker: KXNBAGAME (strip date+teams)
+        const tickerParts = p.ticker.split('-');
+        const eventTicker = tickerParts.length >= 3
+          ? tickerParts.slice(0, -1).join('-')  // strip last team segment
+          : p.ticker;
+        const seriesTicker = eventTicker.replace(/-\d{2}[a-z]{3}\d{2}.*$/i, '') || eventTicker;
+
+        // Try to get market title + current price from cache or API
+        let question = p.ticker;
+        let currentPrice = 0;
+        const cached = this.marketCache.get(p.ticker);
+        if (cached) {
+          question = cached.question;
+          // outcomePrices[0] = YES price, outcomePrices[1] = NO price (already normalized 0-1)
+          const isYes = posSize > 0;
+          currentPrice = isYes
+            ? (cached.outcomePrices?.[0] ?? 0)
+            : (cached.outcomePrices?.[1] ?? 0);
+        } else {
+          try {
+            const market = await this.fetchMarket(p.ticker);
+            if (market) {
+              question = market.question;
+              const isYes = posSize > 0;
+              currentPrice = isYes
+                ? (market.outcomePrices?.[0] ?? 0)
+                : (market.outcomePrices?.[1] ?? 0);
+            }
+          } catch { /* use ticker as fallback */ }
+        }
+
+        // Compute avg entry price from exposure / position:
+        // market_exposure_dollars (or market_exposure in cents) = total cost of position
+        const absPos = Math.abs(posSize);
+        const exposureDollars = p.market_exposure_dollars ?? ((p.market_exposure ?? 0) / 100);
+        const avgEntryPrice = absPos > 0 ? exposureDollars / absPos : 0;
+
+        const marketUrl = `https://kalshi.com/markets/${seriesTicker.toLowerCase()}/${eventTicker.toLowerCase()}`;
+        const realizedPnl = p.realized_pnl_dollars ?? p.realized_pnl ?? 0;
+
+        result.push({
           platform: 'kalshi' as Platform,
           marketId: p.ticker,
-          marketQuestion: p.ticker,
-          outcomeIndex: p.position > 0 ? 0 : 1, // positive = YES, negative = NO
-          side: (p.position > 0 ? 'YES' : 'NO') as 'YES' | 'NO',
-          size: Math.abs(p.position),
-          avgEntryPrice: 0, // Not directly available; would need to compute from fills
-          currentPrice: 0,
-          unrealizedPnl: 0,
-        }));
+          marketQuestion: question,
+          outcomeIndex: posSize > 0 ? 0 : 1,
+          side: (posSize > 0 ? 'YES' : 'NO') as 'YES' | 'NO',
+          size: absPos,
+          avgEntryPrice,
+          currentPrice,
+          unrealizedPnl: realizedPnl,
+          marketUrl,
+        });
+      }
+
+      return result;
     } catch (err) {
       this.log.error('Failed to get positions', { error: (err as Error).message });
       return [];
@@ -871,10 +965,19 @@ export class KalshiConnector extends BaseConnector {
       category: raw.category || '',
       outcomes: ['Yes', 'No'],
       outcomeTokenIds: [`${raw.ticker}_yes`, `${raw.ticker}_no`],
-      outcomePrices: [
-        raw.yes_ask > 0 ? raw.yes_ask / 100 : raw.last_price / 100,
-        raw.no_ask > 0 ? raw.no_ask / 100 : (100 - raw.last_price) / 100,
-      ],
+      outcomePrices: (() => {
+        // Prefer _dollars fields (strings like "0.27"); fall back to legacy cents / 100
+        const yesAsk = raw.yes_ask_dollars != null ? parseFloat(raw.yes_ask_dollars)
+          : (raw.yes_ask ?? 0) > 0 ? (raw.yes_ask ?? 0) / 100 : 0;
+        const noAsk = raw.no_ask_dollars != null ? parseFloat(raw.no_ask_dollars)
+          : (raw.no_ask ?? 0) > 0 ? (raw.no_ask ?? 0) / 100 : 0;
+        const lastPrice = raw.last_price_dollars != null ? parseFloat(raw.last_price_dollars)
+          : (raw.last_price ?? 0) / 100;
+        return [
+          yesAsk > 0 ? yesAsk : lastPrice,
+          noAsk > 0 ? noAsk : (1 - lastPrice),
+        ];
+      })(),
       volume: raw.volume || 0,
       liquidity: raw.liquidity || 0,
       active: raw.status === 'open' || raw.status === 'active',
