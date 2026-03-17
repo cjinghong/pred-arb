@@ -2,6 +2,18 @@
 
 Cross-platform prediction market arbitrage bot. Monitors [Polymarket](https://polymarket.com), [Kalshi](https://kalshi.com), and [predict.fun](https://predict.fun) for pricing discrepancies on equivalent markets, then executes simultaneous 2-legged trades to lock in risk-free profit.
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Dashboard](screenshots/1.png) | ![Dashboard2](screenshots/2.png) |
+| Matched Markets | Manual Match Markets |
+| ![Opportunities](screenshots/3.png) | ![Trades](screenshots/4.png) |
+Opportunities Tab | Trades tab |
+| ![Positions](screenshots/5.png) | |
+| View all positions across platforms | |
+
+
 ## How it works
 
 Binary prediction markets settle at $1 (event happened) or $0 (it didn't). By buying YES on one platform and NO on another for the same event, the combined position pays out $1 regardless of the outcome. If both legs cost less than $1, the difference is guaranteed profit.
