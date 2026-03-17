@@ -237,7 +237,13 @@ export function insertTrade(trade: TradeRecord): void {
 export function updateTradeStatus(
   tradeId: string,
   status: TradeStatus,
-  updates?: Partial<{ realizedProfitUsd: number; fees: number; notes: string }>
+  updates?: Partial<{
+    realizedProfitUsd: number;
+    fees: number;
+    notes: string;
+    legA: { id: string; platform: string; marketId: string; side: string; price: number; size: number; fees?: number };
+    legB: { id: string; platform: string; marketId: string; side: string; price: number; size: number; fees?: number };
+  }>
 ): void {
   const db = getDb();
   const sets = ['status = ?'];
@@ -257,6 +263,14 @@ export function updateTradeStatus(
   if (updates?.notes !== undefined) {
     sets.push('notes = ?');
     params.push(updates.notes);
+  }
+  if (updates?.legA) {
+    sets.push('leg_a_order_id = ?, leg_a_platform = ?, leg_a_market_id = ?, leg_a_side = ?, leg_a_price = ?, leg_a_size = ?, leg_a_fees = ?');
+    params.push(updates.legA.id, updates.legA.platform, updates.legA.marketId, updates.legA.side, updates.legA.price, updates.legA.size, updates.legA.fees ?? 0);
+  }
+  if (updates?.legB) {
+    sets.push('leg_b_order_id = ?, leg_b_platform = ?, leg_b_market_id = ?, leg_b_side = ?, leg_b_price = ?, leg_b_size = ?, leg_b_fees = ?');
+    params.push(updates.legB.id, updates.legB.platform, updates.legB.marketId, updates.legB.side, updates.legB.price, updates.legB.size, updates.legB.fees ?? 0);
   }
 
   params.push(tradeId);
@@ -282,7 +296,8 @@ export function getRecentTrades(limit = 100): Record<string, unknown>[] {
     SELECT t.*,
       o.leg_a_question, o.leg_b_question,
       o.leg_a_outcome AS opp_leg_a_outcome, o.leg_b_outcome AS opp_leg_b_outcome,
-      o.expected_profit_bps
+      o.expected_profit_bps,
+      o.leg_a_platform AS opp_leg_a_platform, o.leg_b_platform AS opp_leg_b_platform
     FROM trades t
     LEFT JOIN opportunities o ON t.opportunity_id = o.id
     ORDER BY t.created_at DESC LIMIT ?

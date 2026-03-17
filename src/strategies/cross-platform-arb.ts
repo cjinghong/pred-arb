@@ -1214,11 +1214,9 @@ export class CrossPlatformArbStrategy implements Strategy {
     const isCategoryFiltered = !!category;
 
     // Fetch markets from ALL active platforms in parallel
-    // Politics/crypto: fetch more since they have fewer but higher-value markets
-    const isHighValueCategory = ['politics', 'elections', 'us-politics', 'us-elections', 'crypto'].includes(category?.toLowerCase() || '');
     const baseOpts = {
       activeOnly: true,
-      limit: isCategoryFiltered ? (isHighValueCategory ? 500 : 100) : 200,
+      limit: isCategoryFiltered ? 100 : 200,
       sortBy: 'volume' as const,
       sortDirection: 'desc' as const,
       category,

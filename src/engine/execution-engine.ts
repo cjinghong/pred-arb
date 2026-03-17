@@ -379,6 +379,9 @@ export class ExecutionEngine {
       await rateLimit(firstLeg.platform);
       resultFirst = await firstConn.placeOrder(orderFirst);
       if (firstLegIsA) trade.legA = resultFirst; else trade.legB = resultFirst;
+      // Persist first leg to DB immediately so platform info is available even if second leg fails
+      const firstLegUpdate = { id: resultFirst.id, platform: firstLeg.platform, marketId: firstLeg.marketId, side: firstLeg.outcome, price: resultFirst.avgFillPrice || firstLeg.price, size: resultFirst.filledSize || size, fees: resultFirst.fees };
+      updateTradeStatus(trade.id, 'PENDING', firstLegIsA ? { legA: firstLegUpdate } : { legB: firstLegUpdate });
       log.info('First leg placed', {
         orderId: resultFirst.id,
         platform: firstLeg.platform,
@@ -414,6 +417,9 @@ export class ExecutionEngine {
       await rateLimit(secondLeg.platform);
       resultSecond = await secondConn.placeOrder(orderSecond);
       if (firstLegIsA) trade.legB = resultSecond; else trade.legA = resultSecond;
+      // Persist second leg to DB
+      const secondLegUpdate = { id: resultSecond.id, platform: secondLeg.platform, marketId: secondLeg.marketId, side: secondLeg.outcome, price: resultSecond.avgFillPrice || secondLeg.price, size: resultSecond.filledSize || size, fees: resultSecond.fees };
+      updateTradeStatus(trade.id, 'PENDING', firstLegIsA ? { legB: secondLegUpdate } : { legA: secondLegUpdate });
       log.info('Second leg placed', {
         orderId: resultSecond.id,
         platform: secondLeg.platform,

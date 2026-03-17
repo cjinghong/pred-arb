@@ -34,6 +34,8 @@ interface Trade {
   leg_b_question?: string;
   opp_leg_a_outcome?: string;
   opp_leg_b_outcome?: string;
+  opp_leg_a_platform?: string;
+  opp_leg_b_platform?: string;
   expected_profit_usd: number;
   expected_profit_bps?: number;
   realized_profit_usd: number | null;
@@ -1101,8 +1103,8 @@ export default function DashboardPage() {
                     </div>
                     <div className="opp-card-legs">
                       <div className="opp-leg">
-                        <span className={`row-platform platform-${t.leg_a_platform || 'polymarket'}`}>
-                          {(t.leg_a_platform || 'POLY').slice(0, 5)}
+                        <span className={`row-platform platform-${t.leg_a_platform || t.opp_leg_a_platform || 'unknown'}`}>
+                          {(t.leg_a_platform || t.opp_leg_a_platform || '?').slice(0, 5)}
                         </span>
                         <span className={`row-outcome ${t.opp_leg_a_outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
                           {t.opp_leg_a_outcome || t.leg_a_side || '—'}
@@ -1112,8 +1114,8 @@ export default function DashboardPage() {
                       </div>
                       <span className="opp-arrow">↔</span>
                       <div className="opp-leg">
-                        <span className={`row-platform platform-${t.leg_b_platform || 'predictfun'}`}>
-                          {(t.leg_b_platform || 'PFUN').slice(0, 5)}
+                        <span className={`row-platform platform-${t.leg_b_platform || t.opp_leg_b_platform || 'unknown'}`}>
+                          {(t.leg_b_platform || t.opp_leg_b_platform || '?').slice(0, 5)}
                         </span>
                         <span className={`row-outcome ${t.opp_leg_b_outcome === 'YES' ? 'outcome-yes' : 'outcome-no'}`}>
                           {t.opp_leg_b_outcome || t.leg_b_side || '—'}
